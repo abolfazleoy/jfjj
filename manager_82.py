@@ -1511,6 +1511,17 @@ def backup_arc_essential(arc):
     return os.path.basename(arc or "") in _BACKUP_ESSENTIAL
 
 
+def _admin_upload_path():
+    """zip پشتیبانی که مدیر مستقیم در پیوی بات فرستاده (یک‌بار مصرف)."""
+    return os.path.join(BASE_DIR, "jafj_admin_upload.zip")
+
+
+def _backup_clients_count(caption):
+    """تعداد مشتری‌ای که در کپشن پشتیبان نوشته شده (clients=N). نامعلوم → None."""
+    m = re.search(r"clients=(\d+)", str(caption or ""))
+    return int(m.group(1)) if m else None
+
+
 def command_text(text):
     """`.backup` / `.restore` و شکلِ فارسیِ تک‌کلمه‌ای را به دستور اسلش تبدیل می‌کند.
 
@@ -10261,6 +10272,14 @@ class Manager:
                 os.chmod(latest, 0o600)
             except Exception:
                 pass
+            # همان zipی که مدیر فرستاده، جدا هم نگه داشته می‌شود: `.restore` دستی
+            # اول از همین فایل بازیابی می‌کند، نه از پشتیبانِ قدیمیِ تلگرام.
+            upload = _admin_upload_path()
+            shutil.copy2(path, upload)
+            try:
+                os.chmod(upload, 0o600)
+            except Exception:
+                pass
         except Exception as e:
             await self.say(uid, f"❌ ذخیرهٔ فایل پشتیبان نشد: {type(e).__name__}")
             return True
@@ -10300,6 +10319,32 @@ class Manager:
                 await self.bot.disconnect()
         except Exception:
             pass
+
+    async def _empty_db_backup_guard(self, target):
+        """اگر دیتابیس خالی است و پشتیبانِ پُرِ قبلی در تلگرام هست، پیام خطا برمی‌گرداند
+        (یعنی پشتیبانِ خالی نباید آن را بازنویسی کند). وگرنه None = ادامه بده.
+
+        پشتیبانِ قبلی ۰ مشتری داشته باشد، بازنویسی بی‌خطر است. اگر جست‌وجو هم
+        شکست بخورد و نمی‌دانیم پشتیبانی هست یا نه، محتاطانه نفرست."""
+        try:
+            prev = await self._find_last_backup_msg(target, limit=100)
+        except Exception:
+            prev = None
+        if prev is None:
+            if getattr(self, "_last_iter_ok", True):
+                return None  # پشتیبانی در این چت نبوده؛ چیزی برای حفظ کردن نیست
+            return ("⚠️ دیتابیس خالی است و نتوانستم پشتیبانِ قبلی را در تلگرام پیدا کنم؛ "
+                    "پشتیبانِ خالی نفرستادم.")
+        if not self._msg_has_media(prev):
+            return None
+        prev_n = _backup_clients_count(getattr(prev, "caption", "") or getattr(prev, "text", ""))
+        if prev_n == 0:
+            return None
+        shown = _fa_digits(prev_n) if prev_n is not None else "؟"
+        return (f"⚠️ دیتابیسِ الان خالی است (۰ مشتری) و پشتیبانِ قبلیِ ({shown} مشتری) "
+                "بازنویسی نشد.\n"
+                "اگر بعد از آپدیت هستی، <code>.restore</code> را بزن (یا فایل zip پشتیبان را "
+                "در پیوی بفرست و بعد <code>.restore</code>).")
 
     async def backup_once(self, force=False):
         """یک پشتیبان zip بساز و به تلگرام + دیسک بفرست.
@@ -10381,16 +10426,22 @@ class Manager:
             if zcount <= 0 or not os.path.isfile(tmpzip) or sz <= 0:
                 return False, "فایل پشتیبان خالی ساخته شد"
             try:
+                cnt = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
+                n = cnt["c"] if cnt else 0
+            except Exception:
+                n = "?"
+            # باگِ «بعد از آپدیت صفر مشتری»: دیتابیسِ خالی (مثلاً بوتِ تازه قبل از
+            # بازیابی) نباید پشتیبانِ پُرِ قبلی را در تلگرام و دیسک بازنویسی کند.
+            if n == 0:
+                guard_msg = await self._empty_db_backup_guard(target)
+                if guard_msg:
+                    return False, guard_msg
+            try:
                 self._save_local_backup_copy(tmpzip)
             except Exception as e:
                 print(f"  ⚠️ ذخیره محلی پشتیبان: {e}", flush=True)
             if sz > 50 * 1024 * 1024:
                 return False, (f"حجم پشتیبان {sz // (1024 * 1024)}MB از سقف ۵۰MB ربات تلگرام بیشتر است — ارسال رد می‌شد")
-            try:
-                cnt = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
-                n = cnt["c"] if cnt else 0
-            except Exception:
-                n = "?"
             omit_note = f" omitted={len(omitted)}" if omitted else ""
             caption = (f"{BACKUP_TAG} {datetime.now():%Y-%m-%d %H:%M} clients={n} files={zcount} "
                        f"size={sz//1024}KB build={BUILD_VERSION}{omit_note} \u2502 "
@@ -10511,6 +10562,10 @@ class Manager:
             n0 = 0
         if n0 != 0 and not force:
             return False, f"دیتابیس خالی نیست ({n0} مشتری)"
+        # زیپی که مدیر همین الان در پیوی فرستاده، در `.restore` دستی بر پشتیبانِ
+        # قدیمیِ تلگرام مقدم است. (بوت خودکار همان قبلی را می‌خواند.)
+        admin_up = _admin_upload_path()
+        prefer_admin = bool(force) and os.path.isfile(admin_up)
         # ── پیدا کردنِ پیامِ پشتیبان ──
         # اول در چتِ مقصد، با اولویتِ «فایل» بر متنِ نقل‌قولی (prefer_media):
         # پیامِ متنی که فقط نشانهٔ JAFJBACKUP1 را دارد هیچ zipی ندارد و اگر
@@ -10518,10 +10573,11 @@ class Manager:
         last = None
         search_err = None
         try:
-            last = await self._find_last_backup_msg(target, limit=200, prefer_media=True)
+            if not prefer_admin:
+                last = await self._find_last_backup_msg(target, limit=200, prefer_media=True)
         except Exception as e:
             search_err = f"{type(e).__name__}: {e}"
-        if last is None:
+        if last is None and not prefer_admin:
             # چتِ مقصد چیزی نداشت (بعد از دیپلوی BACKUP_CHAT/admin_ids عوض یا
             # پاک شده) → جست‌وجوی سراسری در همهٔ چت‌های ربات؛ تک‌پیامِ پشتیبان
             # هر جا باشد پیدا می‌شود و بازیابی از دست نمی‌رود.
@@ -10542,7 +10598,7 @@ class Manager:
                 return False, f"خطا در جستجوی پشتیبان: {search_err}"
         if last is None:
             # تلگرام چیزی نداشت — اگر کپی محلی روی Disk هست، همان را امتحان کن (برای Render Disk)
-            for cand in (os.path.join(BASE_DIR, "jafj_backup_latest.zip"), os.path.join(BASE_DIR, "backups", "jafj_backup_latest.zip")):
+            for cand in (((admin_up,) if prefer_admin else ()) + (os.path.join(BASE_DIR, "jafj_backup_latest.zip"), os.path.join(BASE_DIR, "backups", "jafj_backup_latest.zip"))):
                 if os.path.isfile(cand):
                     print(f"  ℹ️ پشتیبان تلگرام نبود؛ کپی محلی {cand} امتحان می‌شود", flush=True)
                     try:
@@ -10681,10 +10737,20 @@ class Manager:
                         except Exception as e:
                             print(f"  ⚠️ تازه‌سازی تنظیمات بعد از بازیابی محلی: "
                                   f"{type(e).__name__}", flush=True)
+                        if cand == admin_up:
+                            # یک‌بار مصرف: وگرنه بوت بعدی یک فایل قدیمی را به جای پشتیبانِ تازه می‌گذارد
+                            try:
+                                os.remove(admin_up)
+                            except Exception:
+                                pass
+                            return True, f"بازیابی از فایلی که فرستادی: {n2} مشتری" + (f" + {regen} سشن" if regen else "")
                         return True, f"بازیابی از دیسک محلی: {n2} مشتری" + (f" + {regen} سشن" if regen else "")
                     except Exception as e:
                         print(f"  ⚠️ restore local {cand}: {e}", flush=True)
                         continue
+            if prefer_admin:
+                return False, ("فایلی که فرستادی بازیابی نشد (خراب یا ناقص است). "
+                               "دوباره همان zip پشتیبان را بفرست.")
             return False, "پشتیبانی پیدا نشد (نه در تلگرام نه روی دیسک)"
         tmpzip = os.path.join(tempfile.gettempdir(), f"jafj_restore_{int(time.time())}_{os.getpid()}.zip")
         try:
