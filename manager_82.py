@@ -1476,7 +1476,7 @@ _BACKUP_SKIP_SUFFIXES = (
     ".log", "-wal", "-shm", "-journal", ".restore_tmp",
     ".tmp", ".bad", ".bak",
 )
-_BACKUP_SKIP_NAMES = {"run.log", "95.py", "jafj_self.py"}
+_BACKUP_SKIP_NAMES = {"run.log", "95.py", "jafj_self.py", "jafj_status.json"}
 _BACKUP_ESSENTIAL = {
     "manager.db", "shop.db", "manager_config.json", "manager_bot.string",
     "jafj_ai.json", ".jafj_deploy_id",
@@ -1485,10 +1485,14 @@ _BACKUP_ESSENTIAL = {
 _CMD_ALIASES = {
     "backup": "backup",
     "restore": "restore",
+    "rules": "rules",
     "بکاپ": "backup",
     "بکآپ": "backup",
+    "یکاپ": "backup",
+    "یکآپ": "backup",
     "پشتیبان": "backup",
     "بازیابی": "restore",
+    "قوانین": "rules",
 }
 
 
@@ -1519,8 +1523,10 @@ def command_text(text):
         return t
     low = t.lower().replace("\u200c", "")
     compact = low.replace(" ", "")
-    if compact in ("بکاپ", "بکآپ"):
+    if compact in ("بکاپ", "بکآپ", "یکاپ", "یکآپ"):
         return "/backup"
+    if compact == "قوانین":
+        return "/rules"
     body = low[1:].strip() if low.startswith(".") and not low.startswith("..") else low
     if body.startswith("/"):
         body = body[1:]
@@ -1592,6 +1598,14 @@ DEFAULTS = {
     "sold_text": "",        # متن بعد از راه‌اندازی موفق
     "expired_text": "",     # متن وقتی اشتراک تمام شد
     "contact": "",          # آیدی پشتیبانی، مثل @yourid
+    "help_text": "",        # متن راهنمای مشتری (خالی = پیش‌فرض)
+    "support_text": "",     # متن بالای صفحه پشتیبانی (خالی = پیش‌فرض)
+    # ── قوانین ربات (نمایش و تأیید در ابتدای ورود به ربات) ──
+    "rules_on": True,       # نمایش قوانین در ابتدای ربات قبل از ورود به منو
+    "rules_text": "",       # متن قوانین (خالی = متن پیش‌فرض قوانین)
+    "rules_btn": "",        # متن دکمه تأیید قوانین (خالی = پیش‌فرض)
+    # ── بک‌آپ خودکار (فقط در صورت ثبت اطلاعات جدید) ──
+    "auto_backup_on": True, # گرفتن بک‌آپ خودکار فقط موقع ثبت/تغییر اطلاعات جدید
     # ── سلامِ بالای منوی اصلی (هر خط یک جمله؛ خالی = پیش‌فرض) ──
     "greet_morning": "",    # ۵ تا ۱۲
     "greet_noon": "",       # ۱۲ تا ۱۷
@@ -1841,7 +1855,8 @@ CREATE TABLE IF NOT EXISTS clients (
     trial_used INTEGER NOT NULL DEFAULT 0,
     trial_started_at INTEGER NOT NULL DEFAULT 0,
     trial_expires_at INTEGER NOT NULL DEFAULT 0,
-    trial_warning_sent INTEGER NOT NULL DEFAULT 0
+    trial_warning_sent INTEGER NOT NULL DEFAULT 0,
+    rules_accepted INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1874,7 +1889,8 @@ class DB:
             for col, decl in (("trial_used", "INTEGER NOT NULL DEFAULT 0"),
                               ("trial_started_at", "INTEGER NOT NULL DEFAULT 0"),
                               ("trial_expires_at", "INTEGER NOT NULL DEFAULT 0"),
-                              ("trial_warning_sent", "INTEGER NOT NULL DEFAULT 0")):
+                              ("trial_warning_sent", "INTEGER NOT NULL DEFAULT 0"),
+                              ("rules_accepted", "INTEGER NOT NULL DEFAULT 1")):
                 if col not in cols:
                     self.c.execute(f"ALTER TABLE clients ADD COLUMN {col} {decl}")
                     if col == "trial_used":
@@ -1981,6 +1997,24 @@ class DB:
         self.set(uid, trial_used=0, trial_started_at=0, trial_warning_sent=0,
                  trial_expires_at=(keep if keep > now_t else 0))
         return True
+
+    def rules_stats(self):
+        """(کل کاربران، تعداد کاربرانی که قوانین را پذیرفته‌اند)"""
+        try:
+            total = self.x("SELECT COUNT(*) c FROM clients", (), "one")["c"]
+            acc = self.x("SELECT COUNT(*) c FROM clients WHERE rules_accepted<>0",
+                         (), "one")["c"]
+            return int(total or 0), int(acc or 0)
+        except Exception:
+            return 0, 0
+
+    def rules_reset_all(self):
+        """تأیید قوانین را برای همه‌ی کاربران صفر می‌کند تا قوانین جدید را دوباره ببینند."""
+        with self.lock:
+            cur = self.c.execute("UPDATE clients SET rules_accepted=0")
+            n = cur.rowcount
+            self.c.commit()
+        return max(0, int(n or 0))
 
     def expired(self):
         return self.x("SELECT * FROM clients WHERE status='active'"
@@ -2581,8 +2615,11 @@ ADMIN_HELP = """🛠 <b>پنل مدیر</b>
 def B(text, data, style=None):
     """دکمه شیشه‌ای. style: primary(آبی) | success(سبز) | danger(قرمز)
     نیاز به Bot API 9.4 — کلاینت‌های قدیمی دکمه را بی‌رنگ نشان می‌دهند."""
-    from telethon import Button
     d = data.encode() if isinstance(data, str) else data
+    try:
+        from telethon import Button
+    except ImportError:
+        return ("inline", (text, d), {"style": style} if style else {})
     if style:
         try:
             return Button.inline(text, d, style=style)
@@ -2623,6 +2660,7 @@ def main_menu(is_admin=False, shop_on=True, points_on=True,
         rows.append([B("🗂 توضیحات", "m:hub", "success")])
     rows.append([B("📚 آموزش فعال‌سازی", "m:tut", "success"),
                  B("📖 راهنما", "m:help")])
+    rows.append([B("📜 قوانین ربات", "m:rules")])
     # فقط وقتی مدیر دستوری ثبت کرده باشد؛ وگرنه دکمه‌ی خالی می‌دهد.
     if has_cmds:
         rows.append([B("📋 دستورات آماده", "m:cmds", "success")])
@@ -2693,14 +2731,15 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("🩺 سلامت سیستم", "a:doctor", "success")],
         [B("🎬 آموزش فعال‌سازی", "a:tut", "success"),
          B("🧩 بخش‌های آموزش", "a:secs", "success")],
-        [B("🗂 توضیحات (فهرست تپ‌کردنی)", "a:hub", "success")],
+        [B("🗂 توضیحات (فهرست تپ‌کردنی)", "a:hub", "success"),
+         B("📜 قوانین ربات", "a:rules", "primary")],
         [B("📝 متن خوش‌آمدگویی", "a:welcome", "primary"),
          B(tr_lbl, "a:trial", "success" if trial_on else "danger")],
         [B("📝 متن‌های ربات", "a:rt", "success"),
          B("📋 دستورات آماده", "a:cm", "success")],
         [B("📣 جوین اجباری", "a:fjoin", "danger"),
          B("📜 رویدادها", "a:mlog", "primary")],
-        [B("📦 پشتیبان بگیر", "a:backup", "success"),
+        [B("📦 بک‌آپ", "a:backup", "success"),
          B("♻️ بازیابی", "a:restore", "danger")],
         back_btn(),
     ]
@@ -3118,10 +3157,178 @@ class Manager:
     LINE = "━━━━━━━━━━━━━━━"
 
     # ═══════════════════════════════════════════════
+    #  📜 قوانین ربات — نمایش و پذیرش قوانین در ابتدای ورود به ربات
+    # ═══════════════════════════════════════════════
+    DEFAULT_RULES_TEXT = (
+        "۱. این ربات جهت راه‌اندازی و مدیریت خودکار سلف‌بات تلگرام ارائه شده است.\n"
+        "۲. مسئولیت نحوه‌ی استفاده از اکانت و رعایت قوانین تلگرام بر عهده‌ی کاربر است.\n"
+        "۳. برای جلوگیری از محدودیت تلگرام (FloodWait)، از تغییر مداوم اکانت یا ارسال اسپم خودداری کنید.\n"
+        "۴. امتیازها و اشتراک‌های خریداری‌شده مربوط به حساب کاربری شما در ربات است.\n"
+        "۵. استفاده از ربات به منزله‌ی مطالعه و پذیرش کامل این قوانین است."
+    )
+    DEFAULT_RULES_BTN = "✅ قوانین را خواندم و می‌پذیرم"
+
+    def rules_on(self):
+        return bool(self.cfg.get("rules_on", True))
+
+    def rules_body(self):
+        cur = str(self.cfg.get("rules_text") or "").strip()
+        return cur if cur else self.DEFAULT_RULES_TEXT
+
+    def rules_btn_label(self):
+        cur = str(self.cfg.get("rules_btn") or "").strip()
+        return cur if cur else self.DEFAULT_RULES_BTN
+
+    def rules_accepted(self, uid):
+        c = self.db.get(uid)
+        if not c:
+            return True
+        return bool(int(c.get("rules_accepted", 1) or 0))
+
+    def rules_required(self, uid):
+        if self.is_admin(uid) or not self.rules_on():
+            return False
+        return not self.rules_accepted(uid)
+
+    def accept_rules(self, uid):
+        if self.db.get(uid):
+            self.db.set(uid, rules_accepted=1)
+
+    def rules_gate_text(self):
+        return (
+            f"📜 <b>قوانین و مقررات استفاده از ربات</b>\n{self.LINE}\n\n"
+            f"{self.rules_body()}\n\n{self.LINE}\n"
+            "👇 <i>برای ورود به ربات و استفاده از امکانات، ابتدا قوانین بالا را مطالعه کرده و دکمه‌ی تأیید را بزنید:</i>"
+        )
+
+    def rules_gate_kb(self):
+        return [[B(self.rules_btn_label(), "rules:accept", "success")]]
+
+    def rules_view_text(self):
+        return (
+            f"📜 <b>قوانین و مقررات ربات</b>\n{self.LINE}\n\n"
+            f"{self.rules_body()}"
+        )
+
+    async def enforce_rules(self, uid, ev=None, chat=None):
+        if not self.rules_required(uid):
+            return False
+        t, kb = self.rules_gate_text(), self.rules_gate_kb()
+        if ev is not None:
+            try:
+                await ev.edit(t, parse_mode="html", buttons=kb, link_preview=False)
+            except Exception:
+                await self.say(chat or uid, t, kb, key="rules_gate")
+        else:
+            await self.say(chat or uid, t, kb, key="rules_gate")
+        return True
+
+    def rules_screen(self):
+        """صفحه‌ی «📜 قوانین ربات» در پنل مدیر."""
+        on = self.rules_on()
+        cur_txt = str(self.cfg.get("rules_text") or "").strip()
+        cur_btn = str(self.cfg.get("rules_btn") or "").strip()
+        total, accepted = self.db.rules_stats()
+        shown_txt = cur_txt if cur_txt else self.DEFAULT_RULES_TEXT
+        txt = "\n".join([
+            "📜 <b>قوانین و مقررات ربات</b>",
+            self.LINE,
+            f"وضعیت نمایش در شروع ربات: <b>{'🟢 فعال (قبل از ورود به ربات)' if on else '🔴 غیرفعال'}</b>",
+            f"متن قوانین: <b>{'✅ متن اختصاصی مدیر' if cur_txt else '⚪ متن پیش‌فرض'}</b>",
+            f"متن دکمه تأیید: <b>{self._esc(self.rules_btn_label())}</b>",
+            f"👥 کاربران تأییدکرده: {_fa_digits(accepted)} از {_fa_digits(total)}",
+            self.LINE,
+            "<b>متن فعلی قوانین:</b>",
+            self._esc(shown_txt[:1500]) + ("…" if len(shown_txt) > 1500 else ""),
+            self.LINE,
+            "<i>وقتی قوانین فعال باشد، هر کاربر جدید قبل از دیدن منوی اصلی اول این متن را می‌بیند و باید دکمه‌ی تأیید را بزند.</i>",
+        ])
+        kb = [
+            [B("✏️ تغییر متن قوانین", "a:rules:edit", "success")],
+            [B("🔴 غیرفعال کردن قوانین در شروع" if on else "🟢 فعال کردن قوانین در شروع",
+               "a:rules:tog", "danger" if on else "success")],
+            [B("✏️ تغییر متن دکمه تأیید", "a:rules:btn", "primary"),
+             B("👁 پیش‌نمایش قوانین", "a:rules:prev", "primary")],
+            [B("🔄 درخواست تأیید مجدد از همه کاربران", "a:rules:reset", "warning")],
+        ]
+        if cur_txt or cur_btn:
+            kb.append([B("♻️ برگشت به قوانین پیش‌فرض", "a:rules:def", "danger")])
+        kb.append(back_btn("a:home"))
+        return txt, kb
+
+    def backup_screen(self, status_line=""):
+        """صفحه‌ی «📦 بک‌آپ» در پنل مدیر."""
+        auto_on = bool(self.cfg.get("auto_backup_on", True))
+        try:
+            cnt = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
+            n = cnt["c"] if cnt else 0
+        except Exception:
+            n = 0
+        lines = []
+        if status_line:
+            lines += [status_line, self.LINE]
+        lines += [
+            "📦 <b>مدیریت بک‌آپ و بازیابی</b>",
+            self.LINE,
+            f"👥 مشتری‌های فعلی در دیتابیس: <b>{_fa_digits(n)}</b> نفر",
+            f"🔄 بک‌آپ خودکار (فقط موقع ثبت اطلاعات جدید): "
+            f"<b>{'🟢 روشن' if auto_on else '🔴 خاموش'}</b>",
+            self.LINE,
+            "📥 با زدن <b>«📥 دریافت فایل بک‌آپ همین الان»</b>، فایل <code>.zip</code> کامل اطلاعات (مشتری‌ها، سشن‌ها، امتیازها، تنظیمات و قوانین) همین‌جا برایت ارسال می‌شود.",
+            "",
+            "♻️ <b>نحوه بازیابی اطلاعات:</b>\n"
+            "هر زمان خواستی اطلاعات برگردد، کافیست همان فایل <code>.zip</code> بک‌آپ را در پیوی برای خودِ ربات بفرستی و دکمه‌ی <b>«♻️ بازیابی»</b> را بزنی.",
+        ]
+        kb = [
+            [B("📥 دریافت فایل بک‌آپ همین الان", "a:backup:dl", "success")],
+            [B("🔄 بک‌آپ خودکار موقع تغییر اطلاعات: " + ("🟢 روشن" if auto_on else "🔴 خاموش"),
+               "a:backup:auto", "success" if auto_on else "danger")],
+            [B("♻️ بازیابی از آخرین بک‌آپ", "a:restore", "danger")],
+            back_btn("a:home"),
+        ]
+        return "\n".join(lines), kb
+
+    async def send_backup_to_admin(self, chat_id):
+        """بک‌آپ کامل می‌گیرد و فایل zip را مستقیماً در چت مدیر هم ارسال می‌کند."""
+        ok, msg = await self.backup_once(force=True)
+        latest = os.path.join(BASE_DIR, "jafj_backup_latest.zip")
+        if os.path.isfile(latest) and self.bot is not None:
+            try:
+                cnt = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
+                n = cnt["c"] if cnt else 0
+            except Exception:
+                n = "?"
+            sz_kb = max(1, os.path.getsize(latest) // 1024)
+            cap = (
+                f"📦 <b>فایل بک‌آپ کامل ربات</b> ({BACKUP_TAG})\n"
+                f"👥 مشتری‌ها: {_fa_digits(n)} · حجم: {_fa_digits(sz_kb)}KB\n\n"
+                "♻️ هر زمان خواستی اطلاعات (مشتری‌ها، سشن‌ها، امتیازها، تنظیمات و قوانین) برگردد، "
+                "همین فایل را در پیوی برای خودِ ربات بفرست و دکمه‌ی «♻️ بازیابی» را بزن."
+            )
+            # اگر مقصدِ خودکار چت دیگری بود یا پیام قدیمی ویرایش شد، یک فایل مستقیم هم پایین چت مدیر بفرست
+            try:
+                await self.bot.send_file(chat_id, latest, caption=cap,
+                                         parse_mode="html", force_document=True)
+                ok = True
+            except TypeError:
+                try:
+                    await self.bot.send_file(chat_id, latest, caption=cap)
+                    ok = True
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"  ⚠️ ارسال مستقیم فایل بک‌آپ به مدیر: {type(e).__name__}: {e}", flush=True)
+        return ok, msg
+
+    # ═══════════════════════════════════════════════
     #  📝 متن‌های ربات — همه‌ی متن‌های قابل‌تنظیمِ ربات یک‌جا
     #  (id, emoji, عنوان، کلید در cfg، چندخطی؟، سقف حرف، توضیح)
     # ═══════════════════════════════════════════════
     READY_TEXTS = (
+        ("rules", "📜", "متن قوانین ربات", "rules_text", False, 3500,
+         "در ابتدای ورود کاربر به ربات (قبل از منوی اصلی) و در بخش قوانین نمایش داده می‌شود."),
+        ("rules_btn", "✅", "دکمه تأیید قوانین", "rules_btn", False, 80,
+         "متن دکمه‌ی پذیرش زیر قوانین در ابتدای ربات (پیش‌فرض: ✅ قوانین را خواندم و می‌پذیرم)."),
         ("welcome", "📝", "متن خوش‌آمدگویی", "welcome", False, 2000,
          "زیرِ سلامِ بالای منوی اصلیِ مشتری نمایش داده می‌شود."),
         ("sold", "🚀", "بعد از راه‌اندازی سلف", "sold_text", False, 3500,
@@ -3130,6 +3337,10 @@ class Manager:
         ("expired", "⏳", "اشتراک / سرویس غیرفعال", "expired_text", False, 2000,
          "وقتی مشتری با سرویسِ غیرفعال یا اشتراکِ تمام‌شده کار می‌خواهد "
          "انجام بدهد، این متن را می‌بیند."),
+        ("help_txt", "📖", "متن راهنمای مشتری", "help_text", False, 3500,
+         "وقتی مشتری دکمه‌ی «📖 راهنما» یا دستور /help را می‌زند نمایش داده می‌شود."),
+        ("support_txt", "💬", "متن صفحه پشتیبانی", "support_text", False, 2000,
+         "بالای صفحه‌ی «🎧 پشتیبانی» و ثبت تیکت به مشتری نمایش داده می‌شود."),
         ("contact", "🎧", "آیدی پشتیبانی", "contact", False, 100,
          "مثل @yourid — زیرِ منوی اصلی و صفحه‌ی پشتیبانی نشان داده می‌شود."),
         ("paynote", "💳", "توضیح پرداخت", "pay_note", False, 1000,
@@ -5207,7 +5418,7 @@ class Manager:
                                              "sec_btn_label", "sec_text", "tut_wait",
                                              "rt_set",
                                              "cm_add", "cm_edit", "cm_intro",
-                                             "hub_intro"):
+                                             "hub_intro", "rules_set", "rules_btn_set"):
             keep = data in ("wq:0", "kc:x", "a:tut_done") \
                 or data.startswith(("a:sec_done",)) or (
                 st_now.get("step") in ("verify_phone", "verify_referral") and data.startswith(("ko:", "o:", "wq:", "kc:", "kp:")))
@@ -5224,6 +5435,8 @@ class Manager:
                 return await self.edit(ev, self.join_gate_text(missing),
                                        self.join_gate_kb(missing))
             await ans("عضویت تأیید شد ✅")
+            if await self.enforce_rules(uid, ev=ev, chat=ev.chat_id):
+                return
             return await self.edit(ev, self.home_text(uid),
                                    main_menu(adm, self.cfg["shop_on"], self.cfg["points_on"],
                                    bool((self.db.get(uid) or {}).get("session")),
@@ -5232,9 +5445,27 @@ class Manager:
                                    trial_label=self.trial_label(),
                                    has_cmds=self.has_cmds(),
                                    has_hub=self.hub_on()))
+
+        if data == "rules:accept":
+            self.accept_rules(uid)
+            self.db.log(uid, "rules_accept", "پذیرش قوانین")
+            await ans("قوانین پذیرفته شد ✅")
+            return await self.edit(ev, self.home_text(uid),
+                                   main_menu(adm, self.cfg["shop_on"], self.cfg["points_on"],
+                                   bool((self.db.get(uid) or {}).get("session")),
+                                   self.sup.is_running(uid),
+                                   self.trial_available(uid),
+                                   trial_label=self.trial_label(),
+                                   has_cmds=self.has_cmds(),
+                                   has_hub=self.hub_on()))
+
         if not adm and not data.startswith("a:") and data != "m:home":
             if await self.enforce_join(uid, ev=ev, chat=ev.chat_id):
                 await ans("اول عضو شو")
+                return
+        if not adm and not data.startswith("a:") and data not in ("rules:accept",):
+            if await self.enforce_rules(uid, ev=ev, chat=ev.chat_id):
+                await ans("اول قوانین را تأیید کن")
                 return
 
         # ---------- منوی اصلی ----------
@@ -5261,7 +5492,11 @@ class Manager:
 
         if data == "m:help":
             await ans()
-            return await self.edit(ev, USER_HELP, [back_btn()])
+            return await self.edit(ev, self.cfg.get("help_text") or USER_HELP, [back_btn()])
+
+        if data == "m:rules":
+            await ans()
+            return await self.edit(ev, self.rules_view_text(), [back_btn("m:home")])
 
         if data == "m:tut":
             await ans("در حال ارسال…")
@@ -5865,7 +6100,8 @@ class Manager:
             await ans()
             self.fsm[uid] = {"step": "ticket"}
             ts = sh.user_tickets(uid)
-            txt = "🎧 <b>پشتیبانی</b>\n\nمشکل یا سوالت را بنویس و بفرست."
+            sup_head = self.cfg.get("support_text") or "🎧 <b>پشتیبانی</b>\n\nمشکل یا سوالت را بنویس و بفرست."
+            txt = sup_head
             if ts:
                 txt += "\n\n<b>تیکت‌های قبلی</b>\n" + "\n".join(
                     f"#{_fa_digits(t['id'])} {t['subject'][:40]} — {t['status']}" for t in ts[:5])
@@ -5877,6 +6113,63 @@ class Manager:
         if data.startswith("a:") and adm:
             k = data[2:]
             await ans()
+            if k == "rules":
+                t, kb = self.rules_screen()
+                return await self.edit(ev, t, kb)
+            if k == "rules:tog":
+                now_val = not self.rules_on()
+                self.cfg["rules_on"] = now_val
+                self.cfg.save()
+                self.db.log(uid, "rules_toggle", "on" if now_val else "off")
+                t, kb = self.rules_screen()
+                return await self.edit(ev,
+                    f"وضعیت قوانین در شروع ربات: <b>{'🟢 فعال' if now_val else '🔴 غیرفعال'}</b>\n"
+                    + self.LINE + "\n" + t, kb)
+            if k == "rules:edit":
+                self.fsm[uid] = {"step": "rules_set"}
+                cur = str(self.cfg.get("rules_text") or "").strip()
+                return await self.edit(ev,
+                    f"✏️ <b>تغییر متن قوانین ربات</b>\n{self.LINE}\n"
+                    "متن جدید قوانین را همین‌جا بفرست (چندخطی مجاز است).\n"
+                    "این متن در ابتدای ورود کاربر به ربات نمایش داده می‌شود و کاربر باید آن را تأیید کند.\n\n"
+                    + (f"<b>متن فعلی:</b>\n{self._esc(cur[:1200])}\n\n" if cur else "")
+                    + "برای برگشت به متن پیش‌فرض بنویس: <code>پیش‌فرض</code>\n"
+                    "<i>/cancel برای لغو</i>",
+                    [[B("⬅️ بازگشت", "a:rules")]])
+            if k == "rules:btn":
+                self.fsm[uid] = {"step": "rules_btn_set"}
+                cur_b = self.rules_btn_label()
+                return await self.edit(ev,
+                    f"✏️ <b>تغییر متن دکمه تأیید قوانین</b>\n{self.LINE}\n"
+                    f"متن فعلی دکمه: <b>{self._esc(cur_b)}</b>\n\n"
+                    "متن جدید دکمه را بفرست (مثلاً: <code>✅ قوانین را قبول دارم</code>).\n"
+                    "برای برگشت به پیش‌فرض بنویس: <code>پیش‌فرض</code>\n"
+                    "<i>/cancel برای لغو</i>",
+                    [[B("⬅️ بازگشت", "a:rules")]])
+            if k == "rules:prev":
+                await self.say(uid, self.rules_gate_text(),
+                               [[B(self.rules_btn_label(), "a:rules", "success")],
+                                [B("⬅️ بازگشت به تنظیمات قوانین", "a:rules")]],
+                               key="rules_prev")
+                t, kb = self.rules_screen()
+                return await self.edit(ev,
+                    "👁 پیش‌نمایش قوانین در چت ارسال شد.\n" + self.LINE + "\n" + t, kb)
+            if k == "rules:reset":
+                n_rst = self.db.rules_reset_all()
+                self.db.log(uid, "rules_reset_all", str(n_rst))
+                t, kb = self.rules_screen()
+                return await self.edit(ev,
+                    f"🔄 تأیید قوانین برای <b>{_fa_digits(n_rst)}</b> کاربر ریست شد (همه دوباره قوانین را می‌بینند).\n"
+                    + self.LINE + "\n" + t, kb)
+            if k == "rules:def":
+                self.cfg["rules_text"] = ""
+                self.cfg["rules_btn"] = ""
+                self.cfg.save()
+                self.db.log(uid, "rules_default", "")
+                t, kb = self.rules_screen()
+                return await self.edit(ev,
+                    "♻️ متن قوانین و دکمه تأیید به حالت پیش‌فرض برگشت.\n"
+                    + self.LINE + "\n" + t, kb)
             if k == "trial":
                 t, kb = self.trial_screen()
                 return await self.edit(ev, t, kb)
@@ -6747,14 +7040,28 @@ class Manager:
                     "<code>6037991234567890 علی رضایی</code>\n\n"
                     "<i>/cancel برای لغو</i>",
                     [back_btn("a:home")])
-            if k == "backup":
-                ok, msg = await self.backup_once(force=True)
-                return await self.edit(ev, ("✅ " if ok else "❌ ") + str(msg),
-                                       [back_btn("a:home")])
+            if k in ("backup", "backup:dl"):
+                ok, msg = await self.send_backup_to_admin(ev.chat_id)
+                st_line = ("✅ <b>فایل بک‌آپ همین الان برایت ارسال شد</b>\n" if ok else "❌ ") + str(msg)
+                t, kb = self.backup_screen(status_line=st_line)
+                return await self.edit(ev, t, kb)
+            if k == "backup:auto":
+                now_auto = not bool(self.cfg.get("auto_backup_on", True))
+                self.cfg["auto_backup_on"] = now_auto
+                self.cfg.save()
+                self.db.log(uid, "backup_auto", "on" if now_auto else "off")
+                st_line = (
+                    "🟢 بک‌آپ خودکار روشن شد — فقط زمانی که اطلاعات جدیدی ثبت شود بک‌آپ می‌گیرد."
+                    if now_auto else
+                    "🔴 بک‌آپ خودکار خاموش شد — فقط زمانی که دکمه‌ی «📦 بک‌آپ» را بزنی بک‌آپ می‌دهد."
+                )
+                t, kb = self.backup_screen(status_line=st_line)
+                return await self.edit(ev, t, kb)
             if k == "restore":
                 ok, msg = await self.restore_from_backup(force=True)
                 return await self.edit(ev, ("✅ " if ok else "❌ ") + str(msg),
-                                       [back_btn("a:home")])
+                                       [[B("📦 مدیریت بک‌آپ", "a:backup", "primary")],
+                                        back_btn("a:home")])
             if k in ("revenue", "stats", "users", "plans", "tk",
                      "mlog", "pstats", "doctor"):
                 cmd = {"revenue": "revenue", "stats": "stats", "users": "users",
@@ -7633,6 +7940,8 @@ class Manager:
             new = not self.db.get(uid)
             self.db.add(uid, user.get("username"), user.get("name"),
                         self.cfg["trial_days"])
+            if new and self.rules_on() and not self.is_admin(uid):
+                self.db.set(uid, rules_accepted=0)
             if new and self.shop and arg.startswith("r"):
                 try:
                     ref = int(digits(arg))
@@ -7648,6 +7957,8 @@ class Manager:
                     pass
             if await self.enforce_join(uid, chat=chat):
                 return
+            if await self.enforce_rules(uid, chat=chat):
+                return
             return await self.say(chat, self.home_text(uid),
                                   main_menu(self.is_admin(uid), self.cfg["shop_on"],
                                             self.cfg["points_on"],
@@ -7658,11 +7969,19 @@ class Manager:
                                    has_cmds=self.has_cmds(),
                                    has_hub=self.hub_on()))
 
+        if cmd == "rules":
+            if self.rules_required(uid):
+                return await self.enforce_rules(uid, chat=chat)
+            return await self.say(chat, self.rules_view_text(),
+                                  [[B("⬅️ منوی اصلی", "m:home")]])
+
         if cmd == "trial":
+            if await self.enforce_rules(uid, chat=chat):
+                return
             return await self.start_trial(uid, chat)
 
         if cmd == "help":
-            return await self.say(chat, USER_HELP)
+            return await self.say(chat, self.cfg.get("help_text") or USER_HELP)
 
         if cmd in ("whoami", "id", "myid"):
             return await self.say(chat,
@@ -7674,6 +7993,8 @@ class Manager:
             if self.shop:
                 self.shop.cancel_open(uid)
             await self.say(chat, "لغو شد.", clear_reply_keyboard())
+            if await self.enforce_rules(uid, chat=chat):
+                return
             return await self.say(chat, "به منوی اصلی برگشتی.",
                                   main_menu(self.is_admin(uid), self.cfg["shop_on"],
                                             self.cfg["points_on"],
@@ -7685,6 +8006,8 @@ class Manager:
                                    has_hub=self.hub_on()))
 
         if cmd == "setup":
+            if await self.enforce_rules(uid, chat=chat):
+                return
             return await self.setup_start(uid, chat)
 
         c = self.db.get(uid)
@@ -9209,47 +9532,96 @@ class Manager:
             return False, str(target)
 
     def _backup_fingerprint(self):
-        """اثرانگشت پشتیبان — همهٔ دادهٔ مهم (clients/* هم حساب می‌شود).
-        هر تغییری در مشتری‌ها/سشن‌ها باعث پشتیبان جدید می‌شود.
-        از mtime با دقت نانوثانیه + هش سریع برای فایل‌های کوچک استفاده می‌کند تا تغییر هم‌ثانیه هم شناخته شود."""
-        def _fp_one(path, rel=None):
+        """اثرانگشت پشتیبان — فقط بر اساس محتوای واقعی اطلاعات (مشتری‌ها، فروشگاه، تنظیمات).
+        تغییراتِ لحظه‌ایِ زمان فایل (مثل wal_checkpoint، پینگ سشن تلگرام یا گزارش زنده‌ی سلف)
+        باعث بک‌آپ تکراری و بی‌مورد نمی‌شوند؛ فقط ثبت یا تغییر اطلاعات واقعی اثرانگشت را عوض می‌کند."""
+        import hashlib
+
+        def _sqlite_hash(path, live_conn=None):
+            if not os.path.isfile(path):
+                return None
+            h = hashlib.md5()
+            c = live_conn
+            close_it = False
+            try:
+                if c is None:
+                    c = sqlite3.connect(path, timeout=2)
+                    close_it = True
+                tables = [r[0] for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()]
+                for t in tables:
+                    h.update(t.encode("utf-8", "ignore"))
+                    for row in c.execute(f'SELECT * FROM "{t}"'):
+                        h.update(repr(tuple(row)).encode("utf-8", "ignore"))
+                return h.hexdigest()[:16]
+            except Exception:
+                try:
+                    with open(path, "rb") as f:
+                        return hashlib.md5(f.read()).hexdigest()[:16]
+                except Exception:
+                    return None
+            finally:
+                if close_it and c is not None:
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+
+        def _fp_file(path, rel=None):
+            key = rel or path
             try:
                 if not os.path.isfile(path):
-                    return (rel or path, None, None, None)
+                    return (key, None, None, None)
+                base = os.path.basename(path).lower()
+                if base.endswith(".session"):
+                    return (key, "session", 0, "exists")
+                if base == "jafj.db":
+                    return (key, "client_db", 0, "exists")
+                if base.endswith(".json"):
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            d = json.load(f)
+                        if isinstance(d, dict):
+                            d = {k: v for k, v in d.items()
+                                 if not str(k).startswith(("_adaptive_", "_block_"))}
+                        raw = json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                        return (key, len(raw), 0, hashlib.md5(raw).hexdigest()[:16])
+                    except Exception:
+                        pass
                 st = os.stat(path)
-                # نانوثانیه اگر FS پشتیبانی کند، وگرنه ثانیه *1e9
-                try:
-                    mtns = st.st_mtime_ns
-                except AttributeError:
-                    mtns = int(st.st_mtime * 1e9)
-                # برای فایل‌های کوچک (<8KB) یک هش سریع هم اضافه کن تا تغییر هم‌اندازه-هم‌زمان از دست نرود
                 h = None
                 try:
-                    if st.st_size < 8192:
-                        import hashlib
+                    if st.st_size < 1024 * 1024:
                         with open(path, "rb") as f:
-                            h = hashlib.md5(f.read()).hexdigest()[:8]
+                            h = hashlib.md5(f.read()).hexdigest()[:16]
                 except Exception:
                     h = None
-                return (rel or path, st.st_size, mtns, h)
+                return (key, st.st_size, 0, h)
             except Exception:
-                return (rel or path, None, None, None)
+                return (key, None, None, None)
+
         fps = []
-        for p in (DB_FILE, SHOP_DB, CONFIG_FILE, BOT_SESSION_FILE):
-            fps.append(_fp_one(p))
+        db_conn = getattr(getattr(self, "db", None), "c", None)
+        shop_conn = getattr(getattr(self, "shop", None), "c", None)
+        fps.append((DB_FILE, "sqlite", 0, _sqlite_hash(DB_FILE, db_conn)))
+        fps.append((SHOP_DB, "sqlite", 0, _sqlite_hash(SHOP_DB, shop_conn)))
+        for p in (CONFIG_FILE, BOT_SESSION_FILE):
+            fps.append(_fp_file(p))
         for p in (os.path.join(BASE_DIR, "jafj_ai.json"), os.path.join(BASE_DIR, ".jafj_deploy_id")):
-            fps.append(_fp_one(p))
+            fps.append(_fp_file(p))
         if os.path.isdir(CLIENTS_DIR):
             try:
                 for root, dirs, files in os.walk(CLIENTS_DIR):
                     for fn in sorted(files):
-                        # لاگ و فایل موقت اثرانگشت را عوض می‌کنند بی‌آنکه دادهٔ
-                        # مشتری عوض شده باشد — و اگر داخل zip بروند آپلود رد می‌شود.
                         if backup_file_skipped(fn):
+                            continue
+                        low = fn.lower()
+                        if low.endswith(".session") or low == "jafj.db":
                             continue
                         fp = os.path.join(root, fn)
                         rel = os.path.relpath(fp, BASE_DIR)
-                        fps.append(_fp_one(fp, rel))
+                        fps.append(_fp_file(fp, rel))
             except Exception:
                 pass
         return tuple(sorted(fps))
@@ -9262,6 +9634,9 @@ class Manager:
     def _backup_fp_path(self):
         return os.path.join(BASE_DIR, ".jafj_backup_fp")
 
+    def _backup_meta_path(self):
+        return os.path.join(BASE_DIR, ".jafj_backup_meta")
+
     def _save_backup_fp(self, fp):
         """اثرانگشت آخرین پشتیبان را در حافظه + فایل داده ذخیره کن؛ تا بعد از
         ری‌استارتِ بدون تغییرِ داده، پشتیبانِ تکراری به پیوی مدیر نرود."""
@@ -9270,6 +9645,9 @@ class Manager:
             import json as _json
             with open(self._backup_fp_path(), "w", encoding="utf-8") as f:
                 _json.dump([list(x) for x in (fp or ())], f)
+            if getattr(self, "_backup_msg_id", None):
+                with open(self._backup_meta_path(), "w", encoding="utf-8") as f:
+                    _json.dump({"msg_id": self._backup_msg_id}, f)
         except Exception:
             pass
 
@@ -9283,6 +9661,15 @@ class Manager:
             with open(self._backup_fp_path(), encoding="utf-8") as f:
                 data = _json.load(f)
             self._backup_fp = tuple(tuple(x) for x in (data or []))
+        except Exception:
+            pass
+        try:
+            import json as _json
+            if not getattr(self, "_backup_msg_id", None) and os.path.isfile(self._backup_meta_path()):
+                with open(self._backup_meta_path(), encoding="utf-8") as f:
+                    meta = _json.load(f) or {}
+                if meta.get("msg_id"):
+                    self._backup_msg_id = int(meta["msg_id"])
         except Exception:
             pass
 
@@ -9336,6 +9723,7 @@ class Manager:
         prefer_media=True → پیامی که واقعاً «فایل» دارد بر پیامِ متنیِ
         نقل‌قولی مقدم است؛ اگر هیچ فایل‌داری نبود، همان تازه‌ترین پیامِ
         نشانه‌دار برمی‌گردد (رفتار قدیمی)."""
+        self._last_iter_ok = True
         try:
             bot_id = 0
             try:
@@ -9360,7 +9748,21 @@ class Manager:
                     return m
             return first_tagged
         except Exception as e:
+            self._last_iter_ok = False
             print(f"  ⚠️ جستجوی پیام پشتیبان: {type(e).__name__}: {e}", flush=True)
+            # در ربات‌های تلگرام iter_messages ممکن است BotMethodInvalid بدهد؛
+            # اگر آیدی آخرین پیام پشتیبان را داریم، با get_messages مستقیم بگیر.
+            self._load_backup_fp()
+            mid = getattr(self, "_backup_msg_id", None)
+            if mid:
+                try:
+                    got = await self.bot.get_messages(target, ids=[int(mid)])
+                    m = got[0] if isinstance(got, list) and got else got
+                    if m is not None and getattr(m, "id", None):
+                        if not prefer_media or self._msg_has_media(m):
+                            return m
+                except Exception:
+                    pass
         return None
 
     async def _find_backup_anywhere(self, limit=40, skip=None, max_chats=12):
@@ -9864,7 +10266,9 @@ class Manager:
             return True
         await self.say(uid,
                        "✅ <b>فایل پشتیبان ذخیره شد</b>\n\n"
-                       "برای برگرداندن اطلاعات بفرست: <code>.restore</code>")
+                       "برای برگرداندن اطلاعات دکمه‌ی زیر را بزن یا بفرست: <code>.restore</code>",
+                       [[B("♻️ بازیابی اطلاعات همین الان", "a:restore", "success")],
+                        [B("🛠 پنل مدیر", "a:home", "primary")]])
         return True
 
     async def _graceful_stop(self):
@@ -9935,6 +10339,8 @@ class Manager:
             print(f"  ⚠️ بررسی عمومی/خصوصی: {e}", flush=True)
         fp = self._backup_fingerprint()
         if not force:
+            if not bool(self.cfg.get("auto_backup_on", True)):
+                return False, "بدون تغییر"
             self._load_backup_fp()
             if getattr(self, "_backup_fp", None) == fp:
                 # داده‌ها از آخرین پشتیبان عوض نشده — ولی فقط وقتی «هیچ کاری
@@ -9942,7 +10348,7 @@ class Manager:
                 # پاک کرده باشد، همین‌جا دوباره ساخته می‌شود.
                 existing = await self._find_last_backup_msg(target, limit=100)
                 # پیامِ متنیِ بی‌فایل «پشتیبان موجود» نیست — وگرنه بک‌آپ هرگز فرستاده نمی‌شود.
-                if existing is not None and self._msg_has_media(existing):
+                if (existing is not None and self._msg_has_media(existing)) or not getattr(self, "_last_iter_ok", True):
                     return False, "بدون تغییر"
         # چک‌پوینت WAL تا کپی db کامل باشد
         try:
@@ -10025,7 +10431,7 @@ class Manager:
                                            f"\u00ab<code>clients/</code>\u00bb (سشن و تنظیمات هر اکانت) هم هست و بعد از ری‌استارت Render خودکار بازیابی می‌شود.")
             except Exception:
                 pass
-            self._save_backup_fp(fp)
+            self._save_backup_fp(self._backup_fingerprint())
             print(f"  📦 پشتیبان فرستاده شد به {target} ({sz} بایت, {zcount} فایل, {n} مشتری)", flush=True)
             try:
                 os.remove(tmpzip)
@@ -10790,6 +11196,11 @@ class Manager:
                     and not ev_phone
                     and await self.enforce_join(uid, chat=ev.chat_id)):
                 return
+            if (not self.is_admin(uid)
+                    and not text.lower().startswith("/start")
+                    and not ev_phone
+                    and await self.enforce_rules(uid, chat=ev.chat_id)):
+                return
 
             # ---- مراحل دکمه‌ای ----
             st0 = self.fsm.get(uid)
@@ -11058,12 +11469,48 @@ class Manager:
                     else:
                         val = self.rt_clean(r, text)
                     self.cfg[r[3]] = val
+                    if r[0] == "rules" and val:
+                        self.db.rules_reset_all()
                     self.db.log(uid, "rt_set", f"{r[0]} {len(val)}")
                     return await self.say(ev.chat_id,
                         (f"✅ {r[2]} ذخیره شد." if val else
                          f"✅ {r[2]} به پیش‌فرض برگشت."),
                         [[B(f"{r[1]} {r[2]}", f"a:rt:{r[0]}", "primary")],
                          [B("📝 متن‌های ربات", "a:rt", "success")]])
+
+                if stp == "rules_set" and self.is_admin(uid):
+                    self.fsm.pop(uid, None)
+                    raw = text.strip()
+                    if raw.lower() in self.RT_CLEAR_WORDS:
+                        val = ""
+                    else:
+                        val = raw[:3500]
+                    self.cfg["rules_text"] = val
+                    self.cfg.save()
+                    if val:
+                        self.db.rules_reset_all()
+                    self.db.log(uid, "rules_set", str(len(val)))
+                    t, kb = self.rules_screen()
+                    return await self.say(ev.chat_id,
+                        ("✅ متن قوانین جدید ذخیره شد و در شروع ربات نمایش داده می‌شود.\n"
+                         if val else "✅ متن قوانین به حالت پیش‌فرض برگشت.\n")
+                        + self.LINE + "\n" + t, kb)
+
+                if stp == "rules_btn_set" and self.is_admin(uid):
+                    self.fsm.pop(uid, None)
+                    raw = text.strip()
+                    if raw.lower() in self.RT_CLEAR_WORDS:
+                        val = ""
+                    else:
+                        val = raw[:80]
+                    self.cfg["rules_btn"] = val
+                    self.cfg.save()
+                    self.db.log(uid, "rules_btn_set", str(len(val)))
+                    t, kb = self.rules_screen()
+                    return await self.say(ev.chat_id,
+                        (f"✅ متن دکمه تأیید قوانین → <b>{self._esc(val)}</b>\n"
+                         if val else "✅ متن دکمه تأیید به پیش‌فرض برگشت.\n")
+                        + self.LINE + "\n" + t, kb)
 
                 # ── 📋 دستورات آماده: افزودنِ سه‌قدمی ──
                 if stp == "cm_add" and self.is_admin(uid):
