@@ -109,6 +109,52 @@ def _bot_tz():
         return timezone.utc
 
 
+# ── فیلتر خروجی: پیامِ ناخواسته‌ی «برای استفاده از ربات باید کانال ... جوین شوی» ──
+# این متن در کدِ این پروژه وجود ندارد و از منبعی بیرونی (سرویس میزبان، کانفیگ
+# قدیمی یا تزریق شخص ثالث) به کاربران ارسال می‌شد. هر پیام خروجی‌ای که با این
+# الگوها بخواند، قبل از رسیدن به تلگرام حذف می‌شود.
+BLOCKED_OUTGOING_PATTERNS = (
+    re.compile(r"a_toolsx2", re.IGNORECASE),
+    re.compile(r"t\.me/a_toolsx2", re.IGNORECASE),
+    re.compile(r"to\s+use\s+this\s+bot\s*,?\s*you\s+must\s+join", re.IGNORECASE),
+)
+
+
+def is_blocked_outgoing(text):
+    """True اگر متنِ پیام جزو پیام‌های مسدودشده باشد."""
+    if not isinstance(text, str) or not text:
+        return False
+    return any(p.search(text) for p in BLOCKED_OUTGOING_PATTERNS)
+
+
+def install_outgoing_filter(client):
+    """روی نمونه‌ی TelegramClient، send/edit را طوری می‌پوشاند که پیام مسدودشده
+    هرگز ارسال نشود. برای پیام‌های عادی رفتار تغییری نمی‌کند."""
+    if client is None or getattr(client, "_jafj_out_filter", False):
+        return client
+    from types import SimpleNamespace
+    orig_send = client.send_message
+    orig_edit = client.edit_message
+
+    async def send_message(entity, message=None, *args, **kwargs):
+        if is_blocked_outgoing(message):
+            print("🛡 پیام مسدودشده (جوین اجباریِ بیرونی) ارسال نشد", flush=True)
+            return SimpleNamespace(id=0)
+        return await orig_send(entity, message, *args, **kwargs)
+
+    async def edit_message(entity, message=None, *args, **kwargs):
+        body = message if isinstance(message, str) else kwargs.get("text")
+        if is_blocked_outgoing(body):
+            print("🛡 ویرایش پیام مسدودشده ارسال نشد", flush=True)
+            return SimpleNamespace(id=0)
+        return await orig_edit(entity, message, *args, **kwargs)
+
+    client.send_message = send_message
+    client.edit_message = edit_message
+    client._jafj_out_filter = True
+    return client
+
+
 def local_now():
     """زمان فعلی به ساعت محلیِ ربات (نه ساعت سرور)."""
     return datetime.now(_bot_tz())
@@ -9327,7 +9373,7 @@ class Manager:
                                 raise _RetryLoop()
                             raise
                         if ok:
-                            self.bot = client
+                            self.bot = install_outgoing_filter(client)
                             print("  ✅ نشست ذخیره‌شده معتبر است (بدون ورود دوباره)", flush=True)
                             return client
                         # معتبر نیست → پاک و ورود با توکن در همین تلاش
@@ -9426,7 +9472,7 @@ class Manager:
                             print(f"  💾 نشست ربات ذخیره شد ({len(s)} حرف)", flush=True)
                     except Exception as e:
                         print(f"  ⚠️ ذخیره نشست: {type(e).__name__}: {e}", flush=True)
-                    self.bot = client2
+                    self.bot = install_outgoing_filter(client2)
                     return client2
                 except Exception as e:
                     secs = _flood_seconds(e)
