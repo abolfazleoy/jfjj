@@ -53,10 +53,20 @@ DEFAULT_MSG_NO = "نیومدی"
 
 QUICK_EXCHANGE_DEFAULTS = {
     "msg_ok": "جوین شدم ✅",
+    "msg_no": "چک کردم، نیومدی؛ بیا تا بیام. نمیای، درجا لفت می‌دم\n{mychannel}",
+    "msg_come": "جوینم، جوین شو؛ نمیای لفت می‌دم و چک می‌کنم\n{mychannel}",
+    "msg_wait": "⏳ دارم چک می‌کنم، صبر کن",
+    "msg_nolink": "🔗 لینک کانالت رو بفرست",
+    "msg_claim_no": "گفتی جوین شدی ولی عضو نشدی؛ چک کردم، بیا تا بیام\n{mychannel}",
+}
+
+# این مقادیر همان پیش‌فرض‌های quick exchange نسخه‌ی قبلی‌اند. اگر مدیر
+# خودش متنی را عوض نکرده باشد، با اجرای دوباره‌ی wizard به متن‌های جدید
+# مهاجرت می‌کنند؛ متن‌های سفارشی دیگر دست‌نخورده می‌مانند.
+QUICK_EXCHANGE_PREVIOUS_DEFAULTS = {
     "msg_no": "❌ نیومدی | اول عضو شو بعد بگو",
     "msg_come": "✅ اومدم 🤝 نوبت تو",
     "msg_wait": "⏳ دارم چک می‌کنم صبر کن",
-    "msg_nolink": "🔗 لینک کانالت رو بفرست",
     "msg_claim_no": "❌ گفتی جوین شدی ولی عضو نشدی",
 }
 
@@ -5255,9 +5265,12 @@ async def connect_and_run(eng, creds):
     def _ensure_quick_exchange_defaults(ex_cfg):
         updated = False
         for key, default_text in QUICK_EXCHANGE_DEFAULTS.items():
-            if not str(ex_cfg.get(key) or "").strip():
-                ex_cfg[key] = default_text
-                updated = True
+            current = str(ex_cfg.get(key) or "").strip()
+            previous_default = QUICK_EXCHANGE_PREVIOUS_DEFAULTS.get(key)
+            if not current or (previous_default and current == previous_default):
+                if current != default_text:
+                    ex_cfg[key] = default_text
+                    updated = True
         return updated
 
     async def _start_quick_exchange(user_id):
