@@ -51,6 +51,15 @@ DRY_RUN = False       # True = چیزی واقعاً ارسال نمی‌شود 
 # وقتی متن سفارشی ثبت شده باشد، فقط همان متن می‌رود و لینک طرف زیرش نمی‌آید.
 DEFAULT_MSG_NO = "نیومدی"
 
+QUICK_EXCHANGE_DEFAULTS = {
+    "msg_ok": "جوین شدم ✅",
+    "msg_no": "❌ نیومدی | اول عضو شو بعد بگو",
+    "msg_come": "✅ اومدم 🤝 نوبت تو",
+    "msg_wait": "⏳ دارم چک می‌کنم صبر کن",
+    "msg_nolink": "🔗 لینک کانالت رو بفرست",
+    "msg_claim_no": "❌ گفتی جوین شدی ولی عضو نشدی",
+}
+
 
 # ═══════════════════════════════════════════════════════
 #  ۲) پیش‌فرض‌ها — همه با دستور قابل تغییرند
@@ -5099,6 +5108,7 @@ async def connect_and_run(eng, creds):
     # می‌آید)، پس فقط راهِ تشخیص «پاسخِ خودِ ربات» از «فرمانِ کاربر»،
     # نگه‌داشتن شناسه‌ی ارسال‌های خودِ ربات است.
     own_msg_ids = {}
+    quick_exchange_state = {}
 
     def _track_own(msg):
         try:
@@ -5242,6 +5252,101 @@ async def connect_and_run(eng, creds):
             eng.log("error", "panel", str(e))
         await _say(txt)
 
+    def _ensure_quick_exchange_defaults(ex_cfg):
+        updated = False
+        for key, default_text in QUICK_EXCHANGE_DEFAULTS.items():
+            if not str(ex_cfg.get(key) or "").strip():
+                ex_cfg[key] = default_text
+                updated = True
+        return updated
+
+    async def _start_quick_exchange(user_id):
+        x = eng.ex_cfg()
+        channel = str(eng.st.prof("standard").get("channel") or "").strip()
+        groups = x.get("groups") or []
+        if isinstance(groups, str):
+            groups = [groups]
+        elif not isinstance(groups, (list, tuple, set)):
+            groups = []
+        group = next((str(item).strip() for item in groups
+                      if str(item or "").strip()), "")
+
+        if channel and group:
+            if _ensure_quick_exchange_defaults(x):
+                eng.st.save()
+            quick_exchange_state.pop(user_id, None)
+            await _say("همه‌چیز آماده‌ست، فقط `تبادل روشن` رو بزن")
+            return
+
+        state = {"step": "group" if channel else "channel"}
+        if channel:
+            state["channel"] = channel
+        if group:
+            state["group"] = group
+        quick_exchange_state[user_id] = state
+        if channel:
+            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+        else:
+            await _say("📡 کانالت رو بفرست (مثلاً @mychannel)")
+
+    async def _finish_quick_exchange(user_id, state):
+        channel = str(state.get("channel") or "").strip()
+        group = str(state.get("group") or "").strip()
+        if not channel:
+            state["step"] = "channel"
+            await _say("📡 کانالت رو بفرست (مثلاً @mychannel)")
+            return
+        if not group:
+            state["step"] = "group"
+            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+            return
+
+        st = eng.st
+        st.prof("standard")["channel"] = channel
+        ex_cfg = eng.ex_cfg()
+        ex_cfg["groups"] = [group]
+        _ensure_quick_exchange_defaults(ex_cfg)
+        ex_cfg["enabled"] = True
+        # مثل روشن‌کردن دستی، توقف قبلیِ خودکار را از نظر محافظ باطل کن.
+        st["risk"]["_auto_off"] = False
+        st.save()
+        quick_exchange_state.pop(user_id, None)
+
+        await _say(
+            "✅ تبادل آماده‌ست!\n\n"
+            f"📡 کانال: {channel} ✓\n"
+            f"👥 گروه تبادل: {group} ✓\n"
+            "📝 متن‌های پیش‌فرض: فعال ✓\n"
+            "🔁 تبادل: 🟢 روشن\n\n"
+            "شروع کردم به جذب ممبر! 🚀\n"
+            "برای تنظیمات بیشتر: `پنل`"
+        )
+
+    async def _handle_quick_exchange_input(user_id, raw, low):
+        state = quick_exchange_state.get(user_id) or {}
+        if low in ("لغو", "cancel", ".cancel", "/cancel"):
+            quick_exchange_state.pop(user_id, None)
+            await _say("❌ تبادل سریع لغو شد.")
+            return
+
+        value = raw.strip().split()[0] if raw.strip() else ""
+        if not value:
+            prompt = ("📡 کانالت رو بفرست (مثلاً @mychannel)"
+                      if state.get("step") == "channel" else
+                      "👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+            await _say(prompt)
+            return
+
+        if state.get("step") == "channel":
+            state["channel"] = value
+            if not state.get("group"):
+                state["step"] = "group"
+                await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+                return
+        else:
+            state["group"] = value
+        await _finish_quick_exchange(user_id, state)
+
     # incoming و outgoing «هر دو»: فرمانِ «پنل» که از گوشیِ خودت می‌فرستی
     # به این سشن با out=True می‌رسد (همه‌ی پیام‌های Saved Messages از
     # فرستنده‌ی خودِ اکانت‌اند) و فیلترِ incoming=True قبلی آن را می‌کُشت —
@@ -5256,6 +5361,19 @@ async def connect_and_run(eng, creds):
         # فرمان پنل قبل از هر مسیر AI/تبادل بررسی می‌شود.
         raw = _norm_cmd(event.raw_text or "")
         low = _soft_clean(raw).lower()
+        try:
+            user_id = int(getattr(event, "sender_id", None) or eng.my_id or 0)
+        except (TypeError, ValueError):
+            user_id = int(eng.my_id or 0)
+
+        # ورودیِ فعالِ wizard همیشه داده است، نه فرمان؛ فقط «لغو» از آن خارج می‌شود.
+        if user_id in quick_exchange_state:
+            await _handle_quick_exchange_input(user_id, raw, low)
+            return
+        if low in {"تبادل سریع", ".quickexchange", "/quickexchange"}:
+            await _start_quick_exchange(user_id)
+            return
+
         panel_words = {
             "panel", ".panel", "/panel", "پنل", ".پنل", "/پنل",
             "p", ".p", "/p", "داشبورد", ".داشبورد", "خانه",
@@ -7387,7 +7505,8 @@ async def connect_and_run(eng, creds):
     if not eng.st.prof("standard")["channel"]:
         hint = "\n\n📡 کانال هنوز تعیین نشده: `کانال @channel`"
     await note(f"🟢 جفج {VERSION} آنلاین شد — پنل جدید\n\n"
-               f"`پنل` داشبورد • `راهنما` راهنما{hint}")
+               f"`پنل` داشبورد • `راهنما` راهنما\n\n"
+               f"⚡ `تبادل سریع` — فقط کانال + گروه → تبادل آماده با متن‌های پیش‌فرض{hint}")
 
     # خطای اولیه‌ای که باعث ورود به پاک‌سازی شد را نگه می‌داریم؛ اگر لغوِ
     # بیرونی (CancelledError) بود، در پایان دوباره پرتاب می‌شود تا خاموشی
