@@ -524,7 +524,8 @@ CREATE TABLE IF NOT EXISTS exchange (
     chat_id INTEGER,
     chat_hash INTEGER,
     leave_fail INTEGER NOT NULL DEFAULT 0,
-    leave_blocked_until INTEGER NOT NULL DEFAULT 0
+    leave_blocked_until INTEGER NOT NULL DEFAULT 0,
+    peer_joined_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ex ON exchange(status, last_check);
 CREATE TABLE IF NOT EXISTS events (
@@ -557,7 +558,11 @@ class DB:
                               ("unk_streak", "INTEGER NOT NULL DEFAULT 0"),
                               ("chat_id", "INTEGER"), ("chat_hash", "INTEGER"),
                               ("leave_fail", "INTEGER NOT NULL DEFAULT 0"),
-                              ("leave_blocked_until", "INTEGER NOT NULL DEFAULT 0")):
+                              ("leave_blocked_until", "INTEGER NOT NULL DEFAULT 0"),
+                              # «طرف برگشت و جوینِ کانال من شد» — فقط برای
+                              # رکوردهای پیش‌قدم (direction='out') پر می‌شود؛
+                              # ستون آمارِ «جذب موفق» از همین ساخته می‌شود.
+                              ("peer_joined_at", "INTEGER")):
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE exchange ADD COLUMN {col} {decl}")
             # بعد از مهاجرت ساخته شود؛ وگرنه دیتابیس قدیمی هنوز ستون next_check ندارد.
@@ -781,7 +786,16 @@ class DB:
         return {
             "joined": q("SELECT COUNT(*) c FROM exchange WHERE joined_at IS NOT NULL AND joined_at>=?", (since,)),
             "out_joined": q("SELECT COUNT(*) c FROM exchange WHERE direction='out' AND joined_at IS NOT NULL AND joined_at>=?", (since,)),
-            "in_joined": q("SELECT COUNT(*) c FROM exchange WHERE direction='in' AND joined_at IS NOT NULL AND joined_at>=?", (since,)),
+            # «جذب موفق» = تبادل‌هایی که کسی عضوِ کانال من شد.
+            #   • جهتِ in  → طرف اول آمد و من بعداً جوینِ کانال او شدم.
+            #   • جهتِ out → من پیش‌قدم شدم؛ طرف وقتی برگشت و جوینِ کانال
+            #     من شد (peer_joined_at) — تا قبل از این ستون، این حالت
+            #     هیچ‌جا شمرده نمی‌شد و «جذب موفق» همیشه صفر می‌ماند.
+            # هر رکورد فقط یک‌بار شمرده می‌شود (COUNT روی ردیف است، نه جمع دو کوئری).
+            "in_joined": q("SELECT COUNT(*) c FROM exchange"
+                           " WHERE (direction='in' AND joined_at IS NOT NULL AND joined_at>=?)"
+                           " OR (peer_joined_at IS NOT NULL AND peer_joined_at>=?)",
+                           (since, since)),
             "left": q("SELECT COUNT(*) c FROM events WHERE kind='ex_left' AND ts>=?", (since,)),
             "failed": q("SELECT COUNT(*) c FROM events WHERE kind='ex_join_fail' AND ts>=?", (since,)),
             "pending": q("SELECT COUNT(*) c FROM exchange WHERE status='pending'"),
@@ -4009,6 +4023,11 @@ class Engine:
             if not cur and key == "msg_claim_no":
                 cur = ("تنظیم نشده — همان «پیام ناموفق» می‌رود "
                        "(برای طرفی که ادعای جوین کرده)")
+            if key == "msg_come":
+                # پیامِ پیش‌قدم: کانالِ خودم خودکار زیر متن می‌آید (اگر
+                # خودت داخل متن نگذاشته باشی) تا طرف بداند کجا جوین شود.
+                cur = (cur or "تنظیم نشده — چیزی نمی‌فرستم") + \
+                      "  ←  کانال خودت خودکار زیر متن می‌آید"
             lines += ["", title, "دستور آماده برای کپی:", f"`{command}`",
                       f"متن فعلی: {cur or 'تنظیم نشده'}"]
         lines += ["", "فرمان عمومی «تبادل پیام» متن موفقیت هر دو نوع Join را تنظیم می‌کند.",
@@ -4063,6 +4082,27 @@ class Engine:
             f"👥 جذب موفق تبادل: {fa(c['in_joined'])} نفر",
         ])
 
+    def ex_live_peer_join_text(self, rec):
+        """گزارشِ «طرف هم برگشت و جوینِ کانال من شد» — تکمیلِ پیش‌قدم.
+
+        در حالت پیش‌قدم، گزارشِ لحظه‌ایِ جوین فقط می‌گوید «من رفتم»؛
+        لحظه‌ی تکمیلِ تبادل وقتی است که طرف هم عضو کانال من شود. قبلاً
+        این لحظه هیچ پیامی نداشت و ستونِ «جذب موفق» هم هیچ‌وقت بالا
+        نمی‌رفت — کاربر فکر می‌کرد تبادل انجام شده ولی هیچ‌جا نمی‌دید.
+        """
+        c = self.db.ex_report_counts(self._day_start())
+        return "\n".join([
+            "🤝 تبادل کامل شد",
+            "",
+            f"📡 کانال: {rec.get('link') or '—'}",
+            "✅ طرف هم عضوِ کانال من شد",
+            "",
+            "📊 آمار امروز:",
+            f"✅ Join شده: {fa(c['joined'])} کانال",
+            f"👋 لفت داده‌شده: {fa(c['left'])} کانال",
+            f"👥 جذب موفق تبادل: {fa(c['in_joined'])} نفر",
+        ])
+
     def ex_live_leave_text(self, rec, err="", reason="left"):
         """گزارش لفت.
 
@@ -4092,12 +4132,44 @@ class Engine:
                            "بیشتر انجام می‌شود تا روی اکانت فشار نیفتد.")
         return "\n".join(out)
 
+    def ex_my_channel(self):
+        """کانال خودم (standard اولویت، بعد vip) — خالی = تنظیم نشده."""
+        return (self.st.prof("standard")["channel"] or
+                self.st.prof("vip")["channel"] or "").strip()
+
+    def ex_append_my_channel(self, body):
+        """کانال خودم را «زیر متن» می‌آورد — اگر از قبل داخل متن نباشد.
+
+        قاعده‌ی کلیِ محصول: هیچ‌وقت لینکِ *طرف* اتوماتیک زیر پیام نمی‌رود؛
+        ولی کانالِ *خودم* باید زیر متن باشد تا طرف بداند کدام کانال را
+        جوین شود. مقایسه‌ی تکراری‌بودن نرمال است: `@chan` و
+        `https://t.me/chan` یکی حساب می‌شوند، پس «دو بار» نمی‌آید.
+        """
+        txt = (body or "").strip()
+        mych = self.ex_my_channel()
+        if not txt or not mych:
+            return txt
+
+        def _norm(s):
+            s = str(s or "").strip().lower().rstrip("/")
+            s = re.sub(r"^https?://", "", s)
+            s = re.sub(r"^(t\.me|telegram\.me)/", "", s)
+            return s.lstrip("@")
+
+        if _norm(mych) and _norm(mych) in _norm(txt):
+            return txt
+        return f"{txt}\n{mych}"
+
     def ex_render(self, key, name="", channel=""):
         """متن کاربر را با مقادیر واقعی پر می‌کند. خالی = جوابی نده.
         تنها استثنا msg_no است: اگر متنی ثبت نشده باشد، پیش‌فرض
         «نیومدی» + کانال خودم (standard/vip) فرستاده می‌شود.
         وقتی متن سفارشی msg_no ثبت شده باشد، فقط همان متن می‌رود و
-        هیچ لینکی زیرش اضافه نمی‌شود — لینک طرف هرگز اتوماتیک نمی‌آید."""
+        هیچ لینکی زیرش اضافه نمی‌شود — لینک طرف هرگز اتوماتیک نمی‌آید.
+
+        «پیام پیش‌قدم» (msg_come و مسیرهای جایگزینش) جداست: کانالِ خودم
+        همیشه زیرش می‌آید و این کار در `reply_joined` انجام می‌شود (نه
+        اینجا) تا هر سه مسیرِ متن را پوشش بدهد."""
         cfg = self.ex_cfg()
         raw = (cfg.get(key) or "").strip()
         custom = bool(raw)
@@ -4110,8 +4182,7 @@ class Engine:
         if not t:
             return ""
         # کانال خودم: standard اولویت، بعد vip
-        mych = (self.st.prof("standard")["channel"] or
-                self.st.prof("vip")["channel"] or "").strip()
+        mych = self.ex_my_channel()
         try:
             rendered = (t.replace("{name}", name or "")
                          .replace("{channel}", channel or "")
@@ -4122,8 +4193,7 @@ class Engine:
         # اگر msg_no سفارشی نیست (یعنی پیش‌فرض)، کانال خودم را زیرش بیاور
         # نه کانال طرف. اگر سفارشی است، هیچ لینکی اتوماتیک اضافه نکن.
         if key in ("msg_no", "msg_claim_no") and not custom:
-            if mych and mych not in rendered:
-                rendered = f"{rendered}\n{mych}"
+            rendered = self.ex_append_my_channel(rendered)
         return rendered
 
     def ex_list_text(self, status=None):
@@ -5976,6 +6046,15 @@ async def connect_and_run(eng, creds):
             body = eng.ex_render("msg_ok", rec.get("peer_name") or "", rec["link"])
         if not body:
             return False
+        if outgoing:
+            # باگِ «پیش‌قدم: زیرِ متن، کانال نیست»: در پیامِ «جوین شدم»ِ
+            # پیش‌قدم (خودت اول جوین شدی) لینکِ کانالِ خودت زیرِ متن
+            # می‌آید — چون طرف فقط از همین پیام می‌فهمد کدام کانال را
+            # جوین شود و تبادل کامل شود. تا قبلش این خط فقط برای
+            # «نیومدی» اضافه می‌شد و پیامِ پیش‌قدم بدون آدرس می‌رفت.
+            # اگر کاربر خودش {mychannel} یا آدرس را داخل متن گذاشته
+            # باشد، دوباره اضافه نمی‌شود.
+            body = eng.ex_append_my_channel(body)
         chat, mid = rec.get("src_chat"), rec.get("src_msg")
         if not chat or not mid:
             return False
@@ -7063,11 +7142,26 @@ async def connect_and_run(eng, creds):
                         still = False
                     now = int(time.time())
                     if still is True:
+                        # باگِ «جذب موفق آپدیت نمی‌شود»: در حالت پیش‌قدم
+                        # (direction='out') طرف دیرتر برمی‌گردد و عضوِ کانال
+                        # من می‌شود؛ این لحظه هیچ‌جا ثبت نمی‌شد، پس شمارنده‌ی
+                        # «جذب موفق» هم هیچ‌وقت بالا نمی‌رفت. الان با اولین
+                        # تأییدِ عضویت، زمانش ذخیره و یک‌بار هم به خودت
+                        # گزارش می‌شود (فقط یک‌بار، چون ستون دیگر خالی نیست).
+                        _peer_back = (rec.get("direction") == "out"
+                                      and not int(rec.get("peer_joined_at") or 0))
                         eng.db.ex_set(rec["id"], last_check=now,
                                       next_check=next_action_after(
                                           rec, now + watch_delay_seconds(rec)),
                                       strikes=0, unk_streak=0, reminders_total=0,
-                                      note="عضو است")
+                                      note="عضو است",
+                                      **({"peer_joined_at": now} if _peer_back else {}))
+                        if _peer_back:
+                            eng.log("ok", "ex_peer_joined",
+                                    f"#{rec['id']} {rec['link']}")
+                            if eng.ex_cfg().get("report_mode", "live") == "live":
+                                await note(eng.ex_live_peer_join_text(
+                                    eng.db.ex_get(rec["id"]) or rec))
                     elif still is False:
                         st = rec["strikes"] + 1
                         # فیکس: طرفی که از اول هیچ‌وقت نیامده (بدون ادعای
