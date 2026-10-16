@@ -84,6 +84,12 @@ class TelegramClient:
         class R:
             id = 1
         return R()
+    async def edit_message(self, *a, **k):
+        # Telethon واقعی این متد را دارد و install_outgoing_filter رویش
+        # فیلتر پیام‌های مسدود را می‌گذارد؛ شیمِ تست هم باید مثل خودش باشد.
+        class R:
+            id = 1
+        return R()
     async def get_entity(self, x):
         class E:
             username = None
