@@ -732,6 +732,23 @@ class DB:
         return self._x("SELECT * FROM exchange ORDER BY id DESC LIMIT ?",
                        (limit,), "all")
 
+    def ex_same_channel_left(self, rec):
+        """رکوردِ دیگری که «همین کانال» را قبلاً لفت داده است.
+
+        چرا لازم است: طرف می‌تواند برای یک کانال دو لینک ثبت کند
+        (مثلاً `@chan` و `t.me/+hash`) و دو رکورد بسازد. هر دو رکورد
+        `chat_id` یکسان می‌گیرند؛ بعد از لفتِ اولی، لفتِ دومی خطای
+        «عضو نیستی» می‌دهد که در `leave_link` موفق حساب می‌شود — یعنی
+        پیام «👋 لفت انجام شد» برای یک کانال دو بار می‌رفت. با این چک،
+        رکوردِ دوم بی‌صدا بسته می‌شود.
+        """
+        cid = (rec or {}).get("chat_id")
+        if not cid:
+            return None
+        return self._x("SELECT * FROM exchange WHERE id<>? AND chat_id=?"
+                       " AND status='left' ORDER BY id LIMIT 1",
+                       (int(rec.get("id") or 0), int(cid)), "one")
+
     def ex_due(self, ts, limit=15):
         """تبادل‌های انجام‌شده‌ای که زمان بررسی بعدی‌شان رسیده است.
         next_check برای فاصله تصادفی جدید است؛ last_check پشتیبان دیتابیس قدیمی است.
@@ -4052,12 +4069,15 @@ class Engine:
         reason:
           «left»   → چکِ نگهبانی دید طرف از کانال من خارج شده → من هم لفت دادم
           «nojoin» → طرف بعد از دو «نیومدی» عضو کانال من نشد → من از کانالش لفت دادم
+          «manual» → خودت دستور `تبادل خروج N` را داده بودی
 
         متنِ قبلی همیشه می‌گفت «طرف از کانال من خارج شده بود»، حتی وقتی
         دلیلِ لفت این نبود (مثلاً طرف اصلاً نیامده بود) — همین باعث
         سوتفاهم می‌شد.
         """
-        why = ("⏳ طرف بعد از پیام‌های «نیومدی» عضو کانال من نشد"
+        why = ("🖐 لفت دستی — خودت دستور دادی"
+               if reason == "manual" else
+               "⏳ طرف بعد از پیام‌های «نیومدی» عضو کانال من نشد"
                if reason == "nojoin" else
                "✅ طرف از کانال من خارج شده بود")
         out = ["👋 لفت انجام شد" if not err else "⚠️ لفت انجام نشد",
@@ -6882,15 +6902,31 @@ async def connect_and_run(eng, creds):
                                     rec, int(time.time()) + membership_check_delay()),
                                     note="لفت معلق — عضویت نامشخص است")
                                 continue
+                            # وضعیتِ تازه: اگر رکورد دیگر در حالت joined
+                            # نیست (لفتِ مسیر دیگر/دستی)، دوباره لفت نزن.
+                            _fresh = eng.db.ex_get(rec["id"])
+                            if not _fresh or _fresh.get("status") != "joined":
+                                continue
                             # اگر تلاشِ قبلیِ لفت شکست خورده و عقب‌نشینی
                             # فعال است، دوباره تلاش نکن: هم به اکانت فشار
                             # نمی‌آید، هم نوتیف تکراری نمی‌رود.
-                            _blk = int(rec.get("leave_blocked_until") or 0)
+                            _blk = int(max(int(rec.get("leave_blocked_until") or 0),
+                                           int(_fresh.get("leave_blocked_until") or 0)))
                             if _blk > int(time.time()):
                                 eng.db.ex_set(rec["id"], next_reminder=0,
                                               next_check=_blk,
                                               note="لفت معلق — لینکِ طرف "
                                                    "قابل‌حل نیست، بعداً دوباره")
+                                continue
+                            # کانالِ تکراری: اگر همان کانال با رکوردِ دیگری
+                            # قبلاً لفت شده، این رکورد را هم بی‌صدا ببند تا
+                            # پیام «لفت انجام شد» دوباره نرود.
+                            _twin = eng.db.ex_same_channel_left(_fresh)
+                            if _twin:
+                                eng.db.ex_set(rec["id"], status="left",
+                                              next_reminder=0, next_check=0,
+                                              note="همان کانال قبلاً لفت شد "
+                                                   f"(رکورد #{_twin['id']})")
                                 continue
                             ok, err = await leave_link(rec["link"], rec["id"])
                             _now_l = int(time.time())
@@ -6916,7 +6952,15 @@ async def connect_and_run(eng, creds):
                                               leave_fail=_fails,
                                               leave_blocked_until=_now_l + _back,
                                               note=f"لفت نشد (تلاش {_fails}): {err}")
-                            eng.log("info", "ex_left", f"#{rec['id']} {rec['link']}")
+                            # لفتِ ناموفق «لفت» حساب نمی‌شود: آمارِ گزارش و
+                            # ریسک فقط لفت‌های واقعی را می‌شمارند، وگرنه
+                            # گزارش می‌گفت «لفت داده‌شده» در حالی‌که طرف
+                            # هنوز در کانالِ طرف است.
+                            if ok:
+                                eng.log("info", "ex_left", f"#{rec['id']} {rec['link']}")
+                            else:
+                                eng.log("warn", "ex_leave_fail",
+                                        f"#{rec['id']} {rec['link']} — {err}")
                             if ok and rec.get("direction") == "out":
                                 # بعد از لفت، نوبت بعدی را از گروه بررسی کن.
                                 x["_scan_now"] = True
@@ -6989,8 +7033,17 @@ async def connect_and_run(eng, creds):
                         continue
                     # اگر چک دائمی خاموش یا مهلتش گذشته → دیگر چک نکن
                     if not eng.should_watch_joined(rec):
+                        # فیکس باگِ «چرخه‌ی بی‌پایان»: قبلاً next_check صفر و
+                        # last_check «الان» می‌شد؛ یعنی همان شرطِ ex_due
+                        # (next_check=0 AND last_check<=now) دوباره برقرار
+                        # بود و حلقه هر چند ثانیه همین رکورد را برمی‌داشت،
+                        # هر بار یک نوشتن در دیتابیس می‌زد و جا را برای
+                        # رکوردهای واقعی تنگ می‌کرد. الان بازنشستگی تا ۶
+                        # ساعت دیگر قطعی است و هر ۶ ساعت یک‌بار دوباره چک
+                        # می‌شود (اگر تنظیمات را عوض کنی، خودش برمی‌گردد).
+                        _retire_to = int(time.time()) + 6 * 3600
                         eng.db.ex_set(rec["id"], last_check=int(time.time()),
-                                      next_check=0,
+                                      next_check=_retire_to,
                                       note="پایان نگهبانی دائمی (سقف ساعت)")
                         continue
                     # رکوردهای دارای نوبتِ یادآوری فعال (ادعای «جوین شدم» بدون
@@ -7060,14 +7113,33 @@ async def connect_and_run(eng, creds):
                                     rec, int(time.time()) + membership_check_delay()),
                                     note="لفت معلق — عضویت نامشخص است")
                                 continue
+                            # وضعیتِ تازه را از دیتابیس بخوان: اگر بینِ این
+                            # تصمیم و چکِ قبلی، رکورد از حالت joined خارج شده
+                            # (لفتِ دستیِ خودت، لفتِ مسیر یادآوری، حذف/رد)،
+                            # دوباره لفت نزن و پیام «لفت انجام شد» تکراری نساز.
+                            _fresh = eng.db.ex_get(rec["id"])
+                            if not _fresh or _fresh.get("status") != "joined":
+                                continue
                             # عقب‌نشینیِ لفتِ ناموفق (لینک منقضی/خطای موقت):
                             # تا پایان مهلت، تلاش تکراری نکن.
-                            _blk = int(rec.get("leave_blocked_until") or 0)
+                            _blk = int(max(int(rec.get("leave_blocked_until") or 0),
+                                           int(_fresh.get("leave_blocked_until") or 0)))
                             if _blk > int(time.time()):
                                 eng.db.ex_set(rec["id"], last_check=now,
                                               next_check=_blk,
                                               note="لفت معلق — لینکِ طرف "
                                                    "قابل‌حل نیست، بعداً دوباره")
+                                continue
+                            # کانالِ تکراری: اگر همان کانال با رکوردِ دیگری
+                            # قبلاً لفت شده، این رکورد را هم بی‌صدا ببند تا
+                            # پیام «لفت انجام شد» دوباره نرود.
+                            _twin = eng.db.ex_same_channel_left(_fresh)
+                            if _twin:
+                                eng.db.ex_set(rec["id"], status="left",
+                                              last_check=now, next_check=0,
+                                              strikes=st,
+                                              note="همان کانال قبلاً لفت شد "
+                                                   f"(رکورد #{_twin['id']})")
                                 continue
                             ok, err = await leave_link(rec["link"], rec["id"])
                             _now_l = int(time.time())
@@ -7091,7 +7163,12 @@ async def connect_and_run(eng, creds):
                                               leave_fail=_fails,
                                               leave_blocked_until=_now_l + _back,
                                               note=f"لفت نشد (تلاش {_fails}): {err}")
-                            eng.log("info", "ex_left", f"#{rec['id']} {rec['link']}")
+                            # لفتِ ناموفق در آمار/ریسک «لفت» شمرده نمی‌شود.
+                            if ok:
+                                eng.log("info", "ex_left", f"#{rec['id']} {rec['link']}")
+                            else:
+                                eng.log("warn", "ex_leave_fail",
+                                        f"#{rec['id']} {rec['link']} — {err}")
                             if ok and rec.get("direction") == "out":
                                 # بعد از لفت، نوبت بعدی را از گروه بررسی کن.
                                 x["_scan_now"] = True
@@ -7208,8 +7285,16 @@ async def connect_and_run(eng, creds):
                     ok, err = await leave_link(rec["link"], rec["id"])
                     eng.db.ex_set(rec["id"], status="left" if ok else "failed",
                                   note="لفت دستی" if ok else err)
-                    eng.log("info" if ok else "warn", "ex_leave",
+                    # لفتِ دستی هم در آمار شمرده می‌شود (ex_left فقط برای
+                    # لفتِ واقعی) و نتیجه‌اش هم به خودت گزارش می‌شود؛ قبلاً
+                    # اگر لفت دستی شکست می‌خورد، هیچ پیامی نمی‌آمد.
+                    eng.log("info" if ok else "warn",
+                            "ex_left" if ok else "ex_leave_fail",
                             f"#{rec['id']} {rec['link']} {err}")
+                    if eng.ex_cfg().get("report_mode", "live") == "live":
+                        await note(eng.ex_live_leave_text(
+                            eng.db.ex_get(rec["id"]) or rec,
+                            "" if ok else err, "manual"))
                     await asyncio.sleep(3)
 
                 # ۲) جوین تأییدشده‌ها — تطبیقی + سقف ساعتی
