@@ -936,6 +936,7 @@ class ExCooldown:
         # این‌ها «صبر کن» می‌دهد تا دو مسیر همزمان روی یک رکورد کار نکنند.
         self._busy = set()
         self._last_done = {}        # رکورد → زمانِ تمام‌شدنِ آخرین عملکرد
+        self._last_kind = {}        # رکورد → نوعِ آخرین عملکرد (check/join/…)
         self._order = []            # برای هرسِ حافظه
         self.last_global_done = 0.0
         self.blocked_until = 0.0
@@ -1007,6 +1008,24 @@ class ExCooldown:
     def ready(self, rec_id, now=None):
         return self.wait_for(rec_id, now) <= 0.0
 
+    def last_kind(self, rec_id):
+        """نوعِ آخرین عملکردِ تمام‌شده روی این رکورد ("" اگر هیچی).
+
+        دروازه‌ی ارسال «نیومدی» با این فرق می‌گذارد بین:
+          • «پیامِ تکراری درجا پشتِ پیام/جوین/لفتِ قبلی» → باید رد شود
+            و نوبتش به بعد منتقل شود؛
+          • «ادامه‌ی همان نوبت بعد از چکِ بی‌صدای عضویت» → چک و پیامِ
+            بعدش دو نیمه‌ی یک نوبت‌اند؛ اگر این هم رد شود، حلقه‌ی
+            یادآوری که هر نوبت اول چک می‌کند، هیچ‌وقت به ارسال نمی‌رسد
+            (باگِ «گفت دارم چک می‌کنم و دیگر هیچی نگفت»).
+        """
+        if not rec_id:
+            return ""
+        try:
+            return self._last_kind.get(int(rec_id), "") or ""
+        except (TypeError, ValueError):
+            return ""
+
     def defer_if_due(self, rec, due_ts, now=None):
         """رکوردِ سررسیدشده را اگر در خنک‌کننده/صف است به زمانِ درست منتقل می‌کند.
 
@@ -1074,10 +1093,12 @@ class ExCooldown:
                 self.last_global_done = done
                 if rid is not None:
                     self._last_done[rid] = done
+                    self._last_kind[rid] = kind
                     self._order.append(rid)
                     if len(self._order) > 600:
                         for k in self._order[:200]:
                             self._last_done.pop(k, None)
+                            self._last_kind.pop(k, None)
                         del self._order[:200]
 
     def note_done(self, rec_id=None, now=None):
@@ -1093,10 +1114,14 @@ class ExCooldown:
             return
         rid = int(rec_id)
         self._last_done[rid] = now
+        # ادامه‌ی همان چکِ عضویت است؛ نوع عملکرد «check» می‌ماند تا
+        # دروازه‌ی ارسال بداند پیامِ بعدی ادامه‌ی همان نوبت است.
+        self._last_kind[rid] = "check"
         self._order.append(rid)
         if len(self._order) > 600:
             for k in self._order[:200]:
                 self._last_done.pop(k, None)
+                self._last_kind.pop(k, None)
             del self._order[:200]
 
     def mark_done(self, rec_id, now=None):
@@ -1111,15 +1136,18 @@ class ExCooldown:
         if len(self._order) > 600:
             for k in self._order[:200]:
                 self._last_done.pop(k, None)
+                self._last_kind.pop(k, None)
             del self._order[:200]
 
     def reset(self, rec_id=None):
         """خنک‌کننده را پاک می‌کند (برای رکوردِ تازه یا تست)."""
         if rec_id:
             self._last_done.pop(int(rec_id), None)
+            self._last_kind.pop(int(rec_id), None)
             self._busy.discard(int(rec_id))
         else:
             self._last_done.clear()
+            self._last_kind.clear()
             self._busy.clear()
             self._order.clear()
             self.last_global_done = 0.0
@@ -3639,7 +3667,12 @@ class Engine:
                 self.db.ex_delete(rec["id"])
                 return f"🗑 `#{fa(rec['id'])}` حذف شد."
             if sub == "ok":
-                self.db.ex_set(rec["id"], status="approved", strikes=0)
+                # replied=0: پیام «دارم چک می‌کنم» (msg_wait) که قبل از
+                # تأیید رفته، replied را ۱ کرده است؛ اگر صفر نشود، بعد از
+                # جوینِ واقعی reply_joined پیام «جوین شدم» را نمی‌فرستد و
+                # طرف فقط همان «در حال بررسی» را می‌بیند و دیگر هیچ.
+                self.db.ex_set(rec["id"], status="approved", strikes=0,
+                               replied=0)
                 return f"✅ `#{fa(rec['id'])}` تأیید شد — تو نوبت جوین."
             self.db.ex_set(rec["id"], status="leaving")
             return f"👋 `#{fa(rec['id'])}` تو نوبت لفت."
@@ -6256,8 +6289,23 @@ async def connect_and_run(eng, creds):
         # بعدی کمی جلو می‌افتد تا دوباره تلاش شود — بدون سوزاندنِ شمارنده‌ی
         # یادآوری و بدون لفتِ زودهنگام. (باگِ «دو تا نیومدی درجا» همین‌جا
         # بسته می‌شود، چون هر سه مسیر ارسال از این تابع رد می‌شوند.)
+        #
+        # استثنا — فیکسِ «گفت دارم چک می‌کنم و دیگر هیچی نگفت»: حلقه‌ی
+        # یادآوری هر نوبت اول عضویت را «چک» می‌کند و اگر عضو نبود،
+        # بلافاصله همین تابع را صدا می‌زند؛ یعنی آخرین عملکرد همیشه
+        # چکِ همین چند لحظه پیش است و دروازه بدون استثنا، ارسال را
+        # «همیشه» رد می‌کرد. حلقه هم آن را شکستِ ارسال حساب می‌کرد،
+        # اخطار می‌سوزاند و تبادل را بی‌اینکه حتی یک «نیومدی» برود لغو
+        # می‌کرد — طرف فقط «دارم چک می‌کنم» را دیده بود. وقتی آخرین
+        # عملکرد چکِ بی‌صدای همان نوبت بوده، این ارسال ادامه‌ی همان
+        # نوبت است، نه پیامِ تکراری: رد نمی‌شود و صفِ تک‌عملکردی در
+        # action() خودش باقیِ فاصله (۱۵–۲۰ ثانیه) را صبر می‌کند و بعد
+        # می‌فرستد — فاصله‌ی بین عملکرد‌ها همچنان کامل رعایت می‌شود.
         wait_op = ex_cd.wait_for(rec.get("id"))
-        if wait_op > 0:
+        _last_kind_fn = getattr(ex_cd, "last_kind", None)
+        _last_kind = (_last_kind_fn(rec.get("id"))
+                      if callable(_last_kind_fn) else "")
+        if wait_op > 0 and _last_kind != "check":
             nxt = int(time.time() + max(1, int(wait_op) + 1))
             eng.db.ex_set(rec["id"], next_reminder=nxt,
                           note="در صف عملکرد — «نیومدی» کمی دیگر می‌رود")
@@ -6621,13 +6669,20 @@ async def connect_and_run(eng, creds):
                     eng.log("info", "ex_unknown_recheck",
                             f"{sender_name} → {link or rec0.get('link')}")
                 else:
-                    # کانال من اصلاً تنظیم نشده؛ عضویت هرگز قابل تأیید نیست.
+                    # کانال من اصلاً تنظیم نشده؛ عضویت فعلاً قابل تأیید نیست.
                     # در وضعیت pending می‌ماند تا کانال ست شود — نه تأییدِ
-                    # کورکورانه، نه جوینِ کانال طرف.
+                    # کورکورانه، نه جوینِ کانال طرف. نوبتِ چکِ دوباره هم
+                    # می‌گیرد تا به‌محض ست‌شدن کانال، حلقه‌ی یادآوری خودش
+                    # ادامه بدهد؛ قبلاً next_reminder ست نمی‌شد و رکورد
+                    # برای همیشه مرده می‌ماند (طرف فقط «دارم چک می‌کنم»
+                    # را دیده بود و دیگر هیچ).
                     eng.db.ex_set(rec0["id"], status="pending", direction="in", claim_joined=int(claim),
                                   peer_id=sender.id, peer_name=sender_name,
                                   src_chat=event.chat_id, src_msg=event.id,
                                   replied=0, strikes=0,
+                                  next_reminder=next_action_after(
+                                      rec0, int(time.time())
+                                      + membership_check_delay()),
                                   note="کانال من تنظیم نشده — عضویت تأیید نشد")
                     eng.log("warn", "ex_no_channel",
                             f"{sender_name} → {link or rec0.get('link')}")
