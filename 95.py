@@ -70,6 +70,14 @@ QUICK_EXCHANGE_PREVIOUS_DEFAULTS = {
     "msg_claim_no": "❌ گفتی جوین شدی ولی عضو نشدی",
 }
 
+# توضیحِ کوتاه و ثابتِ «تبادل سریع» — ته پنل و اولِ wizard می‌آید تا
+# کاربر بدون حدس‌زدن بداند فقط دو ورودی دارد: کانال + گروه.
+QUICK_EXCHANGE_HELP = (
+    "⚡ تبادل سریع — فقط ۲ قدم:\n"
+    "۱) کانالِ خودت (مثلاً @mychannel)\n"
+    "۲) گروه تبادل (مثلاً @exchange_group)\n"
+    "متن‌های پیش‌فرض خودکار ست می‌شن و تبادل روشن می‌شه؛ تمومه."
+)
 
 # ═══════════════════════════════════════════════════════
 #  ۲) پیش‌فرض‌ها — همه با دستور قابل تغییرند
@@ -268,6 +276,74 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime
+
+
+# ── اعتبارسنجی آیدی/لینکِ کانال و گروه ──────────────────────────────
+# قاعده‌ی اصلی: در «تبادل سریع» هر ورودی باید یک آیدی/لینکِ واقعی باشد.
+# قبلاً هر چیزی (حتی خودِ کلمه‌ی «کانال» یا «گروه») به‌عنوان مقدار ذخیره
+# می‌شد؛ نتیجه: کانال خالی می‌ماند ولی گروهِ بی‌معنی ثبت می‌شد و تبادل
+# روشن می‌شد. این تابع همان باگ را می‌بندد.
+_REF_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+_REF_INVITE_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+_REF_NOT_A_VALUE = {
+    "کانال", "چنل", "گروه", "پنل", "بستن", "لغو", "تبادل", "تنظیمات",
+    "channel", "group", "panel", "close", "cancel", "none", "off",
+}
+
+
+def normalize_peer_ref(value):
+    """«@name / name / t.me/name / +hash / t.me/+hash» → مقدارِ قابل‌ذخیره.
+
+    None یعنی مقدار معتبر نیست (خالی، دستور، جمله، فاصله‌دار یا لینکِ
+    ناشناخته). عمداً محافظه‌کار است: چیزی که مطمئن نیستیم آیدی است را
+    ذخیره نمی‌کنیم تا دوباره «گروهِ الکی» ثبت نشود.
+    """
+    v = (value or "").strip().strip("«»\"'")
+    if not v or len(v) > 100 or re.search(r"\s", v):
+        return None
+    low = v.lower().strip(".:،")
+    if low in _REF_NOT_A_VALUE:
+        return None
+    # لینک کامل یا کوتاهِ t.me / telegram.me
+    m = re.match(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(.+)$",
+                 v, flags=re.I)
+    if m:
+        path = m.group(1).strip("/")
+        if path.lower().startswith("joinchat/"):
+            path = "+" + path[len("joinchat/"):]
+        if path.lower().startswith("s/"):
+            path = path[2:]
+        if path.startswith("+"):
+            h = path[1:]
+            return f"https://t.me/+{h}" if _REF_INVITE_RE.match(h) else None
+        if path.lower().startswith("c/"):
+            return None          # لینکِ پیامِ خصوصی، آیدیِ کانال نیست
+        name = path.split("/")[0]
+        return f"@{name}" if _REF_USERNAME_RE.match(name) else None
+    # هشِ دعوتِ خالی: «+abc123»
+    if v.startswith("+"):
+        h = v[1:]
+        return f"https://t.me/+{h}" if _REF_INVITE_RE.match(h) else None
+    # آیدیِ عددی (کانال/گروهِ جوین‌شده)
+    if re.fullmatch(r"-?\d{5,20}", v):
+        return v
+    name = v.lstrip("@")
+    if _REF_USERNAME_RE.match(name):
+        return f"@{name}"
+    return None
+
+
+def same_peer_ref(a, b):
+    """آیا دو مقدار به یک کانال/گروه اشاره می‌کنند؟ (برای ردِ کانال=گروه)"""
+    def _norm(s):
+        s = str(s or "").strip().lower().rstrip("/")
+        s = re.sub(r"^https?://", "", s)
+        s = re.sub(r"^(www\.)?(t|telegram)\.me/", "", s)
+        s = s.replace("joinchat/+", "+")
+        return s.lstrip("@")
+    na, nb = _norm(a), _norm(b)
+    return bool(na) and na == nb
+
 
 VERSION = "3.0"
 BUILD_TAG = "JAFJ_SELF_69_70_EN_2026_08_28"
@@ -2319,6 +2395,20 @@ class Engine:
     def ex_cfg(self):
         return self.st["exchange"]
 
+    def ex_channel_ready(self):
+        """قاعده‌ی اصلیِ تبادل: تا کانالِ معتبرِ خودت ثبت نشده، هیچ عملکردی نرو.
+
+        کانال «عادی» اولویت دارد ولی اگر فقط VIP ست شده باشد هم کافی است
+        (همان منطقِ `peer_in_my_channel`). مقدارِ ذخیره‌شده با همان
+        اعتبارسنجیِ wizard سنجیده می‌شود تا داده‌ی خرابِ قدیمی (مثلاً
+        کلمه‌ی «کانال» که اشتباهی ذخیره شده) «کانالِ ثبت‌شده» حساب نشود.
+        """
+        for tier in ("standard", "vip"):
+            ch = (self.st.prof(tier)["channel"] or "").strip()
+            if ch and normalize_peer_ref(ch):
+                return True
+        return False
+
     def hour_cap_wait(self, now=None):
         """سقف جوین/ساعت: اگر روشن باشد و در یک ساعتِ غلتان به سقف رسیده‌ایم،
         مدتِ مانده تا باز شدن پنجره را برمی‌گرداند؛ وگرنه ۰.
@@ -2963,14 +3053,23 @@ class Engine:
             if not self.lim.allowed("exchange"):
                 return ("🔒 تبادل در پلن فعلی تو نیست.\n"
                         "برای فعال شدن، پلن را ارتقا بده.")
+            # ── قاعده‌ی “اول کانال، بعد گروه” ──
+            # بدون کانال، نه اسکنِ گروه لازم است نه چکِ عضویت؛ روشن‌کردنِ
+            # تبادل فقط این توهم را می‌ساخت که ربات دارد کار می‌کند و در
+            # عمل هیچ‌چیز تأیید نمی‌شد. حالا روشن‌کردن هم رد می‌شود.
+            if not self.ex_channel_ready():
+                x["enabled"] = False
+                self.st.save()
+                return ("❌ تبادل روشن **نشد** — اول کانالِ خودت رو ثبت کن.\n\n"
+                        "📡 `کانال @mychannel`\n"
+                        "⚡ یا کلِ راه با هم: `تبادل سریع`\n\n"
+                        "قاعده: تا کانال ثبت نشه، ربات سراغ گروهِ تبادل نمی‌ره، "
+                        "عضویت کسی رو چک نمی‌کنه و جوین/لفت نمی‌زنه.")
             x["enabled"] = True
             # تصمیم دستیِ کاربر، خاموشیِ خودکارِ محافظ را باطل می‌کند
             self.st["risk"]["_auto_off"] = False
             self.st.save()
             w = ""
-            if not self.st.prof("standard")["channel"]:
-                w += ("\n\n⚠️ کانال تعیین نشده — بدون آن نمی‌توانم چک کنم طرف "
-                      "عضو شده یا نه.\n`کانال @channel`")
             if not any(x[k] for k in ("msg_ok", "msg_wait",
                                       "msg_nolink", "msg_first", "msg_come")):
                 w += ("\n\n💬 هنوز متنی برای جواب‌ها تعیین نکرده‌ای؛ فعلاً فقط "
@@ -3806,6 +3905,15 @@ class Engine:
             "",
             f"کانال من: {ch or 'تنظیم نشده'} · گروه‌ها: {fad(len(groups))}",
             "",
+        ]
+        if not self.ex_channel_ready():
+            lines += [
+                "❌ کانالِ من تنظیم نشده — تا ثبتش نکنی تبادل هیچ کاری "
+                "نمی‌کند:",
+                "`کانال @mychannel` · یا کلِ راه: `تبادل سریع`",
+                "",
+            ]
+        lines += [
             f"جوین امروز: {fad(today)} · انجام‌شده: {fad(c.get('joined', 0))}"
             f" · در صف: {fad(c.get('approved', 0))}",
             "",
@@ -4775,6 +4883,13 @@ class Engine:
             "📊 آمار  →  `آمار`",
             "🎛 تنظیمات  →  `تنظیمات`",
             "📖 راهنما  →  `راهنما`",
+            "",
+            "━━━━━━━━━━━━━━",
+            QUICK_EXCHANGE_HELP,
+            "👉  `تبادل سریع`",
+            "",
+            "🚪 بستن پنل  →  `بستن پنل`",
+            "   (پنل پاک می‌شه و پیامِ شروع دوباره میاد)",
         ]
         return "\n".join(lines) + "\n"
 
@@ -5242,6 +5357,9 @@ async def connect_and_run(eng, creds):
     # نگه‌داشتن شناسه‌ی ارسال‌های خودِ ربات است.
     own_msg_ids = {}
     quick_exchange_state = {}
+    # شناسه‌ی پیام‌های «پنل» که خودِ ربات فرستاده. با `بستن پنل` همین‌ها
+    # پاک می‌شوند تا کاربر مجبور نباشد پیامِ طولانیِ پنل را دستی حذف کند.
+    panel_msg_ids = []
 
     def _track_own(msg):
         try:
@@ -5257,12 +5375,42 @@ async def connect_and_run(eng, creds):
 
     async def note(text):
         try:
-            _track_own(await client.send_message("me", text, link_preview=False))
+            msg = await client.send_message("me", text, link_preview=False)
+            _track_own(msg)
+            return msg
         except Exception:
-            pass
+            return None
+
+    def _startup_text():
+        """پیامِ شروع — همان متنی که موقعِ بالا آمدن ربات می‌رود.
+
+        `بستن پنل` عیناً همین را دوباره می‌فرستد تا کاربر بعد از بستنِ
+        پنل دوباره راهنمای شروع (و میان‌برِ `تبادل سریع`) را ببیند. یک
+        تابعِ مشترک است تا پیامِ ران و پیامِ بعد از بستن هیچ‌وقت از هم
+        جدا نیفتند.
+        """
+        hint = ""
+        if not eng.ex_channel_ready():
+            hint = "\n\n📡 کانال هنوز تعیین نشده: `کانال @channel`"
+        elif not (eng.ex_cfg().get("groups") or []):
+            hint = "\n\n👥 گروه تبادل هنوز ثبت نشده: `تبادل سریع`"
+        return (f"🟢 جفج {VERSION} آنلاین شد — پنل جدید\n\n"
+                f"`پنل` داشبورد • `راهنما` راهنما\n\n"
+                f"⚡ `تبادل سریع` — فقط کانال + گروه → تبادل آماده با "
+                f"متن‌های پیش‌فرض{hint}")
 
     _warn_check = {"last": 0}
     _warn_check_flood = {"last": 0}
+    _warn_no_channel = {"last": 0}
+
+    async def warn_ex_no_channel(now):
+        """هشدارِ یک‌بار در ۱۰ دقیقه: تبادل روشن است ولی کانال نداریم."""
+        if int(now) - int(_warn_no_channel["last"] or 0) < 600:
+            return
+        _warn_no_channel["last"] = int(now)
+        await note("⚠️ تبادل روشن است ولی **کانالِ من** تنظیم نشده — "
+                   "تا ثبتش نکنی هیچ اسکن/چک/جوینی انجام نمی‌دهم.\n"
+                   "`کانال @mychannel` یا `تبادل سریع`")
     check_gate = CheckGate()
     # صفِ تک‌عملکردی تبادل: هیچ دو عملکردی (چک/جوین/لفت/پیام) همزمان یا
     # پشت‌سرهمِ بدون فاصله اجرا نمی‌شوند. قبل از تعریف تابع‌های چک ساخته
@@ -5359,22 +5507,25 @@ async def connect_and_run(eng, creds):
 
     async def _say(txt, event=None):
         if not txt:
-            return
+            return None
         h = _to_html(txt)
         # همیشه به Saved Messages (me) برمی‌گردد تا پاسخ، مستقل از محلِ پیام،
         # حتماً در جایی که ربات کنترلِ آن را دارد دیده شود.
         try:
-            _track_own(await client.send_message("me", h, parse_mode="html",
-                                                 link_preview=False))
-            return
+            msg = await client.send_message("me", h, parse_mode="html",
+                                            link_preview=False)
+            _track_own(msg)
+            return msg
         except Exception as e:
             eng.log("warn", "say_html", f"{type(e).__name__}: {str(e)[:120]}")
         # اگر HTML رد شد، با متنِ خام تلاش کن.
         try:
-            _track_own(await client.send_message("me", txt, link_preview=False))
-            return
+            msg = await client.send_message("me", txt, link_preview=False)
+            _track_own(msg)
+            return msg
         except Exception as e:
             eng.log("error", "say", f"{type(e).__name__}: {str(e)[:120]}")
+        return None
 
     async def _send_panel():
         try:
@@ -5383,7 +5534,32 @@ async def connect_and_run(eng, creds):
             txt = f"⚠️ پنل خطا داد: {type(e).__name__}: {e}"
             traceback.print_exc()
             eng.log("error", "panel", str(e))
-        await _say(txt)
+        msg = await _say(txt)
+        mid = int(getattr(msg, "id", 0) or 0) if msg else 0
+        if mid:
+            panel_msg_ids.append(mid)
+            # فقط پنل‌های اخیر را نگه دار؛ بستنِ پنل همه‌ی همین‌ها را پاک می‌کند.
+            if len(panel_msg_ids) > 50:
+                del panel_msg_ids[:-50]
+
+    async def _close_panel(user_id=0):
+        """بستنِ پنل: پیام‌های پنل پاک می‌شوند و پیامِ شروع دوباره می‌آید.
+
+        «پنل» در Saved Messages یک پیامِ ساده است (دکمه‌ی بستن ندارد)، پس
+        بدون این مسیر کاربر مجبور بود پیام را دستی حذف کند. حالا هم
+        می‌تواند دستی پیام را پاک کند (ربات چیزی نمی‌فرستد) و هم با
+        `بستن پنل` هم پیام پاک شود و هم پیامِ شروع برگردد.
+        """
+        ids = [int(i) for i in panel_msg_ids if i]
+        panel_msg_ids.clear()
+        quick_exchange_state.pop(user_id, None)
+        if ids:
+            try:
+                await client.delete_messages("me", ids)
+            except Exception as e:
+                eng.log("warn", "panel_close",
+                        f"{type(e).__name__}: {str(e)[:120]}")
+        await note(_startup_text())
 
     def _ensure_quick_exchange_defaults(ex_cfg):
         updated = False
@@ -5396,45 +5572,87 @@ async def connect_and_run(eng, creds):
                     updated = True
         return updated
 
-    async def _start_quick_exchange(user_id):
-        x = eng.ex_cfg()
-        channel = str(eng.st.prof("standard").get("channel") or "").strip()
-        groups = x.get("groups") or []
+    def _qe_prompt(step, extra=""):
+        if step == "channel":
+            return ("📡 کانالِ خودت رو بفرست (مثلاً @mychannel)\n"
+                    "برای انصراف: `لغو`" + extra)
+        return ("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)\n"
+                "برای انصراف: `لغو`" + extra)
+
+    def _qe_first_group(ex_cfg):
+        groups = ex_cfg.get("groups") or []
         if isinstance(groups, str):
             groups = [groups]
         elif not isinstance(groups, (list, tuple, set)):
             groups = []
-        group = next((str(item).strip() for item in groups
-                      if str(item or "").strip()), "")
+        return next((str(item).strip() for item in groups
+                     if str(item or "").strip()), "")
+
+    async def _start_quick_exchange(user_id):
+        x = eng.ex_cfg()
+        # مقادیرِ قدیمی هم از همین فیلتر رد می‌شوند: کانالی که «کانال» یا
+        # یک جمله‌ی فارسی ذخیره شده، به‌عنوان کانالِ معتبر شناخته نمی‌شود.
+        raw_channel = str(eng.st.prof("standard").get("channel") or "").strip()
+        channel = normalize_peer_ref(raw_channel) or ""
+        group = normalize_peer_ref(_qe_first_group(x)) or ""
+
+        # قاعده: اگر کانال معتبر نیست، حتی اگر گروه ثبت شده باشد، سراغ
+        # گروه نمی‌رویم؛ اول کانال.
+        if channel and group and same_peer_ref(channel, group):
+            group = ""
 
         if channel and group:
             if _ensure_quick_exchange_defaults(x):
                 eng.st.save()
             quick_exchange_state.pop(user_id, None)
-            await _say("همه‌چیز آماده‌ست، فقط `تبادل روشن` رو بزن")
+            if x.get("enabled"):
+                await _say("⚡ تبادل سریع از قبل آماده و روشن است.\n\n"
+                           f"📡 کانال: {channel}\n"
+                           f"👥 گروه: {group}\n\n"
+                           "برای دیدن وضعیت: `تبادل`")
+            else:
+                await _say("⚡ تبادل سریع از قبل آماده است؛ فقط روشنش کن:\n"
+                           "`تبادل روشن`")
             return
 
-        state = {"step": "group" if channel else "channel"}
+        state = {"step": "channel" if not channel else "group"}
         if channel:
             state["channel"] = channel
         if group:
+            # گروه بدون کانال نگه داشته می‌شود ولی تا ثبت کانال شروع نمی‌کنیم.
             state["group"] = group
         quick_exchange_state[user_id] = state
         if channel:
-            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)\n"
+                       "برای انصراف: `لغو`")
         else:
-            await _say("📡 کانالت رو بفرست (مثلاً @mychannel)")
+            extra = ("\n\n👥 گروهِ ثبت‌شده فعلاً نگه داشته می‌شود؛ تا کانال "
+                     "ثبت نشه کاری شروع نمی‌کنم." if group else "")
+            await _say(QUICK_EXCHANGE_HELP + "\n\n"
+                       + _qe_prompt("channel", extra))
 
     async def _finish_quick_exchange(user_id, state):
-        channel = str(state.get("channel") or "").strip()
-        group = str(state.get("group") or "").strip()
+        channel = normalize_peer_ref(state.get("channel"))
+        group = normalize_peer_ref(state.get("group"))
         if not channel:
+            state.pop("channel", None)
             state["step"] = "channel"
-            await _say("📡 کانالت رو بفرست (مثلاً @mychannel)")
+            await _say("❌ کانال معتبر نیست — تبادل شروع نشد.\n"
+                       + _qe_prompt("channel",
+                                    "\nمثال: `@mychannel` یا `https://t.me/mychannel`"))
             return
         if not group:
+            state.pop("group", None)
             state["step"] = "group"
-            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
+            await _say("❌ گروه معتبر نیست — تبادل شروع نشد.\n"
+                       + _qe_prompt("group",
+                                    "\nمثال: `@exchange_group`"))
+            return
+        if same_peer_ref(channel, group):
+            state.pop("group", None)
+            state["step"] = "group"
+            await _say("❌ کانال و گروه نمی‌توانند یکی باشند.\n"
+                       + _qe_prompt("group"))
             return
 
         st = eng.st
@@ -5442,6 +5660,13 @@ async def connect_and_run(eng, creds):
         ex_cfg = eng.ex_cfg()
         ex_cfg["groups"] = [group]
         _ensure_quick_exchange_defaults(ex_cfg)
+        # ── قاعده‌ی ایمنی: بدون کانالِ معتبر هیچ‌وقت روشن نکن ──
+        if not eng.ex_channel_ready():
+            ex_cfg["enabled"] = False
+            st.save()
+            await _say("❌ کانال ذخیره نشد؛ تبادل روشن نشد.\n"
+                       "`کانال @mychannel` رو دستی بفرست.")
+            return
         ex_cfg["enabled"] = True
         # مثل روشن‌کردن دستی، توقف قبلیِ خودکار را از نظر محافظ باطل کن.
         st["risk"]["_auto_off"] = False
@@ -5458,29 +5683,72 @@ async def connect_and_run(eng, creds):
             "برای تنظیمات بیشتر: `پنل`"
         )
 
+    # پیشوندهای صریحِ ورودی در wizard: «کانال @x» و «گروه @y» همیشه به
+    # فیلدِ درست می‌روند، نه به فیلدِ فعلی. قبلاً اگر در قدمِ گروه بودی و
+    # می‌نوشتی «کانال @x»، خودِ کلمه‌ی «کانال» به‌عنوان گروه ذخیره می‌شد.
+    _QE_CHANNEL_PREFIXES = ("کانال", "چنل", "channel")
+    _QE_GROUP_PREFIXES = ("گروه", "گروهِ", "group")
+
+    def _qe_parse_input(raw, step):
+        """(فیلد, مقدار) — پیشوندِ صریح بر قدمِ فعلی اولویت دارد."""
+        text = (raw or "").strip()
+        low = text.lower()
+        for pref in _QE_CHANNEL_PREFIXES:
+            if low == pref:
+                return "channel", ""
+            if low.startswith(pref) and low[len(pref):len(pref) + 1] in (" ", ":", "：", "\u200c"):
+                return "channel", text[len(pref):].strip(" :：\u200c")
+        for pref in _QE_GROUP_PREFIXES:
+            if low == pref:
+                return "group", ""
+            if low.startswith(pref) and low[len(pref):len(pref) + 1] in (" ", ":", "：", "\u200c"):
+                return "group", text[len(pref):].strip(" :：\u200c")
+        value = text.split()[0] if text.split() else ""
+        return (step or "channel"), value
+
     async def _handle_quick_exchange_input(user_id, raw, low):
         state = quick_exchange_state.get(user_id) or {}
-        if low in ("لغو", "cancel", ".cancel", "/cancel"):
+        if low in ("لغو", "cancel", ".cancel", "/cancel", "انصراف"):
             quick_exchange_state.pop(user_id, None)
-            await _say("❌ تبادل سریع لغو شد.")
+            await _say("❌ تبادل سریع لغو شد. هیچ تنظیمی تغییر نکرد.")
             return
 
-        value = raw.strip().split()[0] if raw.strip() else ""
+        target, value = _qe_parse_input(raw, state.get("step"))
         if not value:
-            prompt = ("📡 کانالت رو بفرست (مثلاً @mychannel)"
-                      if state.get("step") == "channel" else
-                      "👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
-            await _say(prompt)
+            await _say(_qe_prompt(target))
             return
 
-        if state.get("step") == "channel":
-            state["channel"] = value
-            if not state.get("group"):
-                state["step"] = "group"
-                await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)")
-                return
-        else:
-            state["group"] = value
+        parsed = normalize_peer_ref(value)
+        if not parsed:
+            await _say(f"❌ «{value[:40]}» یک آیدی/لینکِ معتبر نیست.\n"
+                       + _qe_prompt(target, "\nمثال: `@mychannel` یا "
+                                            "`https://t.me/+AbCdEfGh`"))
+            return
+
+        other_key = "group" if target == "channel" else "channel"
+        if state.get(other_key) and same_peer_ref(parsed, state.get(other_key)):
+            await _say("❌ کانال و گروه نمی‌توانند یکی باشند.\n"
+                       + _qe_prompt(target))
+            return
+
+        state[target] = parsed
+        quick_exchange_state[user_id] = state
+
+        # ── قاعده‌ی «اول کانال» ──
+        # حتی اگر کاربر گروه را زودتر داده باشد، تا کانال ثبت نشود
+        # هیچ تبادلی شروع نمی‌شود و گروه فقط نگه داشته می‌شود.
+        if not normalize_peer_ref(state.get("channel")):
+            state["step"] = "channel"
+            extra = ("\n\n👥 گروه ذخیره شد، ولی تا کانال ثبت نشه شروع "
+                     "نمی‌کنم." if state.get("group") else "")
+            await _say(_qe_prompt("channel", extra))
+            return
+
+        if not normalize_peer_ref(state.get("group")):
+            state["step"] = "group"
+            await _say(_qe_prompt("group"))
+            return
+
         await _finish_quick_exchange(user_id, state)
 
     # incoming و outgoing «هر دو»: فرمانِ «پنل» که از گوشیِ خودت می‌فرستی
@@ -5501,6 +5769,12 @@ async def connect_and_run(eng, creds):
             user_id = int(getattr(event, "sender_id", None) or eng.my_id or 0)
         except (TypeError, ValueError):
             user_id = int(eng.my_id or 0)
+
+        # «بستن پنل» همیشه کار می‌کند — حتی وسطِ wizard تبادل سریع.
+        if low in {"بستن پنل", "پنل بستن", ".closepanel", "/closepanel",
+                   "closepanel", "close panel", "بستن"}:
+            await _close_panel(user_id)
+            return
 
         # ورودیِ فعالِ wizard همیشه داده است، نه فرمان؛ فقط «لغو» از آن خارج می‌شود.
         if user_id in quick_exchange_state:
@@ -6743,6 +7017,11 @@ async def connect_and_run(eng, creds):
         x = eng.ex_cfg()
         if time.time() < float(x.get("_scan_flood_until", 0)):
             return 0, "اسکن در انتظار پایان FloodWait"
+        # قاعده‌ی «اول کانال، بعد گروه»: بدون کانال، اسکنِ گروه فقط لینک
+        # جمع می‌کند و بعد جوین می‌زند؛ پس همان‌جا متوقف می‌شود.
+        if not eng.ex_channel_ready():
+            return 0, ("کانال تنظیم نشده — تا `کانال @mychannel` ثبت نشه "
+                       "گروه‌ها اسکن نمی‌شوند")
         if not x["groups"]:
             return 0, "گروهی تعیین نشده"
 
@@ -6879,6 +7158,11 @@ async def connect_and_run(eng, creds):
                 if not x["enabled"]:
                     await asyncio.sleep(2)
                     continue
+                # قاعده‌ی «اول کانال»: بدون کانال، اسکنِ گروه هم بی‌معنی است.
+                if not eng.ex_channel_ready():
+                    await warn_ex_no_channel(int(time.time()))
+                    await asyncio.sleep(20)
+                    continue
                 # ۰) اسکن گروه‌ها (حالت پیش‌قدم)
                 now_t = time.time()
                 manual = bool(x.pop("_scan_now", False))
@@ -6926,6 +7210,12 @@ async def connect_and_run(eng, creds):
             try:
                 x = eng.ex_cfg()
                 if not x["enabled"]:
+                    await asyncio.sleep(20)
+                    continue
+                # بدون کانال، چکِ عضویت همه «نامشخص» می‌شود و «نیومدی»
+                # اشتباهی می‌رود؛ پس کلِ این حلقه صبر می‌کند.
+                if not eng.ex_channel_ready():
+                    await warn_ex_no_channel(int(time.time()))
                     await asyncio.sleep(20)
                     continue
                 # پاس‌گاه ضد-فلود: با تعداد رکوردهای جوین‌شده، فاصله‌ی
@@ -7447,6 +7737,14 @@ async def connect_and_run(eng, creds):
                     await asyncio.sleep(3)
 
                 # ۲) جوین تأییدشده‌ها — تطبیقی + سقف ساعتی
+                # قاعده‌ی «اول کانال»: لفتِ دستی (بالا) چون خودِ کاربر
+                # خواسته و به کانالِ من کاری ندارد اجرا می‌شود؛ ولی
+                # جوین/چک/پیامِ خودکار بدون کانالِ ثبت‌شده معنا ندارد و
+                # اصلاً اجرا نمی‌شود.
+                if not eng.ex_channel_ready():
+                    await warn_ex_no_channel(int(time.time()))
+                    await asyncio.sleep(20)
+                    continue
                 # هر بار فاصله موثر (پایه + Flood + آپ‌تایم) را حساب و به throttle بده
                 try:
                     eng.adaptive_maybe_decay()
@@ -7711,6 +8009,10 @@ async def connect_and_run(eng, creds):
                 # ── بازگشایی (فقط خاموشیِ همان لایه، بعد از قفلِ موقت) ──
                 elif (auto_off and not x["enabled"]
                       and now_t >= off_until
+                      # قاعده‌ی «اول کانال»: بازگشاییِ خودکار هم بدون کانال
+                      # نباید تبادل را روشن کند؛ وگرنه پنل «روشن» نشان
+                      # می‌دهد ولی هیچ کاری انجام نمی‌شود.
+                      and eng.ex_channel_ready()
                       and ((off_reason == "hard" and not (rc.get("hard_on", True) and stop_hard))
                            or (off_reason == "score"
                                and (risk is not None)
@@ -7748,12 +8050,7 @@ async def connect_and_run(eng, creds):
     risk_task = asyncio.create_task(risk_loop())
     st_task = asyncio.create_task(status_loop())
 
-    hint = ""
-    if not eng.st.prof("standard")["channel"]:
-        hint = "\n\n📡 کانال هنوز تعیین نشده: `کانال @channel`"
-    await note(f"🟢 جفج {VERSION} آنلاین شد — پنل جدید\n\n"
-               f"`پنل` داشبورد • `راهنما` راهنما\n\n"
-               f"⚡ `تبادل سریع` — فقط کانال + گروه → تبادل آماده با متن‌های پیش‌فرض{hint}")
+    await note(_startup_text())
 
     # خطای اولیه‌ای که باعث ورود به پاک‌سازی شد را نگه می‌داریم؛ اگر لغوِ
     # بیرونی (CancelledError) بود، در پایان دوباره پرتاب می‌شود تا خاموشی
