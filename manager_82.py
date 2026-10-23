@@ -1241,7 +1241,7 @@ API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
 BUILD_VERSION = "v0910-backup"
-BUILD_TAG = "JAFJ_MANAGER_82_v0910-backup_2026_09_26"
+BUILD_TAG = "JAFJ_MANAGER_82_v0911-stale-trial-sub_2026_10_23"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -3730,10 +3730,17 @@ class Manager:
         return txt, [back_btn("a:cm")]
 
     def has_sub(self, uid):
-        """اشتراک پولی فعال دارد؟"""
+        """اشتراک پولی فعال دارد؟
+
+        مُهرِ «کهنه»ی تست رایگان (trial_expires_at در گذشته) نباید اشتراکِ
+        فعال را پنهان کند؛ وگرنه مشترکِ ماهانه‌ای که یک بار تست گرفته بود
+        به‌اشتباه «امتیازی» حساب می‌شود، امتیازش ساعتی می‌سوزد و بعد از
+        چند ساعت خاموش می‌شود. فقط تستِ «در حال اجرا» (در آینده) جلوی
+        has_sub را می‌گیرد.
+        """
         c = self.db.get(uid)
         return bool(c and c["status"] == "active" and c["expires_at"] > now()
-                    and not int(c.get("trial_expires_at") or 0))
+                    and int(c.get("trial_expires_at") or 0) <= now())
 
     def trial_active(self, uid):
         c = self.db.get(uid)
@@ -8987,7 +8994,9 @@ class Manager:
                     if left <= 0:
                         if self.sup.is_running(c["uid"]):
                             self.sup.stop(c["uid"])
-                        self.db.set(c["uid"], status="expired")
+                        # مُهرِ تست باید صفر شود؛ وگرنه روی رکورد می‌ماند و
+                        # بعداً has_sub را برای اشتراکِ خریداری‌شده مخدوش می‌کند.
+                        self.db.set(c["uid"], status="expired", trial_expires_at=0)
                         self.db.log(c["uid"], "trial_expired", "تست رایگان تمام شد")
                     elif left <= warning and not int(c.get("trial_warning_sent") or 0):
                         self.db.set(c["uid"], trial_warning_sent=1)
@@ -11763,8 +11772,10 @@ class Manager:
                     if not c:
                         return await self.say(ev.chat_id, "پیدا نشد.")
                     base = max(c["expires_at"] or 0, now())
+                    # مثل /ok: مُهرِ کهنهٔ تست رایگان پاک شود تا has_sub
+                    # اشتراکِ تازه را نبیند و مشتری «امتیازی» حساب نشود.
                     self.db.set(tid, expires_at=base + days * 86400, status="active",
-                                current_plan_id=0)
+                                current_plan_id=0, trial_expires_at=0)
                     self.sup.write_limits(tid, self.effective_plan(tid) or
                                           {"name": "اشتراک دستی", "max_accounts": 1})
                     await self.say(tid, f"✅ سرویس شما {_fa_digits(days)} روز فعال شد.")
