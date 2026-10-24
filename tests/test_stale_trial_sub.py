@@ -95,6 +95,18 @@ INNER = textwrap.dedent('''
         check((not m.has_sub(U_TRIAL)) and m.trial_active(U_TRIAL),
               "T2: تستِ در حال اجرا هنوز بر has_sub مقدم است")
 
+        # ── T2b — مرزِ دقیق: مُهر = همین لحظه و مُهر = ۱ ثانیهٔ دیگر ──
+        # مُهر = now یعنی تست همین ثانیه تمام شده (مثل trial_loop که
+        # left<=0 را «تمام‌شده» می‌گیرد) → باید مشترک شناخته شود.
+        m.db.add(305, "e", "ه", 0)
+        m.db.set(305, status="active", expires_at=now + 30 * day,
+                 trial_expires_at=now, current_plan_id=0)
+        check(m.has_sub(305) and not m.trial_active(305),
+              "T2b: مُهر = همین‌ثانیه → مشترک (هم‌راستا با trial_loop)")
+        m.db.set(305, trial_expires_at=now + 1)
+        check((not m.has_sub(305)) and m.trial_active(305),
+              "T2b: مُهر = ۱ ثانیهٔ دیگر → هنوز در تست")
+
         # ═══ T3 — کنترلِ منفی ═══
         m.db.add(U_GONE, "c", "ج", 0)
         m.db.set(U_GONE, status="active", expires_at=now - day,
