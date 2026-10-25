@@ -39,7 +39,7 @@ DATA = os.path.join(ROOT, "data")
 
 
 DRIVER = r"""
-import asyncio, importlib.util, os, sys, time
+import asyncio, importlib.util, os, random, sys, time
 from types import SimpleNamespace
 sys.path.insert(0, os.getcwd())
 
@@ -89,6 +89,7 @@ def slice_block(start_marker, end_marker, ind=4):
 
 
 reply_ded = slice_block("async def reply_joined(rec):", "def joins_left_today():")
+flush_ded = slice_block("async def flush_reply_retries():", "def joins_left_today():")
 
 
 class Client:
@@ -109,7 +110,7 @@ class Cd:
 
 def build_reply(eng):
     ns = {"m": m, "eng": eng, "client": Client(), "ex_cd": Cd(),
-          "asyncio": asyncio, "time": time,
+          "asyncio": asyncio, "time": time, "random": random,
           "DRY_RUN": False,
           "come_delay_seconds": lambda: 0,
           "response_delay_seconds": lambda: 0}
@@ -117,6 +118,24 @@ def build_reply(eng):
          + "\n".join("    " + l for l in reply_ded.splitlines())
          + "\n    return await reply_joined(rec)\n", ns)
     return ns["_r"]
+
+
+def build_flush(eng, reply_fn):
+    # تابعِ flush_reply_retries واقعی را با موتورِ واقعی می‌سازد.
+    class Cd2:
+        blocked_until = 0.0
+    NOTES = []
+
+    async def note(text):
+        NOTES.append(text)
+
+    ns = {"m": m, "eng": eng, "ex_cd": Cd2(), "note": note,
+          "reply_joined": reply_fn, "asyncio": asyncio, "time": time,
+          "random": random, "fa": m.fa}
+    exec("async def _f():\n"
+         + "\n".join("    " + l for l in flush_ded.splitlines())
+         + "\n    return await flush_reply_retries()\n", ns)
+    return ns["_f"], ns["ex_cd"], NOTES
 
 
 def mk_rec(eng, peer, link, **kw):
@@ -237,6 +256,95 @@ async def main():
     check(eng8._reply_reason_text({"id": 0}) ==
           "متنِ تبادل ثبت نشده — در پیوی بزن: `تبادل سریع` یا `تبادل پیام متنِ دلخواه`",
           "T8: جملهٔ دلیلِ «متن ثبت نشده» دستورِ اصلاح دارد")
+
+    # ═══ T9–T13 — تلاشِ دوبارهٔ خودکار بعد از فلود/اسلومود ═══
+    class SlowModeWaitError(Exception):
+        def __init__(self, seconds):
+            super().__init__("SlowModeWait %d" % seconds)
+            self.seconds = int(seconds)
+
+    # T9 — فلود → زمان‌بندی؛ بعد از رفعِ محدودیت → خودکار ارسال
+    eng, x = fresh_engine()
+    x["msg_come"] = "جوینم بیا"
+    eng.st.save()
+    flush, cd9, NOTES9 = build_flush(eng, build_reply(eng))
+    rec = mk_rec(eng, 7005, "@peerchan5", direction="out", replied=0,
+                 src_chat=555, src_msg=779)
+    SENT.clear()
+    Client.send_error = SlowModeWaitError(120)
+    ok = await build_reply(eng)(rec)
+    Client.send_error = None
+    check(not ok and not SENT,
+          "T9: ارسال در پنجرهٔ اسلومود شکست می‌خورد (رفتار ثابت)")
+    info = eng.reply_retry.get(rec["id"])
+    check(bool(info) and int(info[1]) == 1,
+          "T9: تلاشِ دوباره زمان‌بندی شد (بود %r)" % (info,))
+    info[0] = time.time() - 1          # محدودیت تمام شده
+    await flush()
+    body9 = SENT[-1][1] if SENT else ""
+    check(body9 == "جوینم بیا\n@mychan",
+          "T9: بعد از رفعِ محدودیت، پیام خودکار رفت (بود %r)" % body9)
+    check(rec["id"] not in eng.reply_retry,
+          "T9: بعد از ارسال موفق از صفِ تلاش حذف شد")
+    check(any("بعد از رفعِ محدودیت" in n for n in NOTES9),
+          "T9: پیوی هم خبر داد که دیر، اما رفت")
+
+    # T10 — سقفِ ۳ تلاش → انصراف با راهنمای دستی، بدونِ لوپِ بی‌پایان
+    eng, x = fresh_engine()
+    x["msg_come"] = "جوینم بیا"
+    eng.st.save()
+    flush10, cd10, NOTES10 = build_flush(eng, build_reply(eng))
+    rec = mk_rec(eng, 7006, "@peerchan6", direction="out", replied=0,
+                 src_chat=556, src_msg=780)
+    eng.reply_retry[rec["id"]] = [time.time() - 1, 3]
+    SENT.clear()
+    await flush10()
+    check(rec["id"] not in eng.reply_retry and not SENT,
+          "T10: بعد از سقفِ تلاش‌ها، رکورد رها می‌شود")
+    check(any("تبادل ارسال" in n for n in NOTES10),
+          "T10: پیوی راهِ دستی («تبادل ارسال») را می‌گوید")
+
+    # T11 — صفِ کلی هنوز بسته (فلود) → عقب می‌افتد، نمی‌سوزد
+    eng, x = fresh_engine()
+    x["msg_come"] = "جوینم بیا"
+    eng.st.save()
+    flush11, cd11, NOTES11 = build_flush(eng, build_reply(eng))
+    rec = mk_rec(eng, 7007, "@peerchan7", direction="out", replied=0,
+                 src_chat=557, src_msg=781)
+    eng.reply_retry[rec["id"]] = [time.time() - 1, 1]
+    SENT.clear()
+    cd11.blocked_until = time.time() + 120
+    await flush11()
+    info = eng.reply_retry.get(rec["id"])
+    check(info and info[0] > time.time() and not SENT,
+          "T11: با صفِ بسته، تلاش عقب می‌افتد ولی از دست نمی‌رود")
+
+    # T12 — خطای غیرِ فلود → یک تیکِ دیگر با شمارندهٔ بالاتر
+    eng, x = fresh_engine()
+    x["msg_come"] = "جوینم بیا"
+    eng.st.save()
+    flush12, cd12, NOTES12 = build_flush(eng, build_reply(eng))
+    rec = mk_rec(eng, 7008, "@peerchan8", direction="out", replied=0,
+                 src_chat=558, src_msg=782)
+    eng.reply_retry[rec["id"]] = [time.time() - 1, 1]
+    Client.send_error = RuntimeError("not found")
+    await flush12()
+    Client.send_error = None
+    info = eng.reply_retry.get(rec["id"])
+    check(info and int(info[1]) == 2 and info[0] > time.time(),
+          "T12: خطای غیرِ فلود هم شمارنده را بالا می‌برد (بود %r)" % (info,))
+
+    # T13 — ارسالِ سالم، هر ردپایی از تلاشِ دوباره را پاک می‌کند
+    eng, x = fresh_engine()
+    x["msg_come"] = "جوینم بیا"
+    eng.st.save()
+    rec = mk_rec(eng, 7009, "@peerchan9", direction="out", replied=0,
+                 src_chat=559, src_msg=783)
+    eng.reply_retry[rec["id"]] = [time.time() - 1, 2]
+    SENT.clear()
+    ok = await build_reply(eng)(rec)
+    check(ok and rec["id"] not in eng.reply_retry,
+          "T13: ارسالِ سالم، صفِ تلاش را هم پاک می‌کند")
 
     print("DONE FAIL" if FAILS else "DONE PASS")
     if FAILS:

@@ -1846,6 +1846,9 @@ class Engine:
         # آخرین دلیلِ «پیامِ گروه نرفت» برای هر رکورد — گزارشِ لحظه‌ای
         # با همین دلیل، علتِ سکوتِ گروه را صریح می‌گوید.
         self.reply_note = {}
+        # پیام‌های گروهی که به‌خاطر فلود/اسلومود نرفتند → [زمانِ تلاشِ بعدی،
+        # تعدادِ تلاش‌ها]. exchange_worker هر چرخه سرِ وقت آن‌ها را می‌فرستد.
+        self.reply_retry = {}
 
     def apply_limits(self):
         """سقف‌های پلن را روی تنظیمات فعلی اعمال می‌کند."""
@@ -6456,6 +6459,7 @@ async def connect_and_run(eng, creds):
             eng.db.ex_set(rec["id"], replied=1)
             try:
                 eng.reply_note.pop(int(rec["id"]), None)
+                eng.reply_retry.pop(int(rec["id"]), None)
             except Exception:
                 pass
             eng.log("ok", "ex_reply" if not DRY_RUN else "dry_run_reply",
@@ -6464,7 +6468,78 @@ async def connect_and_run(eng, creds):
         except Exception as e:
             _why("err:" + type(e).__name__)
             eng.log("warn", "ex_reply", f"#{rec['id']}: {type(e).__name__}: {e}")
+            # فلود/اسلومود یعنی تلگرام فعلاً اجازهٔ ارسال به آن چت را
+            # نمی‌دهد — خطای موقت است. پیام گم نشود: بعد از پایانِ
+            # محدودیت، exchange_worker خودش دوباره تلاش می‌کند (سقف ۳).
+            _sn = getattr(e, "seconds", 0) or 0
+            if (type(e).__name__ in ("FloodWaitError", "SlowModeWaitError",
+                                     "FloodPremiumWaitError")
+                    and 0 < int(_sn or 0) <= 900 and rec.get("id")):
+                try:
+                    _prev = eng.reply_retry.get(int(rec["id"])) or [0, 0]
+                    _att = int(_prev[1]) + 1
+                    if _att <= 3:
+                        eng.reply_retry[int(rec["id"])] = [
+                            time.time() + int(_sn) + random.randint(5, 20), _att]
+                        eng.log("info", "ex_reply_retry",
+                                f"#{rec['id']} تلاشِ {_att} بعد از {_sn}s")
+                except Exception:
+                    pass
             return False
+
+    async def flush_reply_retries():
+        """پیام‌های گروهیِ جاافتاده به‌خاطر فلود/اسلومود را می‌فرستد.
+
+        گزارشِ پیوی مستقیم به «پیام‌های ذخیره» می‌رود و همیشه می‌آید؛ ولی
+        پیامِ گروه از صفِ تک‌عملکردی می‌گذرد. اگر ارسال در پنجرهٔ
+        محدودیتِ تلگرام شکست بخورد، قبلاً برای همیشه از دست می‌رفت (تنها
+        راه، دستورِ دستی «تبادل ارسال» بود) — همان «چند دقیقه گروه ساکت
+        است بعد هم هیچی نمی‌رود». الان هر پیامِ معلق تا سقف ۳ بار بعد از
+        پایانِ محدودیت خودکار تلاش می‌شود و نتیجه به پیوی گزارش می‌شود.
+        """
+        try:
+            _now = time.time()
+            due = [rid for rid, info in list(eng.reply_retry.items())
+                   if _now >= float(info[0])]
+        except Exception:
+            return
+        # حداکثر ۳ پیام در هر چرخه تا صفِ اصلی معطل نماند
+        for rid in due[:3]:
+            info = eng.reply_retry.get(rid) or [0, 0]
+            try:
+                att = int(info[1])
+            except Exception:
+                att = 0
+            if att >= 3:
+                eng.reply_retry.pop(rid, None)
+                eng.log("warn", "ex_reply_giveup", f"#{rid}")
+                await note(f"💬 پیام تبادل #{fa(rid)} بعد از ۳ تلاش ارسال نشد — "
+                           f"با `تبادل ارسال {fa(rid)}` دوباره امتحان کن.")
+                continue
+            if time.time() < float(getattr(ex_cd, "blocked_until", 0) or 0):
+                # صف هنوز به‌خاطر فلود بسته است؛ بعداً
+                info[0] = time.time() + 30
+                eng.reply_retry[rid] = info
+                continue
+            rec = eng.db.ex_get(int(rid))
+            if not rec or rec.get("status") != "joined" or rec.get("replied"):
+                eng.reply_retry.pop(rid, None)
+                continue
+            if await reply_joined(rec):
+                await note(f"💬 پیام تبادل #{fa(rid)} بعد از رفعِ محدودیت "
+                           "تلگرام ارسال شد.")
+            # اگر reply_joined خودش دوباره زمان‌بندی نکرده بود (خطای
+            # غیرِ فلود مثل پیدا نشدنِ چت)، یک تیک دیگر با شمارندهٔ بالاتر
+            info2 = eng.reply_retry.get(rid)
+            if info2 and float(info2[0]) <= _now:
+                info2[0] = time.time() + 60
+                info2[1] = att + 1
+                if int(info2[1]) >= 3:
+                    eng.reply_retry.pop(rid, None)
+                    eng.log("warn", "ex_reply_giveup", f"#{rid}")
+                    await note(f"💬 پیام تبادل #{fa(rid)} بعد از چند تلاش "
+                               f"ارسال نشد — با `تبادل ارسال {fa(rid)}` "
+                               "دوباره امتحان کن.")
 
     def joins_left_today():
         # عمداً هیچ سقف روزانه‌ای برای Join وجود ندارد.
@@ -7793,6 +7868,10 @@ async def connect_and_run(eng, creds):
                             "خودکار ادامه می‌دهم.\n"
                             "اگر زیاد تکرار شد، «تبادل فاصله» را بزرگ‌تر کن "
                             "یا تعداد تبادل‌های هم‌زمان را کم کن.")
+
+                # پیام‌های گروهیِ جاافتادهٔ پشتِ فلود/اسلومود — سرِ وقتشان
+                # خودکار می‌روند تا «چند دقیقه سکوتِ گروه» دیگر دائمی نشود.
+                await flush_reply_retries()
 
                 # ۱) لفت‌های دستی
                 for rec in eng.db.ex_list("leaving", 5):
