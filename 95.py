@@ -346,7 +346,7 @@ def same_peer_ref(a, b):
 
 
 VERSION = "3.0"
-BUILD_TAG = "JAFJ_SELF_69_70_EN_2026_08_28"
+BUILD_TAG = "JAFJ_SELF_71_GROUP_REPLY_TRANSPARENCY_2026_10_24"
 FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 EN = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
@@ -1843,6 +1843,9 @@ class Engine:
         self.my_username = ""
         self.my_id = 0
         self.last_error = ""
+        # آخرین دلیلِ «پیامِ گروه نرفت» برای هر رکورد — گزارشِ لحظه‌ای
+        # با همین دلیل، علتِ سکوتِ گروه را صریح می‌گوید.
+        self.reply_note = {}
 
     def apply_limits(self):
         """سقف‌های پلن را روی تنظیمات فعلی اعمال می‌کند."""
@@ -4205,6 +4208,55 @@ class Engine:
             "📍 مقصد: PV / Saved Messages",
         ])
 
+    def _reply_reason(self, rec):
+        """دلیلِ کوتاهِ «پیام گروه نرفت» — از آخرین ثبتِ reply_joined.
+
+        اگر دلیلِ ثبت‌شده‌ای نیست، از تنظیمات حدسِ قطعی می‌زنیم:
+        «جواب» خاموش یا متنِ ثبت‌نشده (شایع‌ترین علتِ سکوتِ گروه).
+        """
+        rsn = ""
+        try:
+            rsn = (self.reply_note.get(int((rec or {}).get("id") or 0))
+                   or ("", ""))[0]
+        except Exception:
+            rsn = ""
+        if rsn:
+            return rsn
+        try:
+            if not self.ex_cfg().get("reply", True):
+                return "reply_off"
+        except Exception:
+            pass
+        return "no_text"
+
+    def _reply_reason_text(self, rec):
+        """جملهٔ فارسیِ دلیلِ «پیام گروه نرفت» — بدون پیشوند."""
+        rsn = self._reply_reason(rec)
+        if rsn == "reply_off":
+            return ("جواب‌دادن خاموش است — در پیوی بزن: `تبادل جواب`")
+        if rsn == "no_text":
+            return ("متنِ تبادل ثبت نشده — در پیوی بزن: `تبادل سریع` "
+                    "یا `تبادل پیام متنِ دلخواه`")
+        if rsn == "no_src":
+            return "پیامِ طرف در گروه پیدا نشد"
+        if rsn == "already":
+            return "برای این تبادل قبلاً پیام رفته بود"
+        if rsn.startswith("err:"):
+            return f"خطای ارسال {rsn[4:]} — جزئیات: `.log رویدادها`"
+        return "دلیل نامعلوم"
+
+    def _reply_line(self, rec, sent):
+        """خطِ شفافیتِ «پیام گروه» در گزارشِ لحظه‌ای.
+
+        قبلاً اگر پیامِ گروه به هر دلیل نمی‌رفت (متنِ ثبت‌نشده، «جوابِ»
+        خاموش، خطای ارسال)، گزارشِ پیوی فقط خطِ «💬 متن تبادل ارسال شد»
+        را نداشت و هیچ سرنخی نمی‌داد — کاربر فکر می‌کرد ربات قصدش گروه
+        پیام نمی‌دهد. حالا علتِ دقیق داخل خود گزارش می‌آید.
+        """
+        if sent:
+            return "💬 متن تبادل ارسال شد"
+        return "💬 پیام گروه: " + self._reply_reason_text(rec)
+
     def ex_live_join_text(self, rec, title="", reply_sent=False):
         c = self.db.ex_report_counts(self._day_start())
         direction = "پیش‌قدم انجام شد" if rec.get("direction") == "out" else "تبادل عادی انجام شد"
@@ -4215,7 +4267,7 @@ class Engine:
             f"📡 کانال: {rec.get('link') or '—'}",
             "✅ وضعیت: Join شد",
             *( [f"🏷 عنوان: {title}"] if title else [] ),
-            *( ["💬 متن تبادل ارسال شد"] if reply_sent else [] ),
+            self._reply_line(rec, reply_sent),
             "",
             "📊 آمار امروز:",
             f"✅ Join شده: {fa(c['joined'])} کانال",
@@ -6336,11 +6388,26 @@ async def connect_and_run(eng, creds):
 
     async def reply_joined(rec):
         """متن «جوین شدم» کاربر را روی پیام خود طرف ریپلای می‌کند.
-        بدون لینک، بدون آیدی، بدون منشن — فقط همان متنی که تعیین کرده."""
+        بدون لینک، بدون آیدی، بدون منشن — فقط همان متنی که تعیین کرده.
+
+        اگر پیام به هر دلیل نرود، دلیلش در ``eng.reply_note`` ثبت می‌شود
+        تا گزارشِ لحظه‌ای (``ex_live_join_text``) علتِ سکوتِ گروه را
+        صریح بگوید — نه اینکه فقط خطِ «ارسال شد» حذف شود."""
         x = eng.ex_cfg()
-        if not x["reply"] or not rec:
+
+        def _why(rsn):
+            try:
+                eng.reply_note[int(rec["id"])] = (rsn, int(time.time()))
+            except Exception:
+                pass
+
+        if not rec:
+            return False
+        if not x["reply"]:
+            _why("reply_off")
             return False
         if rec.get("replied"):
+            _why("already")
             return False
         outgoing = rec.get("direction") == "out"
         key = "msg_come" if outgoing else "msg_ok"
@@ -6352,6 +6419,7 @@ async def connect_and_run(eng, creds):
             # اگر فقط «پیام موفق» ثبت شده باشد، پیش‌قدم هم همان متن را می‌گوید.
             body = eng.ex_render("msg_ok", rec.get("peer_name") or "", rec["link"])
         if not body:
+            _why("no_text")
             return False
         if outgoing:
             # باگِ «پیش‌قدم: زیرِ متن، کانال نیست»: در پیامِ «جوین شدم»ِ
@@ -6364,6 +6432,7 @@ async def connect_and_run(eng, creds):
             body = eng.ex_append_my_channel(body)
         chat, mid = rec.get("src_chat"), rec.get("src_msg")
         if not chat or not mid:
+            _why("no_src")
             return False
         if outgoing:
             delay = come_delay_seconds()
@@ -6385,10 +6454,15 @@ async def connect_and_run(eng, creds):
             # یک «نیومدی» نمی‌رود؛ اول نوبتِ صف و فاصله‌ی تنظیم‌شده.
             await ex_cd.action("reply_joined", rec.get("id"), _send_reply)
             eng.db.ex_set(rec["id"], replied=1)
+            try:
+                eng.reply_note.pop(int(rec["id"]), None)
+            except Exception:
+                pass
             eng.log("ok", "ex_reply" if not DRY_RUN else "dry_run_reply",
                     f"#{rec['id']}")
             return True
         except Exception as e:
+            _why("err:" + type(e).__name__)
             eng.log("warn", "ex_reply", f"#{rec['id']}: {type(e).__name__}: {e}")
             return False
 
@@ -7688,7 +7762,8 @@ async def connect_and_run(eng, creds):
                         eng.db.ex_set(rec["id"], replied=0)
                         sent_reply = await reply_joined(eng.db.ex_get(rec["id"]))
                         await note(f"💬 پیام تبادل #{fa(rec['id'])} "
-                                   + ("ارسال شد." if sent_reply else "ارسال نشد."))
+                                   + ("ارسال شد." if sent_reply else
+                                      f"ارسال نشد ({eng._reply_reason_text(rec)})"))
                     eng.st.save()
 
                 if not x["enabled"]:
