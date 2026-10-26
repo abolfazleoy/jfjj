@@ -6618,29 +6618,95 @@ async def connect_and_run(eng, creds):
 
     # ---------- پیدا کردن کانال طرف ----------
     async def find_their_channel(event, sender, chat_id, deep=True):
-        """کانال طرف را پیدا می‌کند. اولویت:
-           ۱) لینک داخل همین ریپلای
-           ۲) لینک در پیام‌های قبلی خودش در همین گروه
-           ۳) کانال شخصی روی پروفایلش
-        deep=False فقط گزینه‌ی ۱ است و برای مسیر «عضو نیست» به کار می‌رود:
-        کانال طرف هرگز از پروفایل یا پیام‌های قبلی‌اش بیرون کشیده نمی‌شود تا
-        هر ریپلای‌کننده‌ی تصادفی‌ای «نیومدی + لینک» نگیرد؛ فقط همان لینکی
-        که خودش در همین پیام فرستاده مبنا است.
-        """
-        mine = {(eng.st.prof(t)["channel"] or "").lstrip("@").lower()
-                for t in ("standard", "vip")}
-        mine.discard("")
-        if eng.my_username:
-            mine.add(eng.my_username.lower())
+        """کانال طرف را پیدا می‌کند و لینک کانال‌های خودمان را کنار می‌گذارد.
 
-        def pick(links):
-            for l in links:
-                if l.lstrip("@").lower() not in mine:
-                    return l
-            return None
+        لینک‌های عمومی با نام کاربری و لینک‌های خصوصی با شناسه‌ی واقعی کانال
+        مقایسه می‌شوند؛ وگرنه t.me/+HASH کانال خودمان با @username یکی تشخیص
+        داده نمی‌شد و در پیام‌های دوتا‌لینکی ممکن بود لینک اول (کانال خودمان)
+        به‌اشتباه به‌عنوان لینک طرف تبادل انتخاب شود.
+
+        اولویت: لینک همین پیام، پیام‌های قبلی خودش در همین گروه، کانال پروفایل.
+        deep=False فقط لینک همین پیام را بررسی می‌کند.
+        """
+        def norm_ref(value):
+            value = str(value or "").strip().lower().rstrip("/")
+            value = re.sub(r"^https?://", "", value)
+            value = re.sub(r"^(?:www\.)?(?:t\.me|telegram\.me)/", "", value)
+            value = value.lstrip("@")
+            if value.startswith("joinchat/"):
+                return "invite:" + value.split("/", 1)[1]
+            if value.startswith("+"):
+                return "invite:" + value[1:]
+            return value
+
+        mine = set()
+        own_refs = []
+        for tier in ("standard", "vip"):
+            raw = (eng.st.prof(tier).get("channel") or "").strip()
+            if raw:
+                own_refs.append(raw)
+                mine.add(norm_ref(raw))
+        if eng.my_username:
+            mine.add(norm_ref(eng.my_username))
+
+        # کانال‌ها را با ID مقایسه کن تا invite link خصوصیِ کانال خودمان هم
+        # از لینک طرف تفکیک شود. CheckChatInvite فقط بررسی می‌کند و عضو نمی‌شود.
+        cache = getattr(eng, "_exchange_link_id_cache", None)
+        if cache is None:
+            cache = eng._exchange_link_id_cache = {}
+
+        async def channel_id(ref):
+            key = norm_ref(ref)
+            now0 = time.time()
+            cached = cache.get(key)
+            if cached and cached[0] > now0:
+                return cached[1]
+            cid = None
+            try:
+                if is_invite(ref):
+                    from telethon.tl.functions.messages import CheckChatInviteRequest
+                    info = await client(CheckChatInviteRequest(invite_hash(ref)))
+                    chat = getattr(info, "chat", None)
+                    cid = getattr(chat, "id", None) if chat else None
+                else:
+                    ent = await client.get_entity(ref)
+                    cid = getattr(ent, "id", None)
+            except Exception:
+                # اگر لینک خصوصی قابل‌بررسی نبود، انتخابِ باقیمانده‌ها ادامه یابد؛
+                # هیچ لینک دعوتی را برای تشخیص، Import/Join نمی‌کنیم.
+                cid = None
+            cache[key] = (now0 + (300 if cid is not None else 30), cid)
+            return cid
+
+        mine_ids = set()
+        for ref in own_refs:
+            cid = await channel_id(ref)
+            if cid is not None:
+                mine_ids.add(int(cid))
+
+        async def pick(links):
+            unresolved = []
+            for link in links:
+                if norm_ref(link) in mine:
+                    continue
+                cid = await channel_id(link)
+                if cid is None:
+                    unresolved.append(link)
+                    continue
+                if int(cid) in mine_ids:
+                    continue
+                return link
+            # قالب دو لینکِ جفج: لینک اول کانال خودمان (جایی که ممبر باید
+            # بیاید) و لینک دوم کانال طرف تبادل است. اگر تلگرام برای هر دو
+            # invite خصوصی شناسه نداد، نقش‌ها را از همین ترتیب بگیر؛ وگرنه
+            # لینک اولِ مبهم اشتباهاً به‌عنوان کانال طرف انتخاب می‌شد.
+            if (len(links) == 2 and len(unresolved) == 2
+                    and all(is_invite(link) for link in links)):
+                return links[1]
+            return unresolved[0] if unresolved else None
 
         # ۱) فقط لینک واقعی داخل همان پیام؛ AI اجازه انتخاب لینک ندارد.
-        got = pick(extract_links(event.raw_text))
+        got = await pick(extract_links(event.raw_text))
         if got:
             return got, "از پیام خودش"
 
@@ -6653,7 +6719,7 @@ async def connect_and_run(eng, creds):
                                                   limit=40):
                 if msg.id == event.id or not msg.raw_text:
                     continue
-                got = pick(extract_links(msg.raw_text))
+                got = await pick(extract_links(msg.raw_text))
                 if got:
                     return got, "از پیام‌های قبلی‌اش"
         except Exception as e:
@@ -6667,7 +6733,7 @@ async def connect_and_run(eng, creds):
             if pcid:
                 ent = await client.get_entity(pcid)
                 u = getattr(ent, "username", None)
-                if u and u.lower() not in mine:
+                if u and norm_ref(u) not in mine:
                     return "@" + u, "از پروفایلش"
         except Exception:
             pass
