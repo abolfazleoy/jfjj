@@ -180,7 +180,15 @@ async def part_a():
     check(not ok and not SENT,
           "A7: با خاموش‌بودنِ پاسخ، پیامِ پیش‌قدم نمی‌رود")
 
-    # A8) مسیرِ غیرِ پیش‌قدم (طرف اول آمده) رفتارش عوض نشده: «پیام موفق» بدونِ کانال
+    # A8) لینکِ طرف با placeholder قدیمی نباید داخل پیام پیش‌قدم بیاید؛
+    # فقط کانالِ خودمان زیر متن قرار می‌گیرد.
+    eng, x = fresh_engine()
+    ok, body = await send_come(eng, x, msg_come="جوینم {channel}؛ کانال من {mychannel} را جوین شو")
+    check(ok and "@peerchan" not in body and body ==
+          "جوینم؛ کانال من @mychan را جوین شو",
+          "A8: پیام پیش‌قدم لینک طرف را حذف می‌کند و لینک خودم را نگه می‌دارد")
+
+    # A9) مسیرِ غیرِ پیش‌قدم (طرف اول آمده) پیام موفق را بدونِ کانال خودم می‌فرستد.
     eng, x = fresh_engine()
     x["msg_ok"] = "اومدم ✅"
     rec = mk_rec(eng, 7002, "@peerchan2", direction="in", replied=0,
@@ -189,7 +197,7 @@ async def part_a():
     ok = await build_reply(eng, Cd())(rec)
     body = SENT[-1][1] if SENT else ""
     check(body == "اومدم ✅",
-          "A8: در تبادلِ عادی (طرف اول آمده) متن دست‌نخورده است (بود %r)" % body)
+          "A9: در تبادلِ عادی (طرف اول آمده) متن دست‌نخورده است (بود %r)" % body)
 
 
 asyncio.run(part_a())

@@ -77,10 +77,11 @@ print("RENDER msg_no unset ->", repr(eng.ex_render("msg_no")))
 # unset → default + my channel
 assert eng.ex_render("msg_no") == "نیومدی\n@dar_sokoote_seda"
 assert eng.ex_render("msg_no", "ali", "@chan") == "نیومدی\n@dar_sokoote_seda"
-# custom text wins; {channel} placeholder still works if explicitly used
+# custom text wins; the legacy {channel} token must never expose the peer link.
 x["msg_no"] = "سفارشی {channel}"
 print("RENDER msg_no custom ->", repr(eng.ex_render("msg_no", "ali", "@chan")))
-assert eng.ex_render("msg_no", "ali", "@chan") == "سفارشی @chan"
+assert eng.ex_render("msg_no", "ali", "@chan") == "سفارشی"
+assert "@chan" not in eng.ex_render("msg_no", "ali", "@chan")
 # custom without placeholder → exactly custom, no append
 x["msg_no"] = "هنوز عضو نشدی"
 assert eng.ex_render("msg_no", "ali", "@chan") == "هنوز عضو نشدی"
@@ -209,13 +210,13 @@ print("BODY custom ->", repr(fake.sent[-1][1]))
 assert ok is True
 assert fake.sent[-1][1] == "هنوز عضو نشدی برو جوین شو", fake.sent[-1][1]
 
-# custom text that contains {channel} → placeholder still replaced with their link
-# (if user explicitly wants it), but no auto-append
+# legacy {channel} template is removed rather than exposing the exchange partner's link
 x["msg_no"] = "هنوز عضو {channel} نشدی"
 ok = asyncio.run(send_rem(eng.db.ex_get(rec["id"])))
 print("BODY placeholder ->", repr(fake.sent[-1][1]))
 assert ok is True
-assert fake.sent[-1][1] == "هنوز عضو @theirchan نشدی"
+assert fake.sent[-1][1] == "هنوز عضو نشدی"
+assert "@theirchan" not in fake.sent[-1][1]
 # custom with {mychannel} → my channel
 x["msg_no"] = "هنوز عضو {mychannel} نشدی"
 ok = asyncio.run(send_rem(eng.db.ex_get(rec["id"])))
