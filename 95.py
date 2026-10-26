@@ -119,6 +119,7 @@ DEFAULTS = {
         "group_failover_after_sec": 300, # چند ثانیه بدون لینک معتبر تا گروه بعدی
         "auto_leave_completed_on_limit": True, # هنگام رسیدن سقف تلگرام، فقط تبادل تمام‌شده
         "_capacity_join_blocked_until": 0,
+        "_capacity_join_block_notice_at": 0,
         "_group_failover_active_index": 0,
         "_group_failover_last_activity": 0,
         "min_join_gap_sec": 30,    # فاصله پیش‌فرض بین دو جوین (از یک عدد ثابت به بازه تصادفی)
@@ -3536,6 +3537,7 @@ class Engine:
                         "بعد از آزادکردن جا دستی: `تبادل لفت خودکار ریست`")
             if action in ("ریست", "reset", "آزاد"):
                 x["_capacity_join_blocked_until"] = 0
+                x["_capacity_join_block_notice_at"] = 0
                 self.st.save()
                 return "✅ توقف جوین به‌خاطر سقف پاک شد؛ اگر جا آزاد باشد تبادل ادامه می‌دهد."
             if action in ("روشن", "فعال", "on", "true"):
@@ -6526,12 +6528,26 @@ async def connect_and_run(eng, creds):
             except Exception:
                 pass
 
-    def block_joins_for_capacity(reason):
+    async def notify_capacity_join_blocked(until, reason=""):
+        x = eng.ex_cfg()
+        if int(x.get("_capacity_join_block_notice_at", 0) or 0) == int(until):
+            return
+        x["_capacity_join_block_notice_at"] = int(until)
+        eng.st.save()
+        eng.log("warn", "ex_capacity_block", f"تا {until}: {reason or 'سقف عضویت تلگرام'}")
+        try:
+            await note("⏸ جوین‌های تبادل به‌خاطر سقف عضویت تلگرام متوقف‌اند.\n"
+                       "اسکنِ لینک‌های تازه هم تا آزادشدن جا مکث می‌کند.\n"
+                       "اگر خودت یک کانال را لفت دادی، بفرست: `تبادل لفت خودکار ریست`")
+        except Exception:
+            pass
+
+    async def block_joins_for_capacity(reason):
         x = eng.ex_cfg()
         until = int(time.time()) + 3600
         x["_capacity_join_blocked_until"] = until
         eng.st.save()
-        eng.log("warn", "ex_capacity_block", f"تا {until}: {reason}")
+        await notify_capacity_join_blocked(until, reason)
 
     async def join_link(link, rec_id=None, _after_capacity_cleanup=False):
         """جوین به کانال. برمی‌گرداند (موفق, پیام, عنوان)
@@ -6578,7 +6594,7 @@ async def connect_and_run(eng, creds):
             return False, "کانال خصوصی است یا بن شده‌ای", ""
         except ChannelsTooMuchError:
             if _after_capacity_cleanup:
-                block_joins_for_capacity("حتی بعد از یک لفت امن، تلگرام سقف را آزاد نکرد")
+                await block_joins_for_capacity("حتی بعد از یک لفت امن، تلگرام سقف را آزاد نکرد")
                 return (False,
                         "تلگرام هنوز خطای حداکثر تعداد کانال (ChannelsTooMuch) می‌دهد؛ "
                         "بعد از یک لفت امن، برای جلوگیری از لفت‌های اضافه ادامه ندادم.",
@@ -6592,13 +6608,13 @@ async def connect_and_run(eng, creds):
                     eng.log("warn", "ex_capacity_cleanup_error", detail)
                 if cleaned:
                     return await join_link(link, rec_id, _after_capacity_cleanup=True)
-                block_joins_for_capacity(detail)
+                await block_joins_for_capacity(detail)
                 return (False,
                         "تلگرام سقف را پر اعلام کرد (حداکثر تعداد کانال / ChannelsTooMuch) و "
                         "تبادلِ تمام‌شدهٔ امنی برای لفت پیدا نشد؛ لطفاً یک عضویت را دستی آزاد کن "
                         "و بعد `تبادل لفت خودکار ریست` را بفرست. " + detail,
                         "")
-            block_joins_for_capacity("پاکسازی خودکار خاموش است و سقف عضویت پر شد")
+            await block_joins_for_capacity("پاکسازی خودکار خاموش است و سقف عضویت پر شد")
             return (False,
                     "تو حداکثر تعداد کانال ممکن هستی — یک عضویت را دستی آزاد کن، "
                     "بعد `تبادل لفت خودکار ریست` را بفرست.", "")
@@ -6722,13 +6738,16 @@ async def connect_and_run(eng, creds):
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
-    async def leave_completed_exchange_for_slot(exclude_rec_id=None):
-        """Free one slot only from a reciprocal, no-longer-monitored exchange."""
+    def completed_capacity_candidate(exclude_rec_id=None):
         joined = eng.db.ex_list("joined", 500)
         own_channels = [eng.st.prof(t).get("channel") for t in ("standard", "vip")]
-        candidate = select_capacity_leave_candidate(
+        return select_capacity_leave_candidate(
             joined, own_channels=own_channels, exclude_id=exclude_rec_id
         )
+
+    async def leave_completed_exchange_for_slot(exclude_rec_id=None):
+        """Free one slot only from a reciprocated, completed exchange."""
+        candidate = completed_capacity_candidate(exclude_rec_id)
         if not candidate:
             eng.log("warn", "ex_capacity_no_candidate",
                     "هیچ تبادلِ کامل و قابل‌تشخیص برای آزادسازی ظرفیت نبود")
@@ -7665,6 +7684,18 @@ async def connect_and_run(eng, creds):
                     await warn_ex_no_channel(int(time.time()))
                     await asyncio.sleep(20)
                     continue
+                capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
+                capacity_now = int(time.time())
+                if (capacity_blocked_until > capacity_now
+                        and x.get("auto_leave_completed_on_limit", True)
+                        and completed_capacity_candidate()):
+                    x["_capacity_join_blocked_until"] = 0
+                    x["_capacity_join_block_notice_at"] = 0
+                    eng.st.save()
+                    capacity_blocked_until = 0
+                if capacity_blocked_until > capacity_now:
+                    await asyncio.sleep(min(20, max(1, capacity_blocked_until - capacity_now)))
+                    continue
                 # ۰) اسکن گروه‌ها (حالت پیش‌قدم)
                 now_t = time.time()
                 manual = bool(x.pop("_scan_now", False))
@@ -7684,7 +7715,7 @@ async def connect_and_run(eng, creds):
                             elif wait > 0:
                                 state = f"در صف است؛ حدود {secs(int(wait))} دیگر امتحان می‌کنم"
                             else:
-                                state = "همین حالا برای Join امتحان می‌کنم"
+                                state = "در صف Join قرار گرفت؛ این پیام هنوز به معنی Join موفق نیست"
                             await note(f"🔍 اسکن تمام شد — {fa(n)} کانال تازه پیدا شد؛ {state}.")
                     elif n:
                         wait = eng.join_thr.wait_time()
@@ -7694,7 +7725,7 @@ async def connect_and_run(eng, creds):
                         elif wait > 0:
                             state = f"در صف Join؛ حدود {secs(int(wait))} دیگر"
                         else:
-                            state = "برای Join همین نوبت"
+                            state = "در صف Join قرار گرفت؛ نتیجهٔ واقعی بعد از تلاش جداگانه گزارش می‌شود"
                         await note(f"🔍 {fa(n)} کانال تازه پیدا شد — {state}.")
 
                 # زمان‌بندی دقیق‌تر از حلقه‌ی اصلی تبادل.
@@ -8198,11 +8229,22 @@ async def connect_and_run(eng, creds):
                     continue
 
                 capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
+                if (capacity_blocked_until > int(time.time())
+                        and x.get("auto_leave_completed_on_limit", True)
+                        and completed_capacity_candidate()):
+                    # A safe exchange may have completed since the last limit
+                    # error; let one queued Join retry so cleanup can proceed now.
+                    x["_capacity_join_blocked_until"] = 0
+                    x["_capacity_join_block_notice_at"] = 0
+                    eng.st.save()
+                    capacity_blocked_until = 0
                 if capacity_blocked_until > int(time.time()):
+                    await notify_capacity_join_blocked(capacity_blocked_until)
                     await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
                     continue
                 if capacity_blocked_until:
                     x["_capacity_join_blocked_until"] = 0
+                    x["_capacity_join_block_notice_at"] = 0
                     eng.st.save()
 
                 # ── شفافیتِ صف: اگر یک عملیات FloodWait خورده باشد، صفِ
