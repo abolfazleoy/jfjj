@@ -176,6 +176,7 @@ FAKE = textwrap.dedent('''
         x["group_failover_on"] = False
         x["auto_leave_completed_on_limit"] = True
         x["_capacity_join_blocked_until"] = 0
+        x["_capacity_join_block_notice_at"] = 0
         x["group_failover_after_sec"] = 300
         x["_group_failover_active_index"] = 0
         x["_group_failover_last_activity"] = 0
@@ -699,7 +700,10 @@ LOOPS = textwrap.dedent('''
         print("SCANS", len(scan_calls))
         print("REQUESTS", len(requests), ",".join(requests))
         if MODE in ("capacity", "capacity_empty"):
-            print("CAPACITY_BLOCKED", int(eng.ex_cfg().get("_capacity_join_blocked_until", 0)) > int(time.time()))
+            blocked_until = int(eng.ex_cfg().get("_capacity_join_blocked_until", 0) or 0)
+            print("CAPACITY_BLOCKED", blocked_until > int(time.time()))
+            print("CAPACITY_NOTICE_SHOWN",
+                  int(eng.ex_cfg().get("_capacity_join_block_notice_at", 0) or 0) == blocked_until and blocked_until > 0)
             print("CAPACITY_RETRIED", len(join_attempts) >= 2)
             print("CAPACITY_PENDING", eng.db.ex_get(rec["id"]).get("status") == "approved")
             if MODE == "capacity":
@@ -803,6 +807,7 @@ def main():
     print(o4.strip()[-1000:])
     blocked_ok = (r4.returncode == 0
                   and "CAPACITY_BLOCKED True" in o4
+                  and "CAPACITY_NOTICE_SHOWN True" in o4
                   and "CAPACITY_RETRIED False" in o4
                   and "CAPACITY_PENDING True" in o4
                   and "LeaveChannelRequest" not in o4)
