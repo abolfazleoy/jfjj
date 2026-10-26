@@ -173,6 +173,12 @@ FAKE = textwrap.dedent('''
         eng.st.prof("vip")["channel"] = "@vipchannel" if vip else ""
         x = eng.ex_cfg()
         x["groups"] = list(groups)
+        x["group_failover_on"] = False
+        x["auto_leave_completed_on_limit"] = True
+        x["_capacity_join_blocked_until"] = 0
+        x["group_failover_after_sec"] = 300
+        x["_group_failover_active_index"] = 0
+        x["_group_failover_last_activity"] = 0
         x["enabled"] = bool(enabled)
         x["op_gap_min_sec"] = 0
         x["op_gap_max_sec"] = 0
@@ -225,7 +231,7 @@ FAKE = textwrap.dedent('''
         check("فقط ۲ قدم" in p, "panel explains quick exchange in 2 steps")
         check("مثلاً @mychannel" in p, "panel shows a concrete channel example")
         check("کانالِ خودت" in p, "panel says the first input is your channel")
-        check("گروه تبادل" in p, "panel says the second input is the group")
+        check("گروه اصلی" in p, "panel says the second input is the primary group")
         check("بستن پنل" in p, "panel tail shows close-panel command")
         check("پنل پاک می‌شه" in p, "panel explains what close does")
         check("بستن" in p and "پیامِ شروع" in p,
@@ -288,8 +294,11 @@ FAKE = textwrap.dedent('''
         check(not eng.st.prof("standard")["channel"], "group-first leaves channel empty")
 
         out = await cmd("کانال @mychannel")
+        check("گروه پشتیبان هم می‌خواهی؟" in out[-1].raw_text,
+              "channel then asks the clear optional backup question")
+        out = await cmd("رد")
         done = out[-1].raw_text if out else ""
-        check("تبادل آماده‌ست" in done, "channel then finishes the wizard")
+        check("تبادل آماده‌ست" in done, "skip completes the wizard without a backup")
         check(eng.st.prof("standard")["channel"] == "@mychannel",
               "channel is persisted after wizard")
         check(eng.ex_cfg()["groups"] == ["@mygroup"], "group is persisted after wizard")
@@ -300,6 +309,71 @@ FAKE = textwrap.dedent('''
               "quick exchange uses the new msg_no default")
         check(eng.st["risk"]["_auto_off"] is False,
               "quick exchange clears the auto-off guard")
+        check(eng.ex_cfg().get("group_failover_on") is False,
+              "quick exchange with one group keeps optional failover off")
+
+        # Quick Exchange takes only one group in its simple group prompt.
+        # Backup is a clear optional follow-up command after the setup completes.
+        reset()
+        await cmd("تبادل سریع")
+        await cmd("@fastchannel")
+        out = await cmd("@primarygroup @backupgroup")
+        check("فقط گروه اصلی" in out[-1].raw_text,
+              "Quick Exchange explains not to enter two groups in one message")
+        check(not eng.ex_cfg()["enabled"],
+              "invalid multi-group input does not partially finish setup")
+        out = await cmd("@primarygroup")
+        check("گروه پشتیبان هم می‌خواهی؟" in out[-1].raw_text,
+              "after the primary group, Quick Exchange asks about optional backup")
+        out = await cmd("رد")
+        check("تبادل آماده‌ست" in out[-1].raw_text,
+              "choosing no backup completes Quick Exchange")
+        check(eng.ex_cfg()["groups"] == ["@primarygroup"],
+              "Quick Exchange keeps the simple single-group setup")
+        check(eng.ex_cfg().get("group_failover_on") is False,
+              "single-group Quick Exchange leaves failover off")
+        out = await cmd("تبادل گروه جایگزین @backupgroup")
+        check("گروه پشتیبان ثبت" in out[-1].raw_text,
+              "optional backup can be added after Quick Exchange")
+        check(eng.ex_cfg()["groups"] == ["@primarygroup", "@backupgroup"],
+              "optional command saves primary then backup group")
+        check(eng.ex_cfg().get("group_failover_on") is True,
+              "explicit backup command opts into failover")
+
+        # The regular panel/command path can configure, disable, tune and enable
+        # the same feature independently of Quick Exchange.
+        reset(channel=True, groups=["@main_group"])
+        out = await cmd("تبادل گروه جایگزین @backup_group")
+        check("گروه پشتیبان ثبت" in out[-1].raw_text,
+              "panel command registers and enables a backup group")
+        check(eng.ex_cfg()["groups"][:2] == ["@main_group", "@backup_group"],
+              "regular command preserves main-before-backup order")
+        check(eng.ex_cfg().get("group_failover_on") is True,
+              "regular command explicitly opts in")
+        await cmd("تبادل گروه جایگزین خاموش")
+        check(eng.ex_cfg().get("group_failover_on") is False,
+              "regular command can disable failover")
+        await cmd("تبادل گروه جایگزین بعد ۷")
+        check(eng.ex_cfg().get("group_failover_after_sec") == 420,
+              "regular command can change the inactivity threshold")
+        await cmd("تبادل گروه جایگزین روشن")
+        check(eng.ex_cfg().get("group_failover_on") is True,
+              "regular command can re-enable failover")
+        out = await cmd("تبادل گروه جایگزین")
+        check("گروه اصلی" in out[-1].raw_text and "گروه پشتیبان" in out[-1].raw_text,
+              "regular panel command reports primary and backup status")
+        out = await cmd("گروه")
+        check("جایگزینی" in out[-1].raw_text and "خاموش‌کردن جایگزینی" in out[-1].raw_text,
+              "ordinary groups submenu exposes failover controls")
+        out = await cmd("تبادل لفت خودکار")
+        check("روشن" in out[-1].raw_text,
+              "capacity cleanup status is visible in the regular panel")
+        await cmd("تبادل لفت خودکار خاموش")
+        check(eng.ex_cfg().get("auto_leave_completed_on_limit") is False,
+              "capacity cleanup can be disabled")
+        await cmd("تبادل لفت خودکار روشن")
+        check(eng.ex_cfg().get("auto_leave_completed_on_limit") is True,
+              "capacity cleanup can be re-enabled")
 
         out = await cmd("تبادل سریع")
         r = out[-1].raw_text if out else ""
@@ -329,15 +403,18 @@ FAKE = textwrap.dedent('''
         check("معتبر نیست" in out[-1].raw_text,
               "a Persian sentence is rejected as a channel")
         out = await cmd("@abcd")
-        check("گروه تبادل" in out[-1].raw_text,
+        check("گروه اصلی" in out[-1].raw_text,
               "valid channel moves the wizard to the group step")
         out = await cmd("@abcd")
-        check("یکی باشند" in out[-1].raw_text,
+        check("یکی" in out[-1].raw_text,
               "channel == group is rejected")
         check(not eng.ex_cfg()["enabled"], "same channel/group never enables exchange")
         out = await cmd("https://t.me/mygroup")
+        check("گروه پشتیبان هم می‌خواهی؟" in out[-1].raw_text,
+              "t.me link is accepted as the primary group")
+        out = await cmd("بدون پشتیبان")
         check("تبادل آماده‌ست" in out[-1].raw_text,
-              "t.me link is accepted as the group")
+              "explicitly skipping the backup completes the wizard")
         check(eng.ex_cfg()["groups"] == ["@mygroup"],
               "t.me group link is normalized to @username")
         check(eng.st.prof("standard")["channel"] == "@abcd",
@@ -358,11 +435,14 @@ FAKE = textwrap.dedent('''
         reset()
         await cmd("تبادل سریع")
         out = await cmd("کانال https://t.me/c1chan")
-        check("گروه تبادل" in out[-1].raw_text,
-              "full channel link is accepted")
+        check("گروه اصلی" in out[-1].raw_text,
+              "full channel link is accepted and asks for a primary group")
         out = await cmd("گروه t.me/g1chan")
+        check("گروه پشتیبان هم می‌خواهی؟" in out[-1].raw_text,
+              "short group link is accepted as the primary group")
+        out = await cmd("رد")
         check("تبادل آماده‌ست" in out[-1].raw_text,
-              "short group link is accepted")
+              "short-link setup continues after skipping backup")
         check(eng.st.prof("standard")["channel"] == "@c1chan",
               "channel URL normalized to @name")
         check(eng.ex_cfg()["groups"] == ["@g1chan"],
@@ -480,6 +560,7 @@ LOOPS = textwrap.dedent('''
 
     scan_calls = []
     requests = []
+    join_attempts = []
     CLIENTS = []
 
     class FakeClient:
@@ -514,7 +595,12 @@ LOOPS = textwrap.dedent('''
             if False:
                 yield None
         def __call__(self, req):
-            requests.append(type(req).__name__)
+            request_name = type(req).__name__
+            requests.append(request_name)
+            if request_name == "JoinChannelRequest":
+                join_attempts.append(request_name)
+                if MODE in ("capacity", "capacity_empty") and len(join_attempts) == 1:
+                    raise tl.errors.ChannelsTooMuchError()
             async def _done():
                 return types.SimpleNamespace(
                     chats=[types.SimpleNamespace(id=9001, access_hash=1234,
@@ -586,6 +672,13 @@ LOOPS = textwrap.dedent('''
     x["auto_join"] = True
     eng.st.save()
     eng.join_thr.apply({"min_gap_sec": 1, "max_gap_sec": 1, "max_per_hour": 0})
+    if MODE == "capacity":
+        x["permanent_check"] = True
+        x["permanent_check_max_hours"] = 24
+        old, _ = eng.db.ex_add(778, "@oldpeer", "@oldexchange")
+        eng.db.ex_set(old["id"], status="joined", direction="in", peer_id=778,
+                      joined_at=int(time.time()) - 3600, chat_id=9002,
+                      chat_hash=2345, next_reminder=0, note="completed")
     rec, _new = eng.db.ex_add(777, "@peer", "@peerchannel")
     eng.db.ex_set(rec["id"], status="approved", direction="in",
                   peer_id=777, peer_name="@peer", created_at=int(time.time()),
@@ -605,6 +698,13 @@ LOOPS = textwrap.dedent('''
         print("MODE", MODE)
         print("SCANS", len(scan_calls))
         print("REQUESTS", len(requests), ",".join(requests))
+        if MODE in ("capacity", "capacity_empty"):
+            print("CAPACITY_BLOCKED", int(eng.ex_cfg().get("_capacity_join_blocked_until", 0)) > int(time.time()))
+            print("CAPACITY_RETRIED", len(join_attempts) >= 2)
+            print("CAPACITY_PENDING", eng.db.ex_get(rec["id"]).get("status") == "approved")
+            if MODE == "capacity":
+                old_after = eng.db.ex_get(old["id"])
+                print("CAPACITY_CLEANED", old_after.get("status") == "left")
         print("ENABLED", eng.ex_cfg()["enabled"])
         print("CHANNEL", eng.st.prof("standard")["channel"])
         client._done.set()
@@ -680,6 +780,35 @@ def main():
           % ("✅ PASS" if pos_ok else "❌ FAIL"))
     if not pos_ok:
         fails.append("positive control failed")
+
+    print("--- phase C3: capacity error leaves one safe completed exchange and retries ---")
+    reset_dir()
+    r3 = run_driver(LOOPS, "capacity")
+    o3 = r3.stdout + r3.stderr
+    print(o3.strip()[-1200:])
+    capacity_ok = (r3.returncode == 0
+                   and "CAPACITY_CLEANED True" in o3
+                   and "CAPACITY_RETRIED True" in o3
+                   and "CAPACITY_BLOCKED False" in o3
+                   and "LeaveChannelRequest" in o3
+                   and "JoinChannelRequest" in o3)
+    print("%s  safe cleanup + one join retry" % ("✅ PASS" if capacity_ok else "❌ FAIL"))
+    if not capacity_ok:
+        fails.append("capacity cleanup/retry failed")
+
+    print("--- phase C4: no safe completed exchange pauses further Join attempts ---")
+    reset_dir()
+    r4 = run_driver(LOOPS, "capacity_empty")
+    o4 = r4.stdout + r4.stderr
+    print(o4.strip()[-1000:])
+    blocked_ok = (r4.returncode == 0
+                  and "CAPACITY_BLOCKED True" in o4
+                  and "CAPACITY_RETRIED False" in o4
+                  and "CAPACITY_PENDING True" in o4
+                  and "LeaveChannelRequest" not in o4)
+    print("%s  no unsafe leave; capacity pause is set" % ("✅ PASS" if blocked_ok else "❌ FAIL"))
+    if not blocked_ok:
+        fails.append("empty-capacity guard failed")
 
     print()
     if fails:
