@@ -70,13 +70,12 @@ QUICK_EXCHANGE_PREVIOUS_DEFAULTS = {
     "msg_claim_no": "❌ گفتی جوین شدی ولی عضو نشدی",
 }
 
-# توضیحِ کوتاه و ثابتِ «تبادل سریع» — ته پنل و اولِ wizard می‌آید تا
-# کاربر بدون حدس‌زدن بداند فقط دو ورودی دارد: کانال + گروه.
+# توضیحِ تبادل سریع: دو قدم اصلی، سپس پرسشِ اختیاریِ پشتیبان با ردِ روشن.
 QUICK_EXCHANGE_HELP = (
-    "⚡ تبادل سریع — فقط ۲ قدم:\n"
+    "⚡ تبادل سریع — فقط ۲ قدم اصلی:\n"
     "۱) کانالِ خودت (مثلاً @mychannel)\n"
-    "۲) گروه تبادل (مثلاً @exchange_group)\n"
-    "متن‌های پیش‌فرض خودکار ست می‌شن و تبادل روشن می‌شه؛ تمومه."
+    "۲) گروه اصلی (مثلاً @exchange_group)\n"
+    "بعدش فقط می‌پرسم گروه پشتیبان هم می‌خواهی یا نه؛ می‌توانی رد کنی."
 )
 
 # ═══════════════════════════════════════════════════════
@@ -115,7 +114,13 @@ DEFAULTS = {
     "exchange": {
         "enabled": False,          # .ex on
         "auto_join": True,         # False = اول از تو تأیید می‌گیرد
-        "groups": [],              # گروه‌های تبادل که رصد شوند (خالی = فقط PV)
+        "groups": [],              # با جایگزینی روشن: ترتیب اولویت؛ وگرنه همه مثل قبل اسکن می‌شوند
+        "group_failover_on": False, # جایگزینی خودکار اختیاری؛ خاموش پیش‌فرض
+        "group_failover_after_sec": 300, # چند ثانیه بدون لینک معتبر تا گروه بعدی
+        "auto_leave_completed_on_limit": True, # هنگام رسیدن سقف تلگرام، فقط تبادل تمام‌شده
+        "_capacity_join_blocked_until": 0,
+        "_group_failover_active_index": 0,
+        "_group_failover_last_activity": 0,
         "min_join_gap_sec": 30,    # فاصله پیش‌فرض بین دو جوین (از یک عدد ثابت به بازه تصادفی)
         "max_join_gap_sec": 60,
         # بررسی عضویت طرف بی‌صدا و با فاصله تصادفی انجام می‌شود.
@@ -343,6 +348,115 @@ def same_peer_ref(a, b):
         return s.lstrip("@")
     na, nb = _norm(a), _norm(b)
     return bool(na) and na == nb
+
+def group_failover_index(ex_cfg, groups, now_ts):
+    """Return the prioritized group index when optional failover is enabled.
+
+    A missing activity timestamp starts a fresh grace period; old settings
+    therefore never fail over immediately just because the feature was added.
+    """
+    if not ex_cfg.get("group_failover_on") or len(groups or []) < 2:
+        return None
+    try:
+        index = int(ex_cfg.get("_group_failover_active_index", 0))
+    except (TypeError, ValueError):
+        index = 0
+    if index < 0 or index >= len(groups):
+        index = 0
+        ex_cfg["_group_failover_active_index"] = 0
+    try:
+        last_activity = int(ex_cfg.get("_group_failover_last_activity", 0) or 0)
+    except (TypeError, ValueError):
+        last_activity = 0
+    if last_activity <= 0:
+        ex_cfg["_group_failover_last_activity"] = int(now_ts)
+    return index
+
+
+def group_failover_scan_groups(ex_cfg, groups, now_ts):
+    """Return all legacy scan targets or the single active priority group."""
+    group_list = list(groups or [])
+    index = group_failover_index(ex_cfg, group_list, now_ts)
+    return group_list if index is None else [group_list[index]]
+
+
+def group_failover_after_scan(ex_cfg, groups, now_ts, found, scan_error=False):
+    """Record activity or advance to the next group after a quiet interval.
+
+    Returns ``(old_index, new_index)`` only when a switch happens.
+    """
+    index = group_failover_index(ex_cfg, groups, now_ts)
+    if index is None:
+        return None
+    if found:
+        ex_cfg["_group_failover_last_activity"] = int(now_ts)
+        return None
+    if scan_error:
+        return None
+    try:
+        last_activity = int(ex_cfg.get("_group_failover_last_activity", now_ts) or now_ts)
+        after_sec = int(ex_cfg.get("group_failover_after_sec", 300) or 300)
+    except (TypeError, ValueError):
+        last_activity, after_sec = int(now_ts), 300
+    after_sec = max(60, min(after_sec, 7 * 24 * 60 * 60))
+    if int(now_ts) - last_activity < after_sec:
+        return None
+    next_index = (index + 1) % len(groups)
+    ex_cfg["_group_failover_active_index"] = next_index
+    # Give the newly selected group a full interval before rotating again.
+    ex_cfg["_group_failover_last_activity"] = int(now_ts)
+    return index, next_index
+
+
+def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None):
+    """Choose the oldest reciprocated exchange channel to leave for a slot.
+
+    An outbound exchange is complete only after the partner joined back.
+    Active reminders, the user's own channels, and duplicate joined-channel
+    records are kept untouched. Completion does not wait for the normal
+    membership-watch window; the account-cap error is the cleanup trigger.
+    """
+    joined = [r for r in (records or []) if r.get("status") == "joined"]
+    candidates = []
+    own_channels = tuple(c for c in (own_channels or ()) if c)
+    for rec in joined:
+        try:
+            rid = int(rec.get("id") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        if exclude_id and rid == int(exclude_id):
+            continue
+        if not rec.get("peer_id"):
+            continue
+        if str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
+            continue
+        if int(rec.get("next_reminder") or 0) > 0:
+            continue
+        if any(same_peer_ref(rec.get("link"), own) for own in own_channels):
+            continue
+        duplicate = False
+        cid = rec.get("chat_id")
+        for other in joined:
+            if other is rec or int(other.get("id") or 0) == rid:
+                continue
+            same_chat = (cid and other.get("chat_id")
+                         and int(cid) == int(other.get("chat_id")))
+            same_link = same_peer_ref(rec.get("link"), other.get("link"))
+            if same_chat or same_link:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        candidates.append(rec)
+    if not candidates:
+        return None
+    def _age_key(rec):
+        try:
+            return (int(rec.get("joined_at") or rec.get("created_at") or 0),
+                    int(rec.get("id") or 0))
+        except (TypeError, ValueError):
+            return (0, 0)
+    return min(candidates, key=_age_key)
 
 
 VERSION = "3.0"
@@ -1718,6 +1832,9 @@ HELP = """🤖 راهنمای جفج
 👥 گروه‌های تبادل
 گروه‌ها — نمایش منوی گروه‌ها
 افزودن گروه @group — افزودن گروه
+تبادل گروه جایگزین @backup — فعال‌سازی پشتیبان اختیاری
+تبادل گروه جایگزین روشن/خاموش — کنترل حالت
+تبادل گروه جایگزین بعد ۵ — انتقال پس از ۵ دقیقه بی‌لینک‌ماندن
 حذف گروه @group — حذف یک گروه
 حذف همه گروه‌ها — حذف همه گروه‌ها
 
@@ -1736,6 +1853,7 @@ HELP = """🤖 راهنمای جفج
 تبادل تأیید ۵ — تأیید یک مورد
 تبادل رد ۵ — رد یک مورد
 تبادل خروج ۵ — لفت از یک کانال
+تبادل لفت خودکار روشن/خاموش/ریست — لفت امن و پاک‌کردن توقف سقف
 تبادل حذف ۵ — حذف یک مورد
 تبادل ارسال ۵ — ارسال دوباره متن برای Join شماره ۵
 
@@ -2951,6 +3069,13 @@ class Engine:
             ("تأخیر اسکن", "scan_jitter"),
             ("فاصله اسکن", "scan_jitter"),
             ("ضد اسپم", "scan_jitter"),
+            ("لفت خودکار", "capacity_leave"),
+            ("پاکسازی سقف", "capacity_leave"),
+            ("گروه جایگزین", "groupfailover"),
+            ("جایگزین گروه", "groupfailover"),
+            ("گروه پشتیبان", "groupfailover"),
+            ("جایگزین", "groupfailover"),
+            ("پشتیبان", "groupfailover"),
             ("همه دستورها", "cmds"),
             ("همه دستورات", "cmds"),
             ("راهنمای حالت ها", "guide"),
@@ -3396,11 +3521,109 @@ class Engine:
                     ("، ".join(f"`{i}`" for i in w) if w
                      else "برداشته شد — هر ریپلایی بررسی می‌شود"))
 
+        if sub in ("capacity_leave", "leave_completed"):
+            action = re.sub(r"\s+", " ", rest.replace("\u200c", " ")).strip().lower()
+            enabled = bool(x.get("auto_leave_completed_on_limit", True))
+            if not action:
+                blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
+                blocked = (f"\n⏸ تلاش برای جوین تا {secs(blocked_until - int(time.time()))} متوقف است."
+                           if blocked_until > int(time.time()) else "")
+                return ("🧹 لفتِ خودکار برای سقف عضویت تلگرام: "
+                        f"{'روشن' if enabled else 'خاموش'}{blocked}\n"
+                        "فقط وقتی تلگرام سقف عضویت را اعلام کند، از قدیمی‌ترین تبادلِ "
+                        "کامل‌شده لفت می‌دهم؛ در پیش‌قدم، طرف هم باید به کانال تو جوین شده باشد.\n"
+                        "`تبادل لفت خودکار روشن` / `خاموش`\n"
+                        "بعد از آزادکردن جا دستی: `تبادل لفت خودکار ریست`")
+            if action in ("ریست", "reset", "آزاد"):
+                x["_capacity_join_blocked_until"] = 0
+                self.st.save()
+                return "✅ توقف جوین به‌خاطر سقف پاک شد؛ اگر جا آزاد باشد تبادل ادامه می‌دهد."
+            if action in ("روشن", "فعال", "on", "true"):
+                x["auto_leave_completed_on_limit"] = True
+                self.st.save()
+                return ("✅ لفت امن برای سقف عضویت روشن شد؛ فقط تبادلِ کامل‌شده انتخاب می‌شود "
+                        "و در پیش‌قدم، جوین‌شدن طرف به کانال تو هم لازم است.")
+            if action in ("خاموش", "غیرفعال", "off", "false"):
+                x["auto_leave_completed_on_limit"] = False
+                self.st.save()
+                return "✅ لفت خودکار برای سقف عضویت خاموش شد؛ در صورت پرشدن سقف، دستی لفت بده."
+            return "فرمت: `تبادل لفت خودکار روشن` یا `تبادل لفت خودکار خاموش`."
+
+        if sub in ("groupfailover", "failover", "backupgroup"):
+            groups = list(x.get("groups") or [])
+            now = int(time.time())
+            action = re.sub(r"\s+", " ", rest.replace("\u200c", " ")).strip()
+            action_low = action.lower()
+            if not action:
+                enabled = bool(x.get("group_failover_on"))
+                active_i = int(x.get("_group_failover_active_index", 0) or 0)
+                active_i = min(max(active_i, 0), max(0, len(groups) - 1))
+                primary = groups[0] if groups else "ثبت نشده"
+                backup = groups[1] if len(groups) > 1 else "ثبت نشده"
+                state = "روشن" if enabled and len(groups) > 1 else "خاموش"
+                minutes = max(1, int(x.get("group_failover_after_sec", 300) or 300) // 60)
+                active = groups[active_i] if groups else "—"
+                return ("🔁 **جایگزینی گروه (اختیاری)**\n"
+                        f"وضعیت: {state}\nگروه اصلی: `{primary}`\n"
+                        f"گروه پشتیبان: `{backup}`\nگروه فعال: `{active}`\n"
+                        f"انتقال پس از {fa(minutes)} دقیقه بدون لینک تازه\n\n"
+                        "تنظیم گروه پشتیبان: `تبادل گروه جایگزین @backup`\n"
+                        "روشن/خاموش: `تبادل گروه جایگزین روشن` / `خاموش`\n"
+                        "تغییر زمان: `تبادل گروه جایگزین بعد ۵` (دقیقه)")
+            if action_low in ("روشن", "فعال", "on", "true"):
+                if len(groups) < 2:
+                    return ("برای روشن‌کردن جایگزینی، اول گروه اصلی و پشتیبان را ثبت کن؛ "
+                            "مثلاً `تبادل گروه @main @backup`.\n"
+                            "قابلیت اختیاری است و تا آن زمان رفتار قبلی تغییری نمی‌کند.")
+                x["group_failover_on"] = True
+                x["_group_failover_active_index"] = 0
+                x["_group_failover_last_activity"] = now
+                self.st.save()
+                return (f"✅ جایگزینی گروه روشن شد. `{groups[0]}` گروه اصلی و "
+                        f"`{groups[1]}` پشتیبان است؛ پس از {fa(max(1, int(x.get('group_failover_after_sec', 300)) // 60))} دقیقه بی‌لینک‌ماندن جابه‌جا می‌شود.")
+            if action_low in ("خاموش", "غیرفعال", "off", "false"):
+                x["group_failover_on"] = False
+                x["_group_failover_active_index"] = 0
+                self.st.save()
+                return "✅ جایگزینی گروه خاموش شد؛ اسکن با رفتار عادی قبلی ادامه دارد."
+            if action_low.startswith(("بعد", "پس از", "after")) or re.fullmatch(r"\d+", action.translate(EN)):
+                match = re.search(r"\d+", action.translate(EN))
+                if not match:
+                    return "فرمت زمان: `تبادل گروه جایگزین بعد ۵` (دقیقه، از ۱ تا ۱۰۰۸۰)"
+                minutes = max(1, min(10080, int(match.group(0))))
+                x["group_failover_after_sec"] = minutes * 60
+                self.st.save()
+                return f"⏱ انتقال به گروه پشتیبان پس از {fa(minutes)} دقیقه بدون لینک تازه انجام می‌شود."
+            backup = normalize_peer_ref(action)
+            if backup:
+                if not groups:
+                    return "اول گروه اصلی را ثبت کن؛ مثلاً `تبادل گروه @main`؛ بعد گروه پشتیبان را بده."
+                if same_peer_ref(backup, groups[0]):
+                    return "❌ گروه پشتیبان باید با گروه اصلی متفاوت باشد."
+                own_channels = [self.st.prof(t).get("channel") for t in ("standard", "vip")]
+                if any(same_peer_ref(backup, channel) for channel in own_channels):
+                    return "❌ گروه پشتیبان نمی‌تواند یکی از کانال‌های خودت باشد."
+                # مورد دوم جایگزین می‌شود؛ گروه‌های بعدی با همان ترتیب حفظ می‌شوند.
+                tail = [g for g in groups[2:] if not same_peer_ref(g, backup)]
+                x["groups"] = [groups[0], backup] + tail
+                x["group_failover_on"] = True
+                x["_group_failover_active_index"] = 0
+                x["_group_failover_last_activity"] = now
+                self.st.save()
+                return (f"✅ گروه پشتیبان ثبت و جایگزینی روشن شد: `{groups[0]}` → `{backup}`.\n"
+                        "خاموش‌کردن اختیاری: `تبادل گروه جایگزین خاموش`")
+            return ("فرمت: `تبادل گروه جایگزین @backup`، `روشن`، `خاموش` یا "
+                    "`بعد ۵` (دقیقه).")
+
         if sub == "removegroup":
             target = rest.strip().lower()
             before = self.ex_cfg().get("groups") or []
             kept = [g for g in before if g.strip().lstrip("@").lower() != target.lstrip("@")]
             self.ex_cfg()["groups"] = kept
+            if len(kept) < 2:
+                self.ex_cfg()["group_failover_on"] = False
+            self.ex_cfg()["_group_failover_active_index"] = 0
+            self.ex_cfg()["_group_failover_last_activity"] = int(time.time())
             self.st.save()
             if len(kept) == len(before):
                 return "این گروه در فهرست نبود."
@@ -3412,17 +3635,27 @@ class Engine:
                 rest = rest[7:].strip()
             if not rest:
                 g = x["groups"]
-                return ("📡 گروه‌های رصدشده: " +
-                        ("، ".join(f"`{i}`" for i in g) if g else "هیچ — فقط پیام خصوصی") +
-                        "\n\n`افزودن گروه @g1 @g2`  |  `حذف همه گروه‌ها`")
+                listed = ("، ".join(f"`{i}`" for i in g) if g else "هیچ — فقط پیام خصوصی")
+                failover_state = ("روشن — گروه اول اصلی، گروه دوم پشتیبان"
+                                  if x.get("group_failover_on") and len(g) >= 2
+                                  else "خاموش — رفتار قبلی حفظ می‌شود")
+                return ("📡 گروه‌های رصدشده: " + listed +
+                        f"\n🔁 جایگزینی اختیاری: {failover_state}" +
+                        "\n\n`افزودن گروه @g1 @g2`  |  `حذف همه گروه‌ها`\n"
+                        "`تبادل گروه جایگزین` برای تنظیم و فعال‌سازی اختیاری")
             if rest.lower() in ("off", "خاموش", "none"):
                 x["groups"] = []
+                x["group_failover_on"] = False
             else:
                 current = list(x.get("groups") or [])
                 for group in (w.strip() for w in rest.split() if w.strip()):
                     if group.lower() not in {g.lower() for g in current}:
                         current.append(group)
                 x["groups"] = current
+            x["_group_failover_active_index"] = 0
+            x["_group_failover_last_activity"] = int(time.time())
+            if len(x.get("groups") or []) < 2:
+                x["group_failover_on"] = False
             self.st.save()
             g = x["groups"]
             return ("📡 گروه‌ها: " + ("، ".join(f"`{i}`" for i in g) if g
@@ -3904,6 +4137,7 @@ class Engine:
             f"جوین خودکار: {'روشن' if x['auto_join'] else 'تأیید دستی'}",
             "",
             f"کانال من: {ch or 'تنظیم نشده'} · گروه‌ها: {fad(len(groups))}",
+            f"گروه جایگزین: {'🟢 روشن' if x.get('group_failover_on') and len(groups) >= 2 else 'خاموش (اختیاری)'}",
             "",
         ]
         if not self.ex_channel_ready():
@@ -3992,6 +4226,10 @@ class Engine:
             "",
             "**گروه‌ها و کلمات**",
             "`تبادل گروه‌ها @گروه` · `تبادل کلمات جوین شدم`",
+            "`تبادل گروه جایگزین @backup` — ثبت و روشن‌کردن پشتیبان (اختیاری)",
+            "`تبادل گروه جایگزین خاموش` · `تبادل گروه جایگزین بعد ۵` (دقیقه)",
+            "`تبادل لفت خودکار` — لفت امن فقط هنگام پرشدن سقف ۵۰۰ عضویت",
+            "`تبادل لفت خودکار ریست` — ادامه پس از آزادکردن جا به‌صورت دستی",
             "",
             "**فاصله‌ها و زمان‌ها**",
             "`تبادل فاصله ۹۰ ۲۴۰` — فاصله تصادفی بین جوین‌ها",
@@ -4053,6 +4291,11 @@ class Engine:
         report_cur = {"live": "لحظه‌ای", "summary": "خلاصه"}.get(
             x.get("report_mode", "live"), "خاموش")
         jitter_cur = "فعال (چندگروه)" if len(groups) >= 2 else "خاموش (تک‌گروه)"
+        failover_cur = ("روشن" if x.get("group_failover_on") and len(groups) >= 2
+                        else "خاموش (پیش‌فرض؛ رفتار قبلی حفظ می‌شود)")
+        failover_min = max(1, int(x.get("group_failover_after_sec", 300) or 300) // 60)
+        capacity_leave_cur = ("روشن" if x.get("auto_leave_completed_on_limit", True)
+                              else "خاموش")
         age_min = max(1, int(x.get('scan_max_age_sec', 300) or 300)) // 60
         lines = [
             "⚙️ تنظیمات تبادل",
@@ -4117,6 +4360,16 @@ class Engine:
             "دستور آماده برای کپی:",
             "`تبادل اسکن تصادفی`",
             f"فعلی: {jitter_cur}",
+            "",
+            "🔁 گروه پشتیبان (اختیاری؛ خاموش پیش‌فرض):",
+            "`تبادل گروه جایگزین @backup` برای ثبت و فعال‌سازی",
+            "`تبادل گروه جایگزین روشن` / `خاموش` برای کنترل",
+            f"انتقال پس از {fa(failover_min)} دقیقه بی‌لینک‌ماندن · وضعیت: {failover_cur}",
+            "`تبادل گروه جایگزین بعد ۵` برای تغییر زمان به ۵ دقیقه",
+            "",
+            "🧹 آزادکردن ظرفیت سقف عضویت تلگرام:",
+            f"وضعیت: {capacity_leave_cur} · فقط تبادل کامل‌شده لفت می‌شود (بدون انتظار ۲۴ساعته)",
+            "`تبادل لفت خودکار روشن` / `خاموش` · `ریست` بعد از آزادکردن جا دستی",
             "",
             "📊 وقتی می‌خواهی گزارش خصوصی را تنظیم کنی:",
             "دستور آماده برای کپی:",
@@ -4614,13 +4867,23 @@ class Engine:
         )
 
     def submenu_groups(self):
-        g = self.ex_cfg().get("groups") or []
+        ex = self.ex_cfg()
+        g = ex.get("groups") or []
         lst = "، ".join(g) if g else "هیچ — فقط پیام خصوصی"
+        failover = bool(ex.get("group_failover_on") and len(g) >= 2)
+        after = max(1, int(ex.get("group_failover_after_sec", 300) or 300) // 60)
+        status = "روشن" if failover else "خاموش (رفتار فعلی حفظ می‌شود)"
         return self._page(
             "👥  گروه‌های تبادل",
-            f"تعداد:  {fa(len(g))}\nفعلی:  {lst}",
+            f"تعداد:  {fa(len(g))}\nفعلی:  {lst}\n"
+            f"ترتیب: گروه اول اصلی، گروه دوم پشتیبان\n"
+            f"جایگزینی: {status} · پس از {fa(after)} دقیقه بی‌لینک‌ماندن",
             [
                 ("➕  افزودن گروه", "گروه @گروه1 @گروه2"),
+                ("🔁  تنظیم پشتیبان", "تبادل گروه جایگزین @backup"),
+                (("🔄  خاموش‌کردن جایگزینی" if failover else "🔄  روشن‌کردن جایگزینی"),
+                 ("تبادل گروه جایگزین خاموش" if failover else "تبادل گروه جایگزین روشن")),
+                ("⏱  زمان انتقال: ۵ دقیقه", "تبادل گروه جایگزین بعد ۵"),
                 ("🗑  حذف یک گروه", "حذف گروه @گروه1"),
                 ("🧹  پاک کردن همه", "حذف همه گروه‌ها"),
                 ("🔄  بروزرسانی", "گروه"),
@@ -4641,6 +4904,9 @@ class Engine:
 
     def cmd_clear_groups(self):
         self.ex_cfg()["groups"] = []
+        self.ex_cfg()["group_failover_on"] = False
+        self.ex_cfg()["_group_failover_active_index"] = 0
+        self.ex_cfg()["_group_failover_last_activity"] = int(time.time())
         self.st.save()
         return self.submenu_groups()
 
@@ -5582,17 +5848,27 @@ async def connect_and_run(eng, creds):
         if step == "channel":
             return ("📡 کانالِ خودت رو بفرست (مثلاً @mychannel)\n"
                     "برای انصراف: `لغو`" + extra)
-        return ("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)\n"
+        if step == "backup_group":
+            return ("➕ گروه اصلی ثبت شد. گروه پشتیبان هم می‌خواهی؟\n"
+                    "۱) برای افزودن، آیدی گروه دوم را بفرست؛ مثلاً `@backup`\n"
+                    "۲) برای ادامه بدون پشتیبان، بنویس `بدون پشتیبان`\n"
+                    "برای لغو کامل: `لغو`")
+        return ("👥 فقط گروه اصلی رو بفرست (مثلاً @exchange_group).\n"
+                "بعدش دربارهٔ گروه پشتیبان ازت می‌پرسم؛ اجباری نیست.\n"
                 "برای انصراف: `لغو`" + extra)
 
-    def _qe_first_group(ex_cfg):
+    def _qe_group_refs(ex_cfg):
         groups = ex_cfg.get("groups") or []
         if isinstance(groups, str):
             groups = [groups]
         elif not isinstance(groups, (list, tuple, set)):
             groups = []
-        return next((str(item).strip() for item in groups
-                     if str(item or "").strip()), "")
+        result = []
+        for item in groups:
+            normalized = normalize_peer_ref(str(item or "").strip())
+            if normalized and not any(same_peer_ref(normalized, old) for old in result):
+                result.append(normalized)
+        return result
 
     async def _start_quick_exchange(user_id):
         x = eng.ex_cfg()
@@ -5600,25 +5876,41 @@ async def connect_and_run(eng, creds):
         # یک جمله‌ی فارسی ذخیره شده، به‌عنوان کانالِ معتبر شناخته نمی‌شود.
         raw_channel = str(eng.st.prof("standard").get("channel") or "").strip()
         channel = normalize_peer_ref(raw_channel) or ""
-        group = normalize_peer_ref(_qe_first_group(x)) or ""
+        saved_groups = _qe_group_refs(x)
+        group = saved_groups[0] if saved_groups else ""
+        backup_group = saved_groups[1] if len(saved_groups) > 1 else ""
 
         # قاعده: اگر کانال معتبر نیست، حتی اگر گروه ثبت شده باشد، سراغ
         # گروه نمی‌رویم؛ اول کانال.
-        if channel and group and same_peer_ref(channel, group):
-            group = ""
+        if channel:
+            if group and same_peer_ref(channel, group):
+                group = ""
+            if backup_group and same_peer_ref(channel, backup_group):
+                backup_group = ""
 
         if channel and group:
             if _ensure_quick_exchange_defaults(x):
                 eng.st.save()
             quick_exchange_state.pop(user_id, None)
+            backup_line = (f"🔁 گروه پشتیبان: {backup_group}\n"
+                           f"حالت جایگزین: {'روشن' if x.get('group_failover_on') else 'خاموش'}\n"
+                           if backup_group else
+                           "🔁 گروه پشتیبان: تنظیم نشده (اختیاری)\n")
             if x.get("enabled"):
                 await _say("⚡ تبادل سریع از قبل آماده و روشن است.\n\n"
                            f"📡 کانال: {channel}\n"
-                           f"👥 گروه: {group}\n\n"
-                           "برای دیدن وضعیت: `تبادل`")
+                           f"👥 گروه اصلی: {group}\n"
+                           f"{backup_line}\n"
+                           + ("برای روشن‌کردن جایگزینی: `تبادل گروه جایگزین روشن`\n"
+                              if backup_group and not x.get("group_failover_on") else
+                              "برای ثبت گروه پشتیبان: `تبادل گروه جایگزین @backup`\n"
+                              if not backup_group else "")
+                           + "برای دیدن وضعیت: `تبادل`")
             else:
                 await _say("⚡ تبادل سریع از قبل آماده است؛ فقط روشنش کن:\n"
-                           "`تبادل روشن`")
+                           "`تبادل روشن`\n"
+                           + ("جایگزینی گروه اختیاری است؛ تنظیم: `تبادل گروه جایگزین`"
+                              if backup_group else ""))
             return
 
         state = {"step": "channel" if not channel else "group"}
@@ -5627,10 +5919,11 @@ async def connect_and_run(eng, creds):
         if group:
             # گروه بدون کانال نگه داشته می‌شود ولی تا ثبت کانال شروع نمی‌کنیم.
             state["group"] = group
+        if backup_group:
+            state["backup_group"] = backup_group
         quick_exchange_state[user_id] = state
         if channel:
-            await _say("👥 گروه تبادل رو بفرست (مثلاً @exchange_group)\n"
-                       "برای انصراف: `لغو`")
+            await _say(_qe_prompt("group"))
         else:
             extra = ("\n\n👥 گروهِ ثبت‌شده فعلاً نگه داشته می‌شود؛ تا کانال "
                      "ثبت نشه کاری شروع نمی‌کنم." if group else "")
@@ -5640,6 +5933,7 @@ async def connect_and_run(eng, creds):
     async def _finish_quick_exchange(user_id, state):
         channel = normalize_peer_ref(state.get("channel"))
         group = normalize_peer_ref(state.get("group"))
+        backup_group = normalize_peer_ref(state.get("backup_group"))
         if not channel:
             state.pop("channel", None)
             state["step"] = "channel"
@@ -5656,15 +5950,26 @@ async def connect_and_run(eng, creds):
             return
         if same_peer_ref(channel, group):
             state.pop("group", None)
+            state.pop("backup_group", None)
             state["step"] = "group"
             await _say("❌ کانال و گروه نمی‌توانند یکی باشند.\n"
+                       + _qe_prompt("group"))
+            return
+        if backup_group and (same_peer_ref(channel, backup_group)
+                             or same_peer_ref(group, backup_group)):
+            state.pop("backup_group", None)
+            state["step"] = "group"
+            await _say("❌ گروه پشتیبان باید با کانال و گروه اصلی متفاوت باشد.\n"
                        + _qe_prompt("group"))
             return
 
         st = eng.st
         st.prof("standard")["channel"] = channel
         ex_cfg = eng.ex_cfg()
-        ex_cfg["groups"] = [group]
+        ex_cfg["groups"] = [group] + ([backup_group] if backup_group else [])
+        ex_cfg["group_failover_on"] = bool(backup_group)
+        ex_cfg["_group_failover_active_index"] = 0
+        ex_cfg["_group_failover_last_activity"] = int(time.time())
         _ensure_quick_exchange_defaults(ex_cfg)
         # ── قاعده‌ی ایمنی: بدون کانالِ معتبر هیچ‌وقت روشن نکن ──
         if not eng.ex_channel_ready():
@@ -5682,8 +5987,12 @@ async def connect_and_run(eng, creds):
         await _say(
             "✅ تبادل آماده‌ست!\n\n"
             f"📡 کانال: {channel} ✓\n"
-            f"👥 گروه تبادل: {group} ✓\n"
-            "📝 متن‌های پیش‌فرض: فعال ✓\n"
+            f"👥 گروه اصلی: {group} ✓\n"
+            + (f"🔁 گروه پشتیبان: {backup_group} ✓ (جایگزینی اختیاری روشن)\n"
+               if backup_group else
+               "🔁 گروه پشتیبان: تنظیم نشده؛ اختیاری است.\n"
+               "برای افزودنش بعداً: `تبادل گروه جایگزین @backup`\n")
+            + "📝 متن‌های پیش‌فرض: فعال ✓\n"
             "🔁 تبادل: 🟢 روشن\n\n"
             "شروع کردم به جذب ممبر! 🚀\n"
             "برای تنظیمات بیشتر: `پنل`"
@@ -5705,11 +6014,12 @@ async def connect_and_run(eng, creds):
             if low.startswith(pref) and low[len(pref):len(pref) + 1] in (" ", ":", "：", "\u200c"):
                 return "channel", text[len(pref):].strip(" :：\u200c")
         for pref in _QE_GROUP_PREFIXES:
+            target = "backup_group" if step == "backup_group" else "group"
             if low == pref:
-                return "group", ""
+                return target, ""
             if low.startswith(pref) and low[len(pref):len(pref) + 1] in (" ", ":", "：", "\u200c"):
-                return "group", text[len(pref):].strip(" :：\u200c")
-        value = text.split()[0] if text.split() else ""
+                return target, text[len(pref):].strip(" :：\u200c")
+        value = text if step in ("group", "backup_group") else (text.split()[0] if text.split() else "")
         return (step or "channel"), value
 
     async def _handle_quick_exchange_input(user_id, raw, low):
@@ -5718,26 +6028,61 @@ async def connect_and_run(eng, creds):
             quick_exchange_state.pop(user_id, None)
             await _say("❌ تبادل سریع لغو شد. هیچ تنظیمی تغییر نکرد.")
             return
+        if state.get("step") == "backup_group" and low in (
+                "رد", "نه", "ندارم", "بدون پشتیبان", "ادامه", "ادامه بدون پشتیبان",
+                "skip", "no", "none"):
+            state.pop("backup_group", None)
+            await _finish_quick_exchange(user_id, state)
+            return
 
         target, value = _qe_parse_input(raw, state.get("step"))
         if not value:
             await _say(_qe_prompt(target))
             return
 
-        parsed = normalize_peer_ref(value)
-        if not parsed:
-            await _say(f"❌ «{value[:40]}» یک آیدی/لینکِ معتبر نیست.\n"
-                       + _qe_prompt(target, "\nمثال: `@mychannel` یا "
-                                            "`https://t.me/+AbCdEfGh`"))
-            return
-
-        other_key = "group" if target == "channel" else "channel"
-        if state.get(other_key) and same_peer_ref(parsed, state.get(other_key)):
-            await _say("❌ کانال و گروه نمی‌توانند یکی باشند.\n"
-                       + _qe_prompt(target))
-            return
-
-        state[target] = parsed
+        if target in ("group", "backup_group"):
+            prompt_step = "backup_group" if target == "backup_group" else "group"
+            if len(value.split()) > 1:
+                if target == "group":
+                    await _say("در این مرحله فقط گروه اصلی را بفرست؛ بعد می‌پرسم گروه پشتیبان هم می‌خواهی یا نه.")
+                else:
+                    await _say("برای گروه پشتیبان فقط یک آیدی/لینک بفرست؛ یا بنویس `رد`.")
+                return
+            parsed = normalize_peer_ref(value)
+            if not parsed:
+                await _say(f"❌ «{value[:60]}» آیدی/لینک معتبر نیست.\n"
+                           + _qe_prompt(prompt_step, "\nمثال: `@mygroup`"))
+                return
+            channel = normalize_peer_ref(state.get("channel"))
+            main_group = normalize_peer_ref(state.get("group"))
+            if channel and same_peer_ref(channel, parsed):
+                await _say("❌ گروه نمی‌تواند با کانال خودت یکی باشد.\n"
+                           + _qe_prompt(prompt_step))
+                return
+            if target == "backup_group":
+                if main_group and same_peer_ref(main_group, parsed):
+                    await _say("❌ گروه پشتیبان باید با گروه اصلی فرق داشته باشد.\n"
+                               + _qe_prompt("backup_group"))
+                    return
+                state["backup_group"] = parsed
+                quick_exchange_state[user_id] = state
+                await _finish_quick_exchange(user_id, state)
+                return
+            state["group"] = parsed
+            state.pop("backup_group", None)
+        else:
+            parsed = normalize_peer_ref(value)
+            if not parsed:
+                await _say(f"❌ «{value[:40]}» یک آیدی/لینکِ معتبر نیست.\n"
+                           + _qe_prompt(target, "\nمثال: `@mychannel` یا "
+                                                "`https://t.me/+AbCdEfGh`"))
+                return
+            for other_group in (state.get("group"), state.get("backup_group")):
+                if other_group and same_peer_ref(parsed, other_group):
+                    await _say("❌ کانال و گروه نمی‌توانند یکی باشند.\n"
+                               + _qe_prompt(target))
+                    return
+            state[target] = parsed
         quick_exchange_state[user_id] = state
 
         # ── قاعده‌ی «اول کانال» ──
@@ -5753,6 +6098,12 @@ async def connect_and_run(eng, creds):
         if not normalize_peer_ref(state.get("group")):
             state["step"] = "group"
             await _say(_qe_prompt("group"))
+            return
+
+        if not normalize_peer_ref(state.get("backup_group")):
+            state["step"] = "backup_group"
+            quick_exchange_state[user_id] = state
+            await _say(_qe_prompt("backup_group"))
             return
 
         await _finish_quick_exchange(user_id, state)
@@ -6175,7 +6526,14 @@ async def connect_and_run(eng, creds):
             except Exception:
                 pass
 
-    async def join_link(link, rec_id=None):
+    def block_joins_for_capacity(reason):
+        x = eng.ex_cfg()
+        until = int(time.time()) + 3600
+        x["_capacity_join_blocked_until"] = until
+        eng.st.save()
+        eng.log("warn", "ex_capacity_block", f"تا {until}: {reason}")
+
+    async def join_link(link, rec_id=None, _after_capacity_cleanup=False):
         """جوین به کانال. برمی‌گرداند (موفق, پیام, عنوان)
 
         rec_id که داده شود، جوین در صفِ تک‌عملکردی اجرا می‌شود و
@@ -6219,7 +6577,31 @@ async def connect_and_run(eng, creds):
         except ChannelPrivateError:
             return False, "کانال خصوصی است یا بن شده‌ای", ""
         except ChannelsTooMuchError:
-            return False, "تو حداکثر تعداد کانال ممکن هستی — چندتا لفت بده", ""
+            if _after_capacity_cleanup:
+                block_joins_for_capacity("حتی بعد از یک لفت امن، تلگرام سقف را آزاد نکرد")
+                return (False,
+                        "تلگرام هنوز خطای حداکثر تعداد کانال (ChannelsTooMuch) می‌دهد؛ "
+                        "بعد از یک لفت امن، برای جلوگیری از لفت‌های اضافه ادامه ندادم.",
+                        "")
+            if eng.ex_cfg().get("auto_leave_completed_on_limit", True):
+                try:
+                    cleaned, detail = await leave_completed_exchange_for_slot(rec_id)
+                except Exception as cleanup_error:
+                    cleaned = False
+                    detail = f"پاکسازی امن ناموفق شد: {type(cleanup_error).__name__}: {cleanup_error}"
+                    eng.log("warn", "ex_capacity_cleanup_error", detail)
+                if cleaned:
+                    return await join_link(link, rec_id, _after_capacity_cleanup=True)
+                block_joins_for_capacity(detail)
+                return (False,
+                        "تلگرام سقف را پر اعلام کرد (حداکثر تعداد کانال / ChannelsTooMuch) و "
+                        "تبادلِ تمام‌شدهٔ امنی برای لفت پیدا نشد؛ لطفاً یک عضویت را دستی آزاد کن "
+                        "و بعد `تبادل لفت خودکار ریست` را بفرست. " + detail,
+                        "")
+            block_joins_for_capacity("پاکسازی خودکار خاموش است و سقف عضویت پر شد")
+            return (False,
+                    "تو حداکثر تعداد کانال ممکن هستی — یک عضویت را دستی آزاد کن، "
+                    "بعد `تبادل لفت خودکار ریست` را بفرست.", "")
         except FloodWaitError as e:
             w = getattr(e, "seconds", 60)
             eng.join_thr.penalize(w)
@@ -6339,6 +6721,42 @@ async def connect_and_run(eng, creds):
             return False, f"FloodWait {w}s"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
+
+    async def leave_completed_exchange_for_slot(exclude_rec_id=None):
+        """Free one slot only from a reciprocal, no-longer-monitored exchange."""
+        joined = eng.db.ex_list("joined", 500)
+        own_channels = [eng.st.prof(t).get("channel") for t in ("standard", "vip")]
+        candidate = select_capacity_leave_candidate(
+            joined, own_channels=own_channels, exclude_id=exclude_rec_id
+        )
+        if not candidate:
+            eng.log("warn", "ex_capacity_no_candidate",
+                    "هیچ تبادلِ کامل و قابل‌تشخیص برای آزادسازی ظرفیت نبود")
+            return False, "هیچ تبادلِ کامل‌شدهٔ امنی برای لفت پیدا نشد."
+
+        ok, err = await leave_link(candidate.get("link"), candidate.get("id"))
+        if not ok:
+            eng.log("warn", "ex_capacity_leave_fail",
+                    f"#{candidate.get('id')} {candidate.get('link')}: {err}")
+            return False, f"لفت امن از `{candidate.get('link')}` انجام نشد: {err}"
+
+        left_at = int(time.time())
+        eng.db.ex_set(candidate["id"], status="left", last_check=left_at,
+                      next_check=0, next_reminder=0,
+                      leave_fail=0, leave_blocked_until=0,
+                      note="لفت خودکار برای آزادکردن ظرفیت پس از پایان تبادل")
+        detail = (f"ظرفیت تلگرام؛ تبادل کامل‌شده — "
+                  f"#{candidate.get('id')} {candidate.get('link')}")
+        eng.log("info", "ex_left", detail)
+        eng.log("info", "ex_capacity_cleanup", detail)
+        if candidate.get("direction") == "out":
+            eng.ex_cfg()["_scan_now"] = True
+        try:
+            await note("🧹 سقف عضویت تلگرام پر بود؛ از یک تبادلِ کامل‌شده لفت دادم:\n"
+                       f"`{candidate.get('link')}`\nبرای جوینِ درخواستی دوباره تلاش می‌کنم.")
+        except Exception:
+            pass
+        return True, f"از `{candidate.get('link')}` لفت شد."
 
     async def reply_joined(rec):
         """متن «جوین شدم» کاربر را روی پیام خود طرف ریپلای می‌کند.
@@ -7107,8 +7525,12 @@ async def connect_and_run(eng, creds):
         found = 0
         max_age = max(30, int(x.get("scan_max_age_sec", 300) or 300))
         scan_now = time.time()
+        raw_groups = x.get("groups") or []
+        all_groups = [raw_groups] if isinstance(raw_groups, str) else list(raw_groups)
+        groups_to_scan = group_failover_scan_groups(x, all_groups, int(scan_now))
+        scan_error = False
 
-        for g in x["groups"]:
+        for g in groups_to_scan:
             key = str(g)
             previous = int(last.get(key, 0) or 0)
             newest = previous
@@ -7191,6 +7613,7 @@ async def connect_and_run(eng, creds):
                 x["_scan_flood_until"] = time.time() + w + 2
                 return found, f"FloodWait {w}s"
             except Exception as e:
+                scan_error = True
                 eng.log("warn", "scan", f"{g}: {type(e).__name__}: {e}")
                 continue
 
@@ -7199,13 +7622,13 @@ async def connect_and_run(eng, creds):
             # ضد اسپم چندگروهی: فقط وقتی ۲ گروه یا بیشتر داری، بین اسکن گروه‌ها ۵–۱۵ ثانیه تصادفی صبر کن
             # تا هر دو گروه سر ۳۰ ثانیه با هم اسکن نشن و اکانت ریپورت نشه.
             # تک گروه = مثل قبل ۰.۵ ثانیه.
-            groups_count = len(x.get("groups") or [])
+            groups_count = len(groups_to_scan)
             if groups_count >= 2 and not manual:
                 jitter_min = max(1, int(x.get("scan_jitter_min_sec", 5) or 5))
                 jitter_max = max(jitter_min, int(x.get("scan_jitter_max_sec", 15) or 15))
                 # اگر گروه آخر نیست، تأخیر تصادفی
                 # (برای اینکه بنر اول سر ۳۰ ثانیه، دومی ۵–۱۵ ثانیه بعد بره)
-                if g != x["groups"][-1]:
+                if g != groups_to_scan[-1]:
                     await asyncio.sleep(random.randint(jitter_min, jitter_max))
                 else:
                     await asyncio.sleep(0.5)
@@ -7214,6 +7637,13 @@ async def connect_and_run(eng, creds):
                 await asyncio.sleep(0.5)
 
         x["scan_last"] = last
+        switched = group_failover_after_scan(
+            x, all_groups, int(time.time()), found, scan_error=scan_error
+        )
+        if switched:
+            old_i, new_i = switched
+            eng.log("info", "group_failover",
+                    f"{all_groups[old_i]} → {all_groups[new_i]} پس از بی‌لینک‌ماندن")
         eng.st.save()
         if found:
             eng.log("info", "scan", f"{found} آخرین پیام دارای لینک ثبت شد")
@@ -7767,6 +8197,14 @@ async def connect_and_run(eng, creds):
                     await asyncio.sleep(20)
                     continue
 
+                capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
+                if capacity_blocked_until > int(time.time()):
+                    await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
+                    continue
+                if capacity_blocked_until:
+                    x["_capacity_join_blocked_until"] = 0
+                    eng.st.save()
+
                 # ── شفافیتِ صف: اگر یک عملیات FloodWait خورده باشد، صفِ
                 # تک‌عملکردی تا پایان جریمه بسته است و هیچ پاسخ خودکاری
                 # (از جمله در پیوی) نمی‌آید. قبلاً این حالت کاملاً بی‌صدا
@@ -7932,14 +8370,16 @@ async def connect_and_run(eng, creds):
                                     await note(f"⏳ Join موقتاً نشد: `{rec['link']}` — {msg}؛ "
                                                "۱۵ ثانیه دیگر دوباره امتحان می‌کنم.")
                                 else:
-                                    eng.db.ex_set(rec["id"], status="failed", note=msg)
-                                    # مهم: فقط خطاهایِ «محدودیتِ حسابیِ خودِ اکانت» در پایشِ
-                                    # واقعیِ ریپ حساب می‌شوند. خطاهایی که از مشکلِ خودِ
-                                    # لینکِ خریدار است (منقضی/خصوصی/یوزرنیم ناموجود) را
-                                    # جدا ثبت می‌کنیم تا باعث توقفِ اجباریِ کاذب نشوند.
+                                    # مهم: محدودیت ۵۰۰عضویت شکستِ خودِ لینک نیست.
+                                    # رکورد را در صف نگه دار تا بعد از آزادشدن جا دوباره امتحان شود.
                                     account_limit = any(
                                         h in msg for h in ("حداکثر تعداد کانال",
                                                            "ChannelsTooMuch"))
+                                    eng.db.ex_set(
+                                        rec["id"],
+                                        status="approved" if account_limit else "failed",
+                                        note=msg,
+                                    )
                                     kind = "ex_join_limit" if account_limit else "ex_join_fail"
                                     eng.log("warn", kind, f"#{rec['id']} {msg}")
                                     await note(f"❌ جوین نشد: `{rec['link']}` — {msg}")
