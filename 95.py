@@ -3219,8 +3219,8 @@ class Engine:
                             f"پیش‌فرض «{DEFAULT_MSG_NO}» + کانال خودت).\n\n"
                             f"`{command} متن دلخواهت`\n\n"
                             "می‌توانی از این‌ها هم استفاده کنی:\n"
-                            "`{name}` اسم طرف • `{channel}` کانال طرف • "
-                            "`{mychannel}` کانال خودت")
+                            "`{name}` اسم طرف • `{mychannel}` کانال خودت. "
+                            "لینک طرف به‌صورت خودکار در متن نمی‌آید؛ `{channel}` پشتیبانی نمی‌شود.")
                 if sub == "msgno":
                     # پیام ناموفق همیشه پیش‌فرض دارد؛ خاموشی معنا ندارد.
                     return (f"**{when}** — متنی تعیین نکرده‌ای، پس پیش‌فرض "
@@ -3231,13 +3231,13 @@ class Engine:
                             "تبادل ثبت شده؛ ریپلای‌های تصادفی جواب نمی‌گیرند.\n\n"
                             f"`{command} متن دلخواهت`\n\n"
                             "می‌توانی از این‌ها هم استفاده کنی:\n"
-                            "`{name}` اسم طرف • `{channel}` کانال طرف • "
-                            "`{mychannel}` کانال خودت")
+                            "`{name}` اسم طرف • `{mychannel}` کانال خودت. "
+                            "لینک طرف به‌صورت خودکار در متن نمی‌آید؛ `{channel}` پشتیبانی نمی‌شود.")
                 return (f"**{when}** — متنی تعیین نکرده‌ای، پس چیزی نمی‌فرستم.\n\n"
                         f"`{command} متن دلخواهت`\n\n"
                         "می‌توانی از این‌ها هم استفاده کنی:\n"
-                        "`{name}` اسم طرف • `{channel}` کانال طرف • "
-                        "`{mychannel}` کانال خودت")
+                        "`{name}` اسم طرف • `{mychannel}` کانال خودت. "
+                        "لینک طرف به‌صورت خودکار در متن نمی‌آید؛ `{channel}` پشتیبانی نمی‌شود.")
             if rest.lower() in ("off", "خاموش", "پاک", "حذف", "-"):
                 x[key] = ""
                 if sub == "msgfirst":
@@ -4173,7 +4173,8 @@ class Engine:
                       f"متن فعلی: {cur or 'تنظیم نشده'}"]
         lines += ["", "فرمان عمومی «تبادل پیام» متن موفقیت هر دو نوع Join را تنظیم می‌کند.",
                   "خاموش‌کردن متن عمومی: `تبادل پیام خاموش`",
-                  "متغیرها: `{name}` نام طرف  ·  `{channel}` کانال طرف  ·  `{mychannel}` کانال من",
+                  "متغیرها: `{name}` نام طرف  ·  `{mychannel}` کانال من. "
+                  "لینک طرف در متن درج نمی‌شود؛ `{channel}` پشتیبانی نمی‌شود.",
                   f"پاسخ‌دادن: {'روشن' if x['reply'] else 'خاموش'}  ·  تغییر: `تبادل جواب`"]
         return "\n".join(lines)
 
@@ -4326,8 +4327,13 @@ class Engine:
         mych = self.ex_my_channel()
         try:
             rendered = (t.replace("{name}", name or "")
-                         .replace("{channel}", channel or "")
+                         # لینکِ طرف نباید داخل متن پیام‌های جفج منتشر شود.
+                         # توکن قدیمی را خالی می‌کنیم تا از تنظیمات ذخیره‌شده
+                         # هم هیچ invite linkای بیرون نرود.
+                         .replace("{channel}", "")
                          .replace("{mychannel}", mych or ""))
+            rendered = re.sub(r"[ \t]{2,}", " ", rendered)
+            rendered = re.sub(r"[ \t]+([،؛,:.!؟])", r"\1", rendered)
         except Exception:
             rendered = t
         rendered = rendered.strip()
@@ -6585,8 +6591,8 @@ async def connect_and_run(eng, creds):
                           note="در صف عملکرد — «نیومدی» کمی دیگر می‌رود")
             eng.log("info", "ex_reminder_gap", f"#{rec['id']} wait={int(wait_op)}s")
             return False
-        # لینک طرف فقط برای placeholder {channel} اگر کاربر خودش خواسته باشد
-        # استفاده می‌شود؛ اما auto-append لینک طرف هرگز انجام نمی‌شود.
+        # لینک طرف هرگز داخل متن ارسالی قرار نمی‌گیرد؛ حتی placeholderهای
+        # قدیمیِ {channel} در ex_render خالی می‌شوند.
         link = (rec.get("link") or "").strip()
         _claim_no = bool(rec.get("claim_joined"))
         body = eng.ex_render("msg_claim_no" if _claim_no else "msg_no",

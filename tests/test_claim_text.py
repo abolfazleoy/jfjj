@@ -71,7 +71,15 @@ check(eng.ex_render("msg_no", "ali", "@theirchan") == "سفارشیِ ناموف
 
 x["msg_claim_no"] = "{name} جان، {mychannel} را جوین نشدی"
 check(eng.ex_render("msg_claim_no", "ali", "@theirchan")
-      == "ali جان، @mychan را جوین نشدی", "C1: placeholderها کار می‌کنند")
+      == "ali جان، @mychan را جوین نشدی", "C1: نام طرف و کانال خودم جایگزین می‌شوند")
+x["msg_claim_no"] = "لینک طرف: {channel}"
+check(eng.ex_render("msg_claim_no", "ali", "@theirchan") == "لینک طرف:"
+      and "@theirchan" not in eng.ex_render("msg_claim_no", "ali", "@theirchan"),
+      "C1: توکن قدیمی channel لینک طرف را منتشر نمی‌کند")
+x["msg_ok"] = "جوین شدم: {channel}"
+check(eng.ex_render("msg_ok", "ali", "@theirchan") == "جوین شدم:"
+      and "@theirchan" not in eng.ex_render("msg_ok", "ali", "@theirchan"),
+      "C1: پیام موفق لینک طرف را منتشر نمی‌کند")
 print("DONE C1 ex_render fallback")
 
 
