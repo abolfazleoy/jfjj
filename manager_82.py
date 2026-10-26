@@ -1652,6 +1652,8 @@ DEFAULTS = {
     "max_clients": 9999,    # سقف کل مشتری‌های همزمان (بی‌نهایت عملی — دیگر محدود نمی‌شود)
     "auto_restart": True,   # اگر پروسه‌ای مرد، دوباره بالا بیاور
     "welcome": "",          # متن خوش‌آمد — خودت بنویس
+    "sample_chat": 0,        # چت منبع نمونه‌های جفت‌رفتن
+    "sample_ids": [],        # پیام‌های نمونه (متن/لینک/عکس/آلبوم)
     "sold_text": "",        # متن بعد از راه‌اندازی موفق
     "expired_text": "",     # متن وقتی اشتراک تمام شد
     "contact": "",          # آیدی پشتیبانی، مثل @yourid
@@ -2717,6 +2719,7 @@ def main_menu(is_admin=False, shop_on=True, points_on=True,
         rows.append([B("🗂 توضیحات", "m:hub", "success")])
     rows.append([B("📚 آموزش فعال‌سازی", "m:tut", "success"),
                  B("📖 راهنما", "m:help")])
+    rows.append([B("🎞 نمونه‌های جفت‌رفتن", "m:samples", "success")])
     rows.append([B("📜 قوانین ربات", "m:rules")])
     # فقط وقتی مدیر دستوری ثبت کرده باشد؛ وگرنه دکمه‌ی خالی می‌دهد.
     if has_cmds:
@@ -2792,6 +2795,7 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("📜 قوانین ربات", "a:rules", "primary")],
         [B("📝 متن خوش‌آمدگویی", "a:welcome", "primary"),
          B(tr_lbl, "a:trial", "success" if trial_on else "danger")],
+        [B("🎞 نمونه‌های جفت‌رفتن", "a:samples", "success")],
         [B("📝 متن‌های ربات", "a:rt", "success"),
          B("📋 دستورات آماده", "a:cm", "success")],
         [B("📣 جوین اجباری", "a:fjoin", "danger"),
@@ -4190,6 +4194,34 @@ class Manager:
             ids = []
         return chat, ids
 
+    def samples_src(self):
+        """منبع نمونه‌های جفت‌رفتن: (chat_id, [msg_id, ...])."""
+        try:
+            chat = int(self.cfg.get("sample_chat") or 0)
+        except (TypeError, ValueError):
+            chat = 0
+        try:
+            ids = [int(x) for x in (self.cfg.get("sample_ids") or [])]
+        except (TypeError, ValueError):
+            ids = []
+        return chat, ids
+
+    async def send_samples(self, uid):
+        """نمونه‌های ثبت‌شده را به همان ترتیبی که مدیر فرستاده کپی می‌کند."""
+        chat, ids = self.samples_src()
+        msgs = await self._tut_load(chat, ids)
+        if not msgs:
+            return await self.say(uid,
+                "🎞 <b>نمونه‌های جفت‌رفتن</b>\n\n"
+                "هنوز نمونه‌ای برای نمایش ثبت نشده است. لطفاً کمی بعد دوباره سر بزن.",
+                [back_btn()])
+        sent, _ = await self._tut_copy(uid, msgs, chat)
+        if not sent:
+            return await self.say(uid,
+                "متأسفانه نمونه‌ها الان ارسال نشدند. لطفاً کمی بعد دوباره تلاش کن.",
+                [back_btn()])
+        return True
+
     @staticmethod
     def _tut_groups(msgs):
         """پیام‌های آلبوم (grouped_id یکسان و پشت‌سرهم) را یک گروه می‌کند."""
@@ -5475,7 +5507,7 @@ class Manager:
                                              "verify_phone", "verify_referral", "bcast", "disc_new",
                                              "price_plan", "price_pack",
                                              "gp_n", "say_u", "card_set", "welcome_set",
-                                             "trial_min",
+                                             "sample_set", "trial_min",
                                              "ok_days", "acct_n", "fjoin_add", "tut_set",
                                              "sec_set", "sec_name", "sec_emoji",
                                              "sec_delay", "sec_note", "sec_btn_url",
@@ -5484,7 +5516,7 @@ class Manager:
                                              "cm_add", "cm_edit", "cm_intro",
                                              "hub_intro", "rules_set", "rules_btn_set"):
             keep = data in ("wq:0", "kc:x", "a:tut_done") \
-                or data.startswith(("a:sec_done",)) or (
+                or data.startswith(("a:sec_done",)) or data == "a:sample_done" or (
                 st_now.get("step") in ("verify_phone", "verify_referral") and data.startswith(("ko:", "o:", "wq:", "kc:", "kp:")))
             if st_now.get("step") in ("verify_phone", "verify_referral") and data not in ("m:home",):
                 keep = True
@@ -5557,6 +5589,10 @@ class Manager:
         if data == "m:help":
             await ans()
             return await self.edit(ev, self.cfg.get("help_text") or USER_HELP, [back_btn()])
+
+        if data == "m:samples":
+            await ans("در حال ارسال…")
+            return await self.send_samples(uid)
 
         if data == "m:rules":
             await ans()
@@ -6554,6 +6590,65 @@ class Manager:
                                            [back_btn("a:cm")])
                 txt, kb = got
                 return await self.edit(ev, txt, kb)
+            if k == "samples":
+                chat, ids = self.samples_src()
+                n = len(ids)
+                stat = (f"✅ ثبت شده — {_fa_digits(n)} پیام" if chat and n
+                        else "⚪ هنوز نمونه‌ای ثبت نشده")
+                kb = [[B("📤 ثبت / تغییر نمونه‌ها", "a:sample_set", "success")],
+                      [B("👁 پیش‌نمایش", "a:sample_view", "primary")]]
+                if chat and n:
+                    kb.append([B("🗑 پاک کردن نمونه‌ها", "a:sample_del", "danger")])
+                kb.append(back_btn("a:home"))
+                return await self.edit(ev,
+                    f"🎞 <b>نمونه‌های جفت‌رفتن</b>\n{self.LINE}\n"
+                    f"وضعیت: {stat}\n{self.LINE}\n"
+                    "محتوایی که کاربر با زدن دکمه‌ی «🎞 نمونه‌های جفت‌رفتن» می‌بیند را اینجا ثبت کن.\n\n"
+                    "لینک کانال، عکس، کپشن یا چند پیام پشت‌سرهم بفرست؛ می‌توانی لینک و عکس را با هم ثبت کنی.\n"
+                    "پیام‌ها به همان ترتیبی که می‌فرستی برای کاربر کپی می‌شوند.\n\n"
+                    "<i>برای تغییر، مجموعه‌ی جدید را ثبت کن؛ برای حذف، «پاک کردن نمونه‌ها» را بزن.</i>", kb)
+            if k == "sample_set":
+                self.fsm[uid] = {"step": "sample_set", "sample_chat": 0,
+                                 "sample_pending": []}
+                return await self.edit(ev,
+                    f"📤 <b>ثبت نمونه‌های جفت‌رفتن</b>\n{self.LINE}\n"
+                    "محتوا را همین‌جا بفرست — لینک، متن، عکس یا کپشن‌دار.\n"
+                    "اگر هم لینک و هم عکس داری، هر دو را به ترتیب بفرست؛ آلبوم هم پشتیبانی می‌شود.\n\n"
+                    "وقتی تمام شد «✅ تمام شد — ذخیره» را بزن. برای لغو /cancel بفرست.",
+                    [[B("✅ تمام شد — ذخیره", "a:sample_done", "success")],
+                     [B("⬅️ بازگشت", "a:samples")]])
+            if k == "sample_done":
+                state = self.fsm.get(uid) or {}
+                pending = state.get("sample_pending") or []
+                if not pending:
+                    return await self.edit(ev,
+                        "❌ هنوز محتوایی دریافت نشده. اول لینک یا عکس را بفرست.",
+                        [[B("✅ تمام شد — ذخیره", "a:sample_done", "success")],
+                         [B("⬅️ بازگشت", "a:samples")]])
+                self.fsm.pop(uid, None)
+                self.cfg["sample_chat"] = state.get("sample_chat") or uid
+                self.cfg["sample_ids"] = pending
+                self.cfg.save()
+                self.db.log(uid, "samples_set", f"{len(pending)} پیام")
+                return await self.edit(ev,
+                    f"✅ <b>نمونه‌ها ذخیره شد</b>\n📦 {_fa_digits(len(pending))} پیام ثبت شد.",
+                    [[B("👁 پیش‌نمایش", "a:sample_view", "primary")],
+                     [B("🎞 صفحه‌ی نمونه‌ها", "a:samples")]])
+            if k == "sample_view":
+                await self.send_samples(uid)
+                return await self.edit(ev,
+                    "👁 <b>پیش‌نمایش</b>\nنمونه‌های فعلی برایت ارسال شد؛ همین را کاربر می‌گیرد.",
+                    [[B("⬅️ بازگشت", "a:samples")]])
+            if k == "sample_del":
+                self.cfg["sample_chat"] = 0
+                self.cfg["sample_ids"] = []
+                self.cfg.save()
+                self.db.log(uid, "samples_del", "")
+                return await self.edit(ev,
+                    "🗑 نمونه‌های جفت‌رفتن پاک شد.",
+                    [[B("📤 ثبت دوباره", "a:sample_set", "success")],
+                     [B("⬅️ بازگشت", "a:samples")]])
+
             if k == "welcome":
                 self.fsm[uid] = {"step": "welcome_set"}
                 cur = self.cfg.get("welcome") or "تنظیم نشده"
@@ -10277,7 +10372,7 @@ class Manager:
         if not self.is_admin(uid):
             return False
         st = (self.fsm.get(uid) or {}).get("step")
-        if st in ("tut_set", "sec_set"):
+        if st in ("tut_set", "sec_set", "sample_set"):
             return False
         msg = getattr(ev, "message", None) or ev
         doc = getattr(ev, "document", None) or getattr(msg, "document", None)
@@ -11328,12 +11423,15 @@ class Manager:
             if st0 and not text.startswith("/"):
                 stp = st0.get("step")
 
-                if (stp == "tut_set" or stp == "sec_set") and self.is_admin(uid):
+                if (stp == "tut_set" or stp == "sec_set" or stp == "sample_set") and self.is_admin(uid):
                     # ثبت محتوای آموزش فعال‌سازی / یک بخش — هر نوع پیامی:
                     # متن، لینک، عکس، ویدیو، ویس، فایل، استیکر، آلبوم
                     # (هر آیتم جدا می‌آید). برای بخش‌ها id بخش هم نگه داشته می‌شود.
-                    pend = st0.setdefault("tut_pending", [])
-                    st0.setdefault("tut_chat", ev.chat_id)
+                    is_sample = stp == "sample_set"
+                    pending_key = "sample_pending" if is_sample else "tut_pending"
+                    chat_key = "sample_chat" if is_sample else "tut_chat"
+                    pend = st0.setdefault(pending_key, [])
+                    st0.setdefault(chat_key, ev.chat_id)
                     pend.append(ev.id)
                     if ev.photo:
                         kind = "🖼 عکس"
@@ -11355,7 +11453,10 @@ class Manager:
                         kind = "📝 متن"
                     else:
                         kind = "💬 پیام"
-                    if stp == "sec_set":
+                    if is_sample:
+                        head = "🎞 نمونه‌های جفت‌رفتن\n"
+                        btn = "a:sample_done"
+                    elif stp == "sec_set":
                         sec_now = self.tut_find(st0.get("sec_id") or 0) or {}
                         head = f"🧩 بخش: {sec_now.get('name') or '—'}\n"
                         btn = f"a:sec_done:{st0.get('sec_id') or 0}"
@@ -11366,7 +11467,7 @@ class Manager:
                         f"➕ ثبت شد: {kind}\n"
                         f"📦 مجموع: {_fa_digits(len(pend))} پیام\n"
                         f"{head}"
-                        "<i>تمام شد؟ دکمه‌ی «✅ تمام شد» در پیامِ بالا را بزن.</i>",
+                        "<i>تمام شد؟ دکمه‌ی «✅ تمام شد — ذخیره» در پیامِ بالا را بزن.</i>",
                         [[B("✅ تمام شد — ذخیره", btn, "success")]])
 
                 # ── بخش‌های آموزش: ورودی‌های متنی پنل مدیر ──
