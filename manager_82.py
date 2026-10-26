@@ -1652,7 +1652,7 @@ DEFAULTS = {
     "max_clients": 9999,    # سقف کل مشتری‌های همزمان (بی‌نهایت عملی — دیگر محدود نمی‌شود)
     "auto_restart": True,   # اگر پروسه‌ای مرد، دوباره بالا بیاور
     "welcome": "",          # متن خوش‌آمد — خودت بنویس
-    "sample_chat": 0,        # چت منبع نمونه‌های جفت‌رفتن
+    "sample_chat": 0,        # چت منبع نمونه‌های جفج‌داش
     "sample_ids": [],        # پیام‌های نمونه (متن/لینک/عکس/آلبوم)
     "sold_text": "",        # متن بعد از راه‌اندازی موفق
     "expired_text": "",     # متن وقتی اشتراک تمام شد
@@ -2719,7 +2719,7 @@ def main_menu(is_admin=False, shop_on=True, points_on=True,
         rows.append([B("🗂 توضیحات", "m:hub", "success")])
     rows.append([B("📚 آموزش فعال‌سازی", "m:tut", "success"),
                  B("📖 راهنما", "m:help")])
-    rows.append([B("🎞 نمونه‌های جفت‌رفتن", "m:samples", "success")])
+    rows.append([B("🎞 نمونه‌های جفج‌داش", "m:samples", "success")])
     rows.append([B("📜 قوانین ربات", "m:rules")])
     # فقط وقتی مدیر دستوری ثبت کرده باشد؛ وگرنه دکمه‌ی خالی می‌دهد.
     if has_cmds:
@@ -2795,7 +2795,7 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("📜 قوانین ربات", "a:rules", "primary")],
         [B("📝 متن خوش‌آمدگویی", "a:welcome", "primary"),
          B(tr_lbl, "a:trial", "success" if trial_on else "danger")],
-        [B("🎞 نمونه‌های جفت‌رفتن", "a:samples", "success")],
+        [B("🎞 نمونه‌های جفج‌داش", "a:samples", "success")],
         [B("📝 متن‌های ربات", "a:rt", "success"),
          B("📋 دستورات آماده", "a:cm", "success")],
         [B("📣 جوین اجباری", "a:fjoin", "danger"),
@@ -4195,7 +4195,7 @@ class Manager:
         return chat, ids
 
     def samples_src(self):
-        """منبع نمونه‌های جفت‌رفتن: (chat_id, [msg_id, ...])."""
+        """منبع نمونه‌های جفج‌داش: (chat_id, [msg_id, ...])."""
         try:
             chat = int(self.cfg.get("sample_chat") or 0)
         except (TypeError, ValueError):
@@ -4212,7 +4212,7 @@ class Manager:
         msgs = await self._tut_load(chat, ids)
         if not msgs:
             return await self.say(uid,
-                "🎞 <b>نمونه‌های جفت‌رفتن</b>\n\n"
+                "🎞 <b>نمونه‌های جفج‌داش</b>\n\n"
                 "هنوز نمونه‌ای برای نمایش ثبت نشده است. لطفاً کمی بعد دوباره سر بزن.",
                 [back_btn()])
         sent, _ = await self._tut_copy(uid, msgs, chat)
@@ -6601,9 +6601,9 @@ class Manager:
                     kb.append([B("🗑 پاک کردن نمونه‌ها", "a:sample_del", "danger")])
                 kb.append(back_btn("a:home"))
                 return await self.edit(ev,
-                    f"🎞 <b>نمونه‌های جفت‌رفتن</b>\n{self.LINE}\n"
+                    f"🎞 <b>نمونه‌های جفج‌داش</b>\n{self.LINE}\n"
                     f"وضعیت: {stat}\n{self.LINE}\n"
-                    "محتوایی که کاربر با زدن دکمه‌ی «🎞 نمونه‌های جفت‌رفتن» می‌بیند را اینجا ثبت کن.\n\n"
+                    "محتوایی که کاربر با زدن دکمه‌ی «🎞 نمونه‌های جفج‌داش» می‌بیند را اینجا ثبت کن.\n\n"
                     "لینک کانال، عکس، کپشن یا چند پیام پشت‌سرهم بفرست؛ می‌توانی لینک و عکس را با هم ثبت کنی.\n"
                     "پیام‌ها به همان ترتیبی که می‌فرستی برای کاربر کپی می‌شوند.\n\n"
                     "<i>برای تغییر، مجموعه‌ی جدید را ثبت کن؛ برای حذف، «پاک کردن نمونه‌ها» را بزن.</i>", kb)
@@ -6611,7 +6611,7 @@ class Manager:
                 self.fsm[uid] = {"step": "sample_set", "sample_chat": 0,
                                  "sample_pending": []}
                 return await self.edit(ev,
-                    f"📤 <b>ثبت نمونه‌های جفت‌رفتن</b>\n{self.LINE}\n"
+                    f"📤 <b>ثبت نمونه‌های جفج‌داش</b>\n{self.LINE}\n"
                     "محتوا را همین‌جا بفرست — لینک، متن، عکس یا کپشن‌دار.\n"
                     "اگر هم لینک و هم عکس داری، هر دو را به ترتیب بفرست؛ آلبوم هم پشتیبانی می‌شود.\n\n"
                     "وقتی تمام شد «✅ تمام شد — ذخیره» را بزن. برای لغو /cancel بفرست.",
@@ -6645,7 +6645,7 @@ class Manager:
                 self.cfg.save()
                 self.db.log(uid, "samples_del", "")
                 return await self.edit(ev,
-                    "🗑 نمونه‌های جفت‌رفتن پاک شد.",
+                    "🗑 نمونه‌های جفج‌داش پاک شد.",
                     [[B("📤 ثبت دوباره", "a:sample_set", "success")],
                      [B("⬅️ بازگشت", "a:samples")]])
 
@@ -11454,7 +11454,7 @@ class Manager:
                     else:
                         kind = "💬 پیام"
                     if is_sample:
-                        head = "🎞 نمونه‌های جفت‌رفتن\n"
+                        head = "🎞 نمونه‌های جفج‌داش\n"
                         btn = "a:sample_done"
                     elif stp == "sec_set":
                         sec_now = self.tut_find(st0.get("sec_id") or 0) or {}

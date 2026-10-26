@@ -7,8 +7,8 @@ source = Path(__file__).resolve().parents[1] / "manager_82.py"
 text = source.read_text(encoding="utf-8")
 tree = ast.parse(text)
 
-assert 'B("🎞 نمونه‌های جفت‌رفتن", "m:samples", "success")' in text
-assert 'B("🎞 نمونه‌های جفت‌رفتن", "a:samples", "success")' in text
+assert 'B("🎞 نمونه‌های جفج‌داش", "m:samples", "success")' in text
+assert 'B("🎞 نمونه‌های جفج‌داش", "a:samples", "success")' in text
 assert '"sample_chat": 0' in text and '"sample_ids": []' in text
 assert 'if data == "m:samples":' in text and 'return await self.send_samples(uid)' in text
 for action in ("samples", "sample_set", "sample_done", "sample_view", "sample_del"):
