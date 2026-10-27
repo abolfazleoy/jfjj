@@ -195,6 +195,98 @@ check("@mychan" in body, "C4: لینک خودم در یادآور می‌مان�
 print("DONE C4 reminder")
 
 
+# ═══════ C5 — سناریوی دقیق مشتری + لبه‌های خطر ═══════
+
+# C5-1: چرخه‌ی واقعی «تبادل سریع اول، متن سفارشی بعد» روی Engine واقعی.
+# اول پیش‌فرض‌های ویزارد اعمال می‌شوند، بعد مشتری متن‌های خصمانه می‌سازد.
+eng2 = fresh()
+x2 = eng2.ex_cfg()
+# همان منطق _ensure_quick_exchange_defaults: جای خالی را با پیش‌فرض ویزارد پر کن
+for k, v in m.QUICK_EXCHANGE_DEFAULTS.items():
+    if not str(x2.get(k) or "").strip():
+        x2[k] = v
+defaults_ok = all(x2.get(k) == v for k, v in m.QUICK_EXCHANGE_DEFAULTS.items())
+check(defaults_ok, "C5: ویزارد تبادل سریع متن‌های پیش‌فرضِ بدون لینک طرف را می‌نشاند")
+# خود پیش‌فرض‌ها هم نباید هیچ نشانی از لینک طرف داشته باشند
+defaults_clean = all("{channel}" not in v and "t.me" not in v
+                     and "joinchat" not in v for v in m.QUICK_EXCHANGE_DEFAULTS.values())
+check(defaults_clean, "C5: هیچ‌کدام از متن‌های پیش‌فرض ویزارد لینک/توکن طرف ندارند")
+hostile = {
+    "msg_come": "بیا {channel} و @partner_chan و https://t.me/partner_chan",
+    "msg_ok": "اوکی { Channel } شد t.me/partner_chan",
+    "msg_no": ("نیومدی {CHANNEL}، لینک خصوصیش هم هست "
+               "https://t.me/+Xy9Zx8Wv7654321 و joinchat/Xy9Zx8Wv7654321 بازم"),
+    "msg_claim_no": "joinchat/Xy9Zx8Wv7654321 و +Xy9Zx8Wv7654321",
+    "msg_wait": "صبر کن @partner_chan جان",
+    "msg_nolink": "لینکت را بفرست",
+}
+x2.update(hostile)
+priv_peer = "https://t.me/+Xy9Zx8Wv7654321"
+# strip بر اساس یک مرجع کار می‌کند: رکورد دعوت خصوصی فقط املای همان hash
+# را می‌تواند پاک کند (یوزرنیم دیگری در دسترس نیست) و برعکس.
+for key, peer, banned in (
+        ("msg_come", "@partner_chan", ("partner_chan",)),
+        ("msg_ok", "@partner_chan", ("partner_chan",)),
+        ("msg_no", priv_peer, ("Xy9Zx8Wv7654321",)),
+        ("msg_claim_no", priv_peer, ("Xy9Zx8Wv7654321",)),
+        ("msg_wait", "@partner_chan", ("partner_chan",))):
+    out = eng2.ex_render(key, "Ali", peer)
+    bad = (any(b in out for b in banned)
+           or ("{channel" in out.lower().replace(" ", "")))
+    check(not bad, "C5: چرخه‌ی ویزارد→متن سفارشی، %s تمیز است -> %r" % (key, out))
+print("DONE C5 lifecycle")
+
+# C5-2: امنیت زیررشته‌ای — توکن مستقلِ طرف برود ولی لینک خودم (که ممکن
+# است پیشوندش مشابه باشد) دست‌نخورده بماند. یوزرنیم‌ها طول معتبر تلگرام دارند.
+import re as _re
+cases_sub = [
+    ("@partner_chan", "@partner_chan_official", "لینک خودمِ بلندتر با پیشوند مشابه"),
+    ("@abadgram", "@my_abadgram", "لینک خودم که رشته‌ی طرف را در دل دارد"),
+    ("@abadgram", "@abadgram_shop", "یوزرنیم طرف در برابر خودمِ بلندتر"),
+]
+for peer, own, label in cases_sub:
+    eng3 = fresh()
+    eng3.st.prof("standard")["channel"] = own
+    eng3.ex_cfg()["msg_come"] = f"بیا {own} را جوین شو، نه {peer}"
+    out = eng3.ex_render("msg_come", "S", peer)
+    standalone = _re.search(_re.escape(peer) + r"\b", out)
+    check(own in out and not standalone,
+          "C5 زیررشته: %s -> %r" % (label, out))
+print("DONE C5 substring")
+
+# C5-3: تکرار چندباره‌ی لینک طرف، همه باید بروند.
+out = m.strip_peer_links("@partner_chan متن @partner_chan باز @partner_chan",
+                         "@partner_chan")
+check("partner_chan" not in out, "C5: هر سه تکرار لینک طرف حذف می‌شوند -> %r" % out)
+# لینک با اسلش انتهایی و www
+for s in ("https://www.t.me/partner_chan/",
+          "https://telegram.me/partner_chan/",
+          "t.me/partner_chan/"):
+    out = m.strip_peer_links("متن " + s + " پایان", "@partner_chan")
+    check("partner_chan" not in out, "C5: املای %r حذف شد -> %r" % (s, out))
+print("DONE C5 repeats/spellings")
+
+# C5-4: peer غیرقابل‌اعتماد (آیدی عددی/نامعتبر) → حذف ناامن انجام نشود و کرش نکند.
+out = m.strip_peer_links("هر متن @partner_chan", "123456789")
+check(out == "هر متن @partner_chan", "C5: آیدی عددی هرگز مبنای حذف متن نمی‌شود")
+check(m.strip_peer_links("متنی", None) == "متنی", "C5: peer=None کرش نمی‌کند")
+print("DONE C5 unsafe peer")
+
+# C5-5: قفل سورسی — هر دو مسیر msg_wait حالا لینک طرف را پاس می‌دهند و
+# fallback خطای ex_render هم مستقل strip می‌کند.
+hits = [i for i in range(len(src)) if src.startswith('await say("msg_wait"', i)]
+check(len(hits) >= 2 and all("say(\"msg_wait\", " in src[i:i + 120] for i in hits),
+      "C5: هر دو فراخوانی msg_wait لینک شناخته‌شده‌ی طرف را برای strip پاس می‌دهند")
+fb = src[src.index("def ex_render("):src.index("def ex_list_text")]
+check("strip_peer_links(t, channel)" in fb,
+      "C5: مسیر استثنای ex_render هم strip لینک طرف را تکرار می‌کند (نه متن خام)")
+# هیچ مسیر گروهی‌ای نباید بدون ex_render متن بفرستد: سه send_message گروهی
+# شناخته‌شده باید body متغیر رندرشده باشد، نه رشته‌ی خام حاوی لینک.
+for marker in ('await client.send_message(chat, body, reply_to=mid',
+               'return await event.reply(t)'):
+    check(marker in src, "C5: مسیر ارسال گروهی از متن رندرشده استفاده می‌کند: " + marker)
+print("DONE C5 source locks")
+
 if FAILS:
     print("FAILED:", len(FAILS))
     for f in FAILS:

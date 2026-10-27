@@ -1952,6 +1952,8 @@ def strip_peer_links(text, peer):
             patterns = [
                 r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/"
                 r"(?:joinchat/|\+)" + h + r"/?",
+                # joinchat خام بدون پیشوند t.me (املای ناقصِ متن‌های قدیمی)
+                r"(?<![\w.\-])joinchat/" + h + r"(?![\w.\-])",
                 r"(?<![\w.\-])\+" + h + r"(?![\w.\-])",
             ]
         else:
@@ -4812,7 +4814,14 @@ class Engine:
             rendered = re.sub(r"[ \t]*\n[ \t]*(?=\n)", "", rendered)
             rendered = re.sub(r"\n{2,}", "\n", rendered)
         except Exception:
-            rendered = t
+            # هیچ خطای قالب‌بندی‌ای نباید متن خام (که ممکن است لینک طرف
+            # داشته باشد) را مستقیم بیرون بدهد؛ حداقل strip را مستقل تکرار کن.
+            try:
+                rendered = strip_peer_links(t, channel)
+            except Exception:
+                rendered = t.replace("{mychannel}", mych or "")
+                rendered = re.sub(r"\{\s*channel\s*\}", "", rendered,
+                                  flags=re.IGNORECASE)
         rendered = rendered.strip()
         # اگر msg_no سفارشی نیست (یعنی پیش‌فرض)، کانال خودم را زیرش بیاور
         # نه کانال طرف. اگر سفارشی است، هیچ لینکی اتوماتیک اضافه نکن.
@@ -7720,7 +7729,8 @@ async def connect_and_run(eng, creds):
             # پیام «جوین شدم» فقط بعد از Join واقعی می‌رود (reply_joined)؛
             # همین‌جا و زودتر از موعد گفته نمی‌شود تا پشت سر پیام دیگری
             # نیفتد. اگر متنی برای انتظار ثبت شده باشد، همان می‌رود.
-            await say("msg_wait")
+            # لینک طرف (اگر در دسترس است) برای لایه‌ی دوم strip پاس می‌شود.
+            await say("msg_wait", link or (rec0 or {}).get("link") or "")
             if not has_channel:
                 await warn_membership_check_broken(int(time.time()))
             return
@@ -7760,7 +7770,7 @@ async def connect_and_run(eng, creds):
         else:
             eng.db.ex_set(rec["id"], status="pending",
                           note=f"✅ عضو است — منتظر تأیید تو ({src})")
-            await say("msg_wait")
+            await say("msg_wait", rec.get("link") or "")
             await note(f"🔁 **درخواست تبادل**\n\nاز: {sender_name}\n"
                        f"کانال: `{link}` ({src})\nوضعیت: ✅ عضو کانال من هست\n\n"
                        f"`تبادل تأیید {rec['id']}` جوین • "
