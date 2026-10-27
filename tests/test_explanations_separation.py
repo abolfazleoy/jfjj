@@ -8,7 +8,7 @@ tree = ast.parse(source)
 manager = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Manager')
 names = {'hub_sections', 'hub_default_items', 'hub_defaults_all', 'hub_made_keys',
          'hub_defaults_on', 'hub_default_text', 'hub_view', 'hub_intro', 'hub_page_size',
-         'hub_default_row', 'hub_pages'}
+         'hub_default_row', 'hub_pages', '_hub_items', '_is_hub_section'}
 body = [n for n in manager.body if isinstance(n, ast.FunctionDef) and n.name in names
         or isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'HUB_DEFAULTS' for t in n.targets)]
 module = ast.Module(body=[ast.ClassDef(name='Hub', bases=[], keywords=[], body=body, decorator_list=[])], type_ignores=[])

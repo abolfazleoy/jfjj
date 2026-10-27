@@ -7,7 +7,7 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1] / "95.py"
 tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
 names = {"group_failover_index", "group_failover_scan_groups", "group_failover_after_scan",
-         "select_capacity_leave_candidate", "same_peer_ref"}
+         "select_capacity_leave_candidate", "same_peer_ref", "_safe_id"}
 selected = [node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name in names]
 defaults_node = next(node for node in tree.body

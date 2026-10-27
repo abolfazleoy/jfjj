@@ -118,6 +118,7 @@ DEFAULTS = {
         "group_failover_on": False, # جایگزینی خودکار اختیاری؛ خاموش پیش‌فرض
         "group_failover_after_sec": 300, # چند ثانیه بدون لینک معتبر تا گروه بعدی
         "auto_leave_completed_on_limit": True, # هنگام رسیدن سقف تلگرام، فقط تبادل تمام‌شده
+        "capacity_cleanup_batch": 30,  # هر دور پاکسازی سقف، چند کانالِ جفج‌زده لفت شود
         "_capacity_join_blocked_until": 0,
         "_group_failover_active_index": 0,
         "_group_failover_last_activity": 0,
@@ -408,23 +409,91 @@ def group_failover_after_scan(ex_cfg, groups, now_ts, found, scan_error=False):
     return index, next_index
 
 
-def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None):
+# ── دروازه و اعلان‌های اسکن پیش‌قدم (ضد طوفانِ اعلان) ──────────────
+# چند رکورد «در صف Join» می‌تواند معلق بماند تا اسکنِ خودکار متوقف شود؟
+# با فاصله‌ی پیش‌فرض ۳۰–۶۰ ثانیه، این تعداد تقریباً کل پنجره‌ی ۵ دقیقه‌ای
+# «سن لینک» را پر می‌کند؛ بیشتر از این، رکوردها پیش از رسیدن نوبت پیر
+# می‌شدند و فقط رکورد مرده و اعلان تکراری می‌ساختند.
+SCAN_JOIN_BACKLOG_LIMIT = 5
+# اعلان خودکار «کانال تازه پیدا شد» حداکثر هر چند ثانیه یک‌بار و به‌صورت
+# تجمیعی برود (اسکن دستی مشمول این محدودیت نیست و همان لحظه جواب می‌دهد).
+SCAN_FOUND_NOTE_GAP_SEC = 300
+# خلاصه‌ی «کانال قدیمی رد شد»: حداکثر چند لینک داخل یک پیام نشان داده شود
+# و حداکثر چند ثانیه برای تجمیع صبر شود.
+STALE_NOTE_MAX_LINKS = 10
+STALE_FLUSH_SEC = 20
+
+
+def scan_gate_reason(blocked_until, approved_count, now_ts,
+                     limit=SCAN_JOIN_BACKLOG_LIMIT):
+    """چرا اسکنِ خودکار باید فعلاً رد شود؟ خروجی: 'flood' / 'backlog' / ''.
+
+    'flood'    → صفِ تک‌عملکردی به‌خاطر FloodWait بسته است و هیچ جوینی
+                 تا پایان جریمه اجرا نمی‌شود؛ اسکن جدید فقط انباشت می‌کند.
+    'backlog'  → به سقف رکوردهای معلقِ Join رسیده‌ایم؛ رکورد تازه قبل از
+                 رسیدن نوبت از پنجره‌ی سن لینک پیر می‌شود.
+    اسکنِ دستی (دستور «تبادل اسکن») عمداً از این دروازه رد نمی‌شود.
+    """
+    try:
+        if blocked_until and float(blocked_until) > float(now_ts):
+            return "flood"
+        if int(approved_count or 0) >= int(limit):
+            return "backlog"
+    except (TypeError, ValueError):
+        return ""
+    return ""
+
+
+def format_stale_batch(links, max_age_sec, shown=STALE_NOTE_MAX_LINKS):
+    """خلاصه‌ی یک‌پیامیِ رکوردهای منقضی‌شده، به‌جای اعلان جدا per-record."""
+    clean = [str(l) for l in (links or []) if l]
+    n = len(clean)
+    head = clean[:shown]
+    lines = [f"🕒 {fa(n)} کانال قدیمی (بیش از {secs(int(max_age_sec or 0))}) "
+             "رد شد؛ Join نشد."]
+    lines += [f"`{l}`" for l in head]
+    if n > len(head):
+        lines.append(f"و {fa(n - len(head))} مورد دیگر…")
+    return "\n".join(lines)
+
+
+def _safe_id(rec):
+    try:
+        return int((rec or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
+                                    exclude_ids=None):
     """Choose the oldest reciprocated exchange channel to leave for a slot.
 
     An outbound exchange is complete only after the partner joined back.
     Active reminders, the user's own channels, and duplicate joined-channel
     records are kept untouched. Completion does not wait for the normal
     membership-watch window; the account-cap error is the cleanup trigger.
+
+    ``exclude_ids`` برای پاکسازی دسته‌ای است: id رکوردهایی که در همین دور
+    قبلاً برداشته شده‌اند رد می‌شوند. رکوردهای برداشته‌شده از استخر حذف
+    نمی‌شوند تا تشخیص تکراری (chat_id/لینک یکسان) نسبت به آن‌ها سالم بماند.
     """
     joined = [r for r in (records or []) if r.get("status") == "joined"]
     candidates = []
     own_channels = tuple(c for c in (own_channels or ()) if c)
-    for rec in joined:
+    skip_ids = set()
+    for v in (exclude_ids or ()):
         try:
-            rid = int(rec.get("id") or 0)
+            skip_ids.add(int(v))
         except (TypeError, ValueError):
-            rid = 0
-        if exclude_id and rid == int(exclude_id):
+            pass
+    if exclude_id:
+        try:
+            skip_ids.add(int(exclude_id))
+        except (TypeError, ValueError):
+            pass
+    for rec in joined:
+        rid = _safe_id(rec)
+        if rid in skip_ids:
             continue
         if not rec.get("peer_id"):
             continue
@@ -457,6 +526,81 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None):
         except (TypeError, ValueError):
             return (0, 0)
     return min(candidates, key=_age_key)
+
+
+# ── پاکسازی دسته‌ای سقف عضویت (فرایند لفت موقع پر شدن ۵۰۰) ──────────
+# وقتی تلگرام ChannelsTooMuch بدهد، به‌جای یک لفت + بلاک یک‌ساعته، یک
+# «دور پاکسازی» اجرا می‌شود و تا این تعداد از قدیمی‌ترین کانال‌هایی که
+# خود جفج جوین زده (تبادل‌های کامل‌شده‌ی امن) لفت می‌شوند. عدد با دستور
+# «تبادل لفت خودکار تعداد <عدد>» قابل تغییر است.
+CAPACITY_CLEANUP_BATCH_DEFAULT = 30
+CAPACITY_CLEANUP_BATCH_MIN = 1
+CAPACITY_CLEANUP_BATCH_MAX = 100
+# اگر بعد از یک دور پاکسازیِ موفق، تلگرام هنوز سقف را پر اعلام کند (ثبتِ
+# آزادشدن slot در سرور تلگرام کمی تأخیر دارد)، جوین چقدر مکث کند؟
+CAPACITY_REBLOCK_SEC = 300
+
+
+def clamp_capacity_batch(value):
+    """عدد دور پاکسازی را به بازه‌ی مجاز می‌چسباند؛ ورودی نامعتبر → پیش‌فرض."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return CAPACITY_CLEANUP_BATCH_DEFAULT
+    return max(CAPACITY_CLEANUP_BATCH_MIN,
+               min(CAPACITY_CLEANUP_BATCH_MAX, n))
+
+
+def select_capacity_leave_batch(records, own_channels=(),
+                                limit=CAPACITY_CLEANUP_BATCH_DEFAULT,
+                                exclude_id=None):
+    """فهرست مرتب‌شده‌ی کاندیدهای لفتِ امن برای یک دور پاکسازی.
+
+    هر بار قدیمی‌ترین کاندید را با همان قواعد
+    ``select_capacity_leave_candidate`` برمی‌دارد و idش را به مجموعه‌ی
+    skip اضافه می‌کند تا دور بعد کاندیدِ بعدی (نه دوباره همان) انتخاب شود؛
+    تا سقف ``limit``. استخر اصلی دست‌نخورده می‌ماند تا تشخیص تکراری نسبت
+    به رکوردهای برداشته‌شده هم درست کار کند. کانال‌های خود کاربر،
+    تبادل‌های ناتمام/یادآوردار و تکراری‌ها طبق همان قواعد وارد نمی‌شوند.
+    """
+    limit = clamp_capacity_batch(limit)
+    pool = [r for r in (records or []) if r.get("status") == "joined"]
+    picked = []
+    skip = set()
+    if exclude_id:
+        try:
+            skip.add(int(exclude_id))
+        except (TypeError, ValueError):
+            pass
+    while len(picked) < limit:
+        rec = select_capacity_leave_candidate(
+            pool, own_channels=own_channels, exclude_ids=skip)
+        if rec is None:
+            break
+        picked.append(rec)
+        skip.add(_safe_id(rec))
+    return picked
+
+
+def format_capacity_cleanup_note(left_links, target, stopped=None):
+    """خلاصه‌ی یک‌پیامیِ فرایند پاکسازی سقف (به‌جای نوتیف per لفت)."""
+    links = [str(l) for l in (left_links or []) if l]
+    n = len(links)
+    if n == 0:
+        return ("🧹 سقف عضویت تلگرام پر بود ولی هیچ تبادلِ کامل‌شده‌ی امنی "
+                "برای لفت پیدا نشد؛ یک عضویت را دستی آزاد کن و بعد "
+                "`تبادل لفت خودکار ریست` را بفرست.")
+    head = links[:STALE_NOTE_MAX_LINKS]
+    lines = [f"🧹 پاکسازی سقف عضویت: از {fa(n)} کانالِ جفج‌زده لفت دادم "
+             f"(هدف هر دور: {fa(target)})."]
+    lines += [f"`{l}`" for l in head]
+    if n > len(head):
+        lines.append(f"و {fa(n - len(head))} مورد دیگر…")
+    if stopped:
+        lines.append(f"⏹ پاکسازی زودتر تمام شد: {stopped}")
+    else:
+        lines.append("جا آزاد شد؛ جوینِ معلق دوباره تلاش می‌شود.")
+    return "\n".join(lines)
 
 
 VERSION = "3.0"
@@ -1774,6 +1918,59 @@ def is_invite(link):
 
 def invite_hash(link):
     return link.split("+")[-1].split("/")[-1]
+
+
+def strip_peer_links(text, peer):
+    """هر شکلی از لینکِ همین طرفِ تبادل را از متن حذف می‌کند.
+
+    قاعده‌ی قطعیِ محصول: لینکِ طرفِ تبادل هرگز نباید داخل متنِ پیام‌های
+    جفج (که در گروه ریپلای می‌شوند) بیاید — نه با توکنِ قدیمیِ
+    `{channel}` و نه اگر لینکش به‌صورت خام داخل متنِ ذخیره‌شده مانده
+    باشد (مثلاً تنظیماتِ به‌جامانده از نسخه‌های قدیمی که لینک طرف را
+    اتوماتیک زیر پیام می‌چسباندند). همه‌ی املای یک لینک پوشش داده
+    می‌شود: `@name`، `t.me/name`، `https://telegram.me/name`،
+    `t.me/+HASH` و `t.me/joinchat/HASH` و `+HASH`.
+
+    عمداً مستقل از `_LINK_PATTERNS` است تا منطقِ اسکن/تشخیص لینک دست
+    نخورد؛ فقط پاک‌سازی متن ارسالی کامل‌تر باشد. آیدی عددی کانال چون
+    لینکِ قابل‌کلیک در متن نیست عمداً حذف نمی‌شود.
+    """
+    if not text or not peer:
+        return text or ""
+    try:
+        def _bare(value):
+            s = str(value or "").strip().lower().rstrip("/")
+            s = re.sub(r"^https?://", "", s)
+            s = re.sub(r"^(?:www\.)?(?:t|telegram)\.me/", "", s)
+            s = s.replace("joinchat/", "").lstrip("+@")
+            return s
+
+        if is_invite(peer):
+            h = re.escape(invite_hash(peer))
+            if not h:
+                return text
+            patterns = [
+                r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/"
+                r"(?:joinchat/|\+)" + h + r"/?",
+                # joinchat خام بدون پیشوند t.me (املای ناقصِ متن‌های قدیمی)
+                r"(?<![\w.\-])joinchat/" + h + r"(?![\w.\-])",
+                r"(?<![\w.\-])\+" + h + r"(?![\w.\-])",
+            ]
+        else:
+            u = re.escape(_bare(peer))
+            if not u or not re.match(r"^[a-z][a-z0-9_]{3,31}$", u):
+                # یوزرنیم معتبر نیست (مثلاً آیدی عددی) → حذفِ ناامن انجام نده.
+                return text
+            patterns = [
+                r"@" + u + r"\b",
+                r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/"
+                + u + r"/?(?![\w/])",
+            ]
+        for pat in patterns:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE)
+    except Exception:
+        return text
+    return text
 
 
 # ─────────────────────────────────────────────
@@ -3528,12 +3725,24 @@ class Engine:
                 blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
                 blocked = (f"\n⏸ تلاش برای جوین تا {secs(blocked_until - int(time.time()))} متوقف است."
                            if blocked_until > int(time.time()) else "")
+                batch = clamp_capacity_batch(
+                    x.get("capacity_cleanup_batch", CAPACITY_CLEANUP_BATCH_DEFAULT))
                 return ("🧹 لفتِ خودکار برای سقف عضویت تلگرام: "
                         f"{'روشن' if enabled else 'خاموش'}{blocked}\n"
-                        "فقط وقتی تلگرام سقف عضویت را اعلام کند، از قدیمی‌ترین تبادلِ "
-                        "کامل‌شده لفت می‌دهم؛ در پیش‌قدم، طرف هم باید به کانال تو جوین شده باشد.\n"
+                        f"وقتی سقف پر شود، یک دور پاکسازی تا {fa(batch)} کانالِ جفج‌زده‌ی "
+                        "قدیمی را لفت می‌دهم (فقط تبادلِ کامل‌شده؛ در پیش‌قدم، طرف هم "
+                        "باید به کانال تو جوین شده باشد) و بعد جوینِ معلق را دوباره می‌زنم.\n"
                         "`تبادل لفت خودکار روشن` / `خاموش`\n"
+                        "`تبادل لفت خودکار تعداد ۳۰` برای تغییر تعداد هر دور\n"
                         "بعد از آزادکردن جا دستی: `تبادل لفت خودکار ریست`")
+            nums = re.findall(r"[۰-۹0-9]+", action)
+            if nums:
+                val = clamp_capacity_batch(num(nums[0]))
+                x["capacity_cleanup_batch"] = val
+                self.st.save()
+                return (f"✅ هر دور پاکسازی سقف، تا {fa(val)} کانالِ جفج‌زده را "
+                        "لفت می‌دهم.\n"
+                        "`تبادل لفت خودکار تعداد <عدد>` برای تغییر دوباره.")
             if action in ("ریست", "reset", "آزاد"):
                 x["_capacity_join_blocked_until"] = 0
                 self.st.save()
@@ -4368,8 +4577,9 @@ class Engine:
             "`تبادل گروه جایگزین بعد ۵` برای تغییر زمان به ۵ دقیقه",
             "",
             "🧹 آزادکردن ظرفیت سقف عضویت تلگرام:",
-            f"وضعیت: {capacity_leave_cur} · فقط تبادل کامل‌شده لفت می‌شود (بدون انتظار ۲۴ساعته)",
-            "`تبادل لفت خودکار روشن` / `خاموش` · `ریست` بعد از آزادکردن جا دستی",
+            f"وضعیت: {capacity_leave_cur} · هر دور تا {fa(clamp_capacity_batch(x.get('capacity_cleanup_batch', CAPACITY_CLEANUP_BATCH_DEFAULT)))} "
+            "کانالِ جفج‌زده‌ی قدیمی لفت می‌شود (فقط تبادل کامل‌شده)",
+            "`تبادل لفت خودکار روشن` / `خاموش` · `تعداد ۳۰` برای تغییر · `ریست` بعد از آزادکردن جا دستی",
             "",
             "📊 وقتی می‌خواهی گزارش خصوصی را تنظیم کنی:",
             "دستور آماده برای کپی:",
@@ -4562,6 +4772,12 @@ class Engine:
         وقتی متن سفارشی msg_no ثبت شده باشد، فقط همان متن می‌رود و
         هیچ لینکی زیرش اضافه نمی‌شود — لینک طرف هرگز اتوماتیک نمی‌آید.
 
+        دو لایه محافظت برای لینکِ طرف اینجاست: (۱) توکنِ قدیمیِ
+        `{channel}` با هر فاصله/حرف‌بندی‌ای خالی می‌شود؛ (۲) اگر لینکِ
+        همین طرف به‌صورت خام هم داخل متن ذخیره شده باشد،
+        `strip_peer_links` حذفش می‌کند. لینکِ کانالِ خودم
+        (`{mychannel}`) چون با لینک طرف برابر نیست دست‌نخورده می‌ماند.
+
         «پیام پیش‌قدم» (msg_come و مسیرهای جایگزینش) جداست: کانالِ خودم
         همیشه زیرش می‌آید و این کار در `reply_joined` انجام می‌شود (نه
         اینجا) تا هر سه مسیرِ متن را پوشش بدهد."""
@@ -4581,14 +4797,31 @@ class Engine:
         try:
             rendered = (t.replace("{name}", name or "")
                          # لینکِ طرف نباید داخل متن پیام‌های جفج منتشر شود.
-                         # توکن قدیمی را خالی می‌کنیم تا از تنظیمات ذخیره‌شده
-                         # هم هیچ invite linkای بیرون نرود.
-                         .replace("{channel}", "")
+                         # توکن قدیمی را — با هر فاصله/حرف‌بندی‌ای — خالی
+                         # می‌کنیم تا از تنظیمات ذخیره‌شده هم هیچ invite
+                         # linkای بیرون نزند (باگ قدیمیِ «لینک یارو زیر پیام»).
                          .replace("{mychannel}", mych or ""))
+            rendered = re.sub(r"\{\s*channel\s*\}", "", rendered,
+                              flags=re.IGNORECASE)
+            # دفاعِ لایه‌دوم: اگر لینکِ همین طرف به‌صورت خام هم داخل متن
+            # مانده باشد (املای @name / t.me / +HASH)، حذفش کن. لینکِ
+            # کانالِ خودم دست‌نخورده می‌ماند چون با لینک طرف برابر نیست.
+            rendered = strip_peer_links(rendered, channel)
             rendered = re.sub(r"[ \t]{2,}", " ", rendered)
             rendered = re.sub(r"[ \t]+([،؛,:.!؟])", r"\1", rendered)
+            # اگر حذف لینک یک خط را خالی کرد، خطوط خالی پشت‌سرهم جمع شوند؛
+            # خطوط تک‌خطی و قالب‌بندی عمدی کاربر دست نمی‌خورد.
+            rendered = re.sub(r"[ \t]*\n[ \t]*(?=\n)", "", rendered)
+            rendered = re.sub(r"\n{2,}", "\n", rendered)
         except Exception:
-            rendered = t
+            # هیچ خطای قالب‌بندی‌ای نباید متن خام (که ممکن است لینک طرف
+            # داشته باشد) را مستقیم بیرون بدهد؛ حداقل strip را مستقل تکرار کن.
+            try:
+                rendered = strip_peer_links(t, channel)
+            except Exception:
+                rendered = t.replace("{mychannel}", mych or "")
+                rendered = re.sub(r"\{\s*channel\s*\}", "", rendered,
+                                  flags=re.IGNORECASE)
         rendered = rendered.strip()
         # اگر msg_no سفارشی نیست (یعنی پیش‌فرض)، کانال خودم را زیرش بیاور
         # نه کانال طرف. اگر سفارشی است، هیچ لینکی اتوماتیک اضافه نکن.
@@ -6526,14 +6759,14 @@ async def connect_and_run(eng, creds):
             except Exception:
                 pass
 
-    def block_joins_for_capacity(reason):
+    def block_joins_for_capacity(reason, seconds=3600):
         x = eng.ex_cfg()
-        until = int(time.time()) + 3600
+        until = int(time.time()) + max(1, int(seconds or 3600))
         x["_capacity_join_blocked_until"] = until
         eng.st.save()
         eng.log("warn", "ex_capacity_block", f"تا {until}: {reason}")
 
-    async def join_link(link, rec_id=None, _after_capacity_cleanup=False):
+    async def join_link(link, rec_id=None):
         """جوین به کانال. برمی‌گرداند (موفق, پیام, عنوان)
 
         rec_id که داده شود، جوین در صفِ تک‌عملکردی اجرا می‌شود و
@@ -6577,31 +6810,41 @@ async def connect_and_run(eng, creds):
         except ChannelPrivateError:
             return False, "کانال خصوصی است یا بن شده‌ای", ""
         except ChannelsTooMuchError:
-            if _after_capacity_cleanup:
-                block_joins_for_capacity("حتی بعد از یک لفت امن، تلگرام سقف را آزاد نکرد")
+            # نکته‌ی معماری: خودِ پاکسازی این‌جا اجرا نمی‌شود چون join_link در
+            # worker داخل wait_for(180s) صدا زده می‌شود و یک دور ۳۰تایی با
+            # فاصله‌ی ۱۵–۲۰ ثانیه‌ای چند دقیقه طول می‌کشد. فقط فلگ می‌زنیم؛
+            # exchange_worker در ابتدای حلقه‌ی بعد، بیرون از آن timeout،
+            # دور پاکسازی را کامل اجرا می‌کند و رکورد approved خودکار دوباره
+            # به صف جوین برمی‌گردد (هندلر شکست جوین، رکورد سقف را failed نمی‌کند).
+            cfg = eng.ex_cfg()
+            if not cfg.get("auto_leave_completed_on_limit", True):
+                block_joins_for_capacity("پاکسازی خودکار خاموش است و سقف عضویت پر شد")
+                return (False,
+                        "تو حداکثر تعداد کانال ممکن هستی — یک عضویت را دستی آزاد کن، "
+                        "بعد `تبادل لفت خودکار ریست` را بفرست.", "")
+            last_clean = int(cfg.get("_last_capacity_cleanup_at", 0) or 0)
+            if last_clean and int(time.time()) - last_clean < CAPACITY_REBLOCK_SEC:
+                # دور پاکسازی اخیر جا آزاد کرده ولی تلگرام هنوز پر می‌گوید
+                # (ثبت آزادشدن slot کمی تأخیر دارد)؛ به‌جای لفت پشت‌سرهم،
+                # چند دقیقه مکث کن تا سمت سرور جاها واقعاً آزاد شوند.
+                block_joins_for_capacity(
+                    "بعد از دور پاکسازی، تلگرام هنوز سقف را پر اعلام می‌کند",
+                    seconds=CAPACITY_REBLOCK_SEC)
                 return (False,
                         "تلگرام هنوز خطای حداکثر تعداد کانال (ChannelsTooMuch) می‌دهد؛ "
-                        "بعد از یک لفت امن، برای جلوگیری از لفت‌های اضافه ادامه ندادم.",
+                        "پاکسازی اخیر جا آزاد کرده ولی ثبتش سمت تلگرام تأخیر دارد. "
+                        f"{secs(CAPACITY_REBLOCK_SEC)} صبر می‌کنم و بعد خودکار دوباره "
+                        "تلاش می‌کنم. اگر باز هم تکرار شد، چند کانالِ غیرجفج را دستی لفت بده.",
                         "")
-            if eng.ex_cfg().get("auto_leave_completed_on_limit", True):
-                try:
-                    cleaned, detail = await leave_completed_exchange_for_slot(rec_id)
-                except Exception as cleanup_error:
-                    cleaned = False
-                    detail = f"پاکسازی امن ناموفق شد: {type(cleanup_error).__name__}: {cleanup_error}"
-                    eng.log("warn", "ex_capacity_cleanup_error", detail)
-                if cleaned:
-                    return await join_link(link, rec_id, _after_capacity_cleanup=True)
-                block_joins_for_capacity(detail)
-                return (False,
-                        "تلگرام سقف را پر اعلام کرد (حداکثر تعداد کانال / ChannelsTooMuch) و "
-                        "تبادلِ تمام‌شدهٔ امنی برای لفت پیدا نشد؛ لطفاً یک عضویت را دستی آزاد کن "
-                        "و بعد `تبادل لفت خودکار ریست` را بفرست. " + detail,
-                        "")
-            block_joins_for_capacity("پاکسازی خودکار خاموش است و سقف عضویت پر شد")
+            cfg["_capacity_cleanup_pending"] = True
+            eng.st.save()
+            eng.log("warn", "ex_capacity_trigger",
+                    "ChannelsTooMuch؛ دور پاکسازی در صف worker قرار گرفت")
             return (False,
-                    "تو حداکثر تعداد کانال ممکن هستی — یک عضویت را دستی آزاد کن، "
-                    "بعد `تبادل لفت خودکار ریست` را بفرست.", "")
+                    "تلگرام سقف را پر اعلام کرد (حداکثر تعداد کانال / ChannelsTooMuch)؛ "
+                    "دور پاکسازی کانال‌های جفج‌زده شروع می‌شود و بعدش جوینِ معلق "
+                    "خودکار دوباره تلاش می‌شود.",
+                    "")
         except FloodWaitError as e:
             w = getattr(e, "seconds", 60)
             eng.join_thr.penalize(w)
@@ -6722,41 +6965,74 @@ async def connect_and_run(eng, creds):
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
-    async def leave_completed_exchange_for_slot(exclude_rec_id=None):
-        """Free one slot only from a reciprocal, no-longer-monitored exchange."""
-        joined = eng.db.ex_list("joined", 500)
-        own_channels = [eng.st.prof(t).get("channel") for t in ("standard", "vip")]
-        candidate = select_capacity_leave_candidate(
-            joined, own_channels=own_channels, exclude_id=exclude_rec_id
-        )
-        if not candidate:
+    async def cleanup_capacity_for_slots():
+        """فرایند پاکسازی سقف: یک دور، تا سقف تنظیم‌شده کانالِ جفج‌زده لفت می‌زند.
+
+        وقتی تلگرام ChannelsTooMuch بدهد، exchange_worker با فلگ
+        ``_capacity_cleanup_pending`` این تابع را بیرون از timeout جوین
+        صدا می‌زند. فقط رکوردهای تبادلِ کامل‌شده‌ی امن (همان قواعد
+        select_capacity_leave_candidate) انتخاب می‌شوند و کانال خود کاربر
+        هرگز لفت نمی‌شود؛ رکوردِ در حال جوین هم چون هنوز joined نیست
+        اصلاً وارد استخر نمی‌شود. لفت‌ها از صف تک‌عملکردی رد می‌شوند پس
+        فاصله‌ی ۱۵–۲۰ ثانیه‌ای به‌صورت خودکار رعایت و ریسک فلود حداقل
+        است. اگر وسط دور FloodWait بیاید همان‌جا متوقف می‌شود (جریمه در
+        join_thr ثبت شده) و دور بعد از رکورد بعدی ادامه می‌دهد. در پایان
+        فقط یک پیام خلاصه می‌رود، نه پیام per لفت.
+        برمی‌گرداند (تعداد لفت‌شده، دلیل توقف زودهنگام یا None).
+        """
+        cfg = eng.ex_cfg()
+        target = clamp_capacity_batch(
+            cfg.get("capacity_cleanup_batch", CAPACITY_CLEANUP_BATCH_DEFAULT))
+        joined = eng.db.ex_list("joined", 1000)
+        own_channels = [eng.st.prof(t).get("channel")
+                        for t in ("standard", "vip")]
+        candidates = select_capacity_leave_batch(
+            joined, own_channels=own_channels, limit=target)
+        if not candidates:
             eng.log("warn", "ex_capacity_no_candidate",
                     "هیچ تبادلِ کامل و قابل‌تشخیص برای آزادسازی ظرفیت نبود")
-            return False, "هیچ تبادلِ کامل‌شدهٔ امنی برای لفت پیدا نشد."
+            try:
+                await note(format_capacity_cleanup_note([], target))
+            except Exception:
+                pass
+            return 0, "هیچ تبادلِ کامل‌شدهٔ امنی برای لفت پیدا نشد."
 
-        ok, err = await leave_link(candidate.get("link"), candidate.get("id"))
-        if not ok:
-            eng.log("warn", "ex_capacity_leave_fail",
-                    f"#{candidate.get('id')} {candidate.get('link')}: {err}")
-            return False, f"لفت امن از `{candidate.get('link')}` انجام نشد: {err}"
-
+        left_links = []
+        stopped = None
         left_at = int(time.time())
-        eng.db.ex_set(candidate["id"], status="left", last_check=left_at,
-                      next_check=0, next_reminder=0,
-                      leave_fail=0, leave_blocked_until=0,
-                      note="لفت خودکار برای آزادکردن ظرفیت پس از پایان تبادل")
-        detail = (f"ظرفیت تلگرام؛ تبادل کامل‌شده — "
-                  f"#{candidate.get('id')} {candidate.get('link')}")
-        eng.log("info", "ex_left", detail)
-        eng.log("info", "ex_capacity_cleanup", detail)
-        if candidate.get("direction") == "out":
+        had_outbound = False
+        for cand in candidates:
+            ok, err = await leave_link(cand.get("link"), cand.get("id"))
+            if not ok:
+                eng.log("warn", "ex_capacity_leave_fail",
+                        f"#{cand.get('id')} {cand.get('link')}: {err}")
+                if isinstance(err, str) and "FloodWait" in err:
+                    stopped = (f"محدودیت تلگرام ({err})؛ دور پاکسازی تا "
+                               "کاهش محدودیت متوقف شد")
+                    break
+                # لینک منقضی/خطای موقت روی این رکورد: ردش کن و سراغ بعدی برو
+                continue
+            eng.db.ex_set(cand["id"], status="left", last_check=left_at,
+                          next_check=0, next_reminder=0,
+                          leave_fail=0, leave_blocked_until=0,
+                          note="لفت خودکار دسته‌ای برای آزادکردن ظرفیت سقف")
+            left_links.append(cand.get("link") or f"#{cand.get('id')}")
+            had_outbound = had_outbound or cand.get("direction") == "out"
+            eng.log("info", "ex_left",
+                    f"ظرفیت تلگرام؛ پاکسازی دسته‌ای — "
+                    f"#{cand.get('id')} {cand.get('link')}")
+        eng.log("info", "ex_capacity_cleanup",
+                f"دور پاکسازی: {len(left_links)} لفت از هدف {target}"
+                + (f" — توقف: {stopped}" if stopped else ""))
+        if had_outbound:
             eng.ex_cfg()["_scan_now"] = True
         try:
-            await note("🧹 سقف عضویت تلگرام پر بود؛ از یک تبادلِ کامل‌شده لفت دادم:\n"
-                       f"`{candidate.get('link')}`\nبرای جوینِ درخواستی دوباره تلاش می‌کنم.")
+            await note(format_capacity_cleanup_note(left_links, target, stopped))
         except Exception:
             pass
-        return True, f"از `{candidate.get('link')}` لفت شد."
+        if not left_links:
+            return 0, (stopped or "لفت هیچ‌کدام از کاندیدها انجام نشد.")
+        return len(left_links), stopped
 
     async def reply_joined(rec):
         """متن «جوین شدم» کاربر را روی پیام خود طرف ریپلای می‌کند.
@@ -7453,7 +7729,8 @@ async def connect_and_run(eng, creds):
             # پیام «جوین شدم» فقط بعد از Join واقعی می‌رود (reply_joined)؛
             # همین‌جا و زودتر از موعد گفته نمی‌شود تا پشت سر پیام دیگری
             # نیفتد. اگر متنی برای انتظار ثبت شده باشد، همان می‌رود.
-            await say("msg_wait")
+            # لینک طرف (اگر در دسترس است) برای لایه‌ی دوم strip پاس می‌شود.
+            await say("msg_wait", link or (rec0 or {}).get("link") or "")
             if not has_channel:
                 await warn_membership_check_broken(int(time.time()))
             return
@@ -7493,7 +7770,7 @@ async def connect_and_run(eng, creds):
         else:
             eng.db.ex_set(rec["id"], status="pending",
                           note=f"✅ عضو است — منتظر تأیید تو ({src})")
-            await say("msg_wait")
+            await say("msg_wait", rec.get("link") or "")
             await note(f"🔁 **درخواست تبادل**\n\nاز: {sender_name}\n"
                        f"کانال: `{link}` ({src})\nوضعیت: ✅ عضو کانال من هست\n\n"
                        f"`تبادل تأیید {rec['id']}` جوین • "
@@ -7529,6 +7806,25 @@ async def connect_and_run(eng, creds):
         all_groups = [raw_groups] if isinstance(raw_groups, str) else list(raw_groups)
         groups_to_scan = group_failover_scan_groups(x, all_groups, int(scan_now))
         scan_error = False
+
+        # ── دروازه‌ی ضد-انباشت (فقط اسکن خودکار؛ اسکن دستی همیشه رد است) ──
+        # وقتی صفِ عملکرد به‌خاطر FloodWait بسته است یا هنوز انباری از
+        # رکوردهای Join‌نشده داریم، اسکنِ تازه نکن: هر کانالی که الان ثبت
+        # شود پیش از رسیدن نوبتش از پنجره‌ی سن لینک پیر می‌شود و فقط
+        # رکورد مرده + طوفانِ اعلان («کانال تازه…» و بعدش «کانال قدیمی
+        # رد شد») می‌سازد. scan_last هم جلو نمی‌رود تا بعد از باز شدنِ
+        # صف، همان پیام‌ها دوباره دیده شوند (ثبت تکراری با ex_by_link
+        # کنترل می‌شود).
+        if not manual:
+            gate = scan_gate_reason(
+                getattr(ex_cd, "blocked_until", 0),
+                len(eng.db.ex_list("approved", 100)),
+                scan_now)
+            if gate == "flood":
+                return 0, "صف تبادل به‌خاطر FloodWait بسته است"
+            if gate == "backlog":
+                return 0, (f"صف Join {fa(SCAN_JOIN_BACKLOG_LIMIT)} رکورد "
+                           "معلق دارد — بعد از تخلیه، اسکن ادامه می‌یابد")
 
         for g in groups_to_scan:
             key = str(g)
@@ -7651,6 +7947,20 @@ async def connect_and_run(eng, creds):
 
     # ---------- اسکن مستقل پیش‌قدم ----------
     async def scan_loop():
+        # تجمیع اعلان «کانال تازه پیدا شد»: به‌جای یک نوتیف per اسکن،
+        # شمارش‌ها جمع می‌شوند و حداکثر هر SCAN_FOUND_NOTE_GAP_SEC ثانیه
+        # یک پیام تجمیعی می‌رود تا Saved Messages طوفان نبیند.
+        found_buf = [0]
+        last_found_note = [0.0]
+
+        def _join_gate_now():
+            try:
+                return scan_gate_reason(
+                    getattr(ex_cd, "blocked_until", 0),
+                    len(eng.db.ex_list("approved", 100)), time.time())
+            except Exception:
+                return ""
+
         # اسکن مستقل است تا بررسی‌های طولانی عضویت، فرصت هر ۳۰ ثانیه
         # برای پیدا کردن کانال جدید را عقب نیندازد.
         last_scan = [0.0]
@@ -7687,15 +7997,33 @@ async def connect_and_run(eng, creds):
                                 state = "همین حالا برای Join امتحان می‌کنم"
                             await note(f"🔍 اسکن تمام شد — {fa(n)} کانال تازه پیدا شد؛ {state}.")
                     elif n:
-                        wait = eng.join_thr.wait_time()
-                        left = joins_left_today()
-                        if left <= 0:
-                            state = "به‌دلیل خطای داخلی امکان Join نیست"
-                        elif wait > 0:
-                            state = f"در صف Join؛ حدود {secs(int(wait))} دیگر"
-                        else:
-                            state = "برای Join همین نوبت"
-                        await note(f"🔍 {fa(n)} کانال تازه پیدا شد — {state}.")
+                        # اعلان تجمیعی و راستگو: وقتی صف بلاک/شلوغ است
+                        # هرگز قول «همین نوبت جوین» نده — همان قولی که
+                        # مشتری دید و عملاً هیچ جوینی اتفاق نمی‌افتاد.
+                        found_buf[0] += int(n)
+                        if (time.time() - last_found_note[0]
+                                >= SCAN_FOUND_NOTE_GAP_SEC):
+                            total = found_buf[0]
+                            found_buf[0] = 0
+                            last_found_note[0] = time.time()
+                            gate = _join_gate_now()
+                            wait = eng.join_thr.wait_time()
+                            if gate == "flood":
+                                state = ("صف تبادل به‌خاطر محدودیت تلگرام "
+                                         "(FloodWait) بسته است؛ به‌محض بازشدن "
+                                         "خودکار جوین می‌زنم")
+                            elif joins_left_today() <= 0:
+                                state = "به‌دلیل خطای داخلی امکان Join نیست"
+                            elif gate == "backlog" or wait > 0:
+                                state = (f"در صف Join؛ حدود "
+                                         f"{secs(int(max(wait, 0)))} دیگر")
+                            else:
+                                state = "برای Join همین نوبت"
+                            await note(f"🔍 {fa(total)} کانال تازه پیدا شد — {state}.")
+                    elif err:
+                        # اسکن خودکار عمداً رد شده (فلود/بک‌لاگ)؛ فقط لاگ،
+                        # بدون نوتیف تا طوفان پیام تکراری ساخته نشود.
+                        eng.log("info", "scan_gated", err)
 
                 # زمان‌بندی دقیق‌تر از حلقه‌ی اصلی تبادل.
                 await asyncio.sleep(1)
@@ -8177,8 +8505,27 @@ async def connect_and_run(eng, creds):
 
     # ---------- کارگر صف Join ----------
     async def exchange_worker():
+        # تجمیع اعلان «کانال قدیمی رد شد»: قبلاً هر رکورد منقضی یک پیام
+        # جدا می‌ساخت و چند ثانیه پشت سر هم Saved Messages را پر می‌کرد.
+        stale_links = []
+        stale_since = [0.0]
+        stale_age_sec = [300]
+
+        async def flush_stale():
+            if not stale_links:
+                return
+            links = stale_links[:]
+            age = stale_age_sec[0]
+            stale_links.clear()
+            stale_since[0] = 0.0
+            await note(format_stale_batch(links, age))
+
         while True:
             try:
+                # اگر پنجره‌ی تجمیع پر شد، یک پیام خلاصه بفرست.
+                if (stale_links and
+                        time.time() - stale_since[0] >= STALE_FLUSH_SEC):
+                    await flush_stale()
                 x = eng.ex_cfg()
 
                 # ارسال دوباره‌ی پیام برای Joinهایی که قبلاً انجام شده‌اند.
@@ -8228,6 +8575,31 @@ async def connect_and_run(eng, creds):
                             "خودکار ادامه می‌دهم.\n"
                             "اگر زیاد تکرار شد، «تبادل فاصله» را بزرگ‌تر کن "
                             "یا تعداد تبادل‌های هم‌زمان را کم کن.")
+
+                # ۰) دور پاکسازی سقف عضویت. بیرون از wait_forِ جوین اجرا
+                # می‌شود چون یک دور کامل (تا ۳۰ لفت با فاصله‌ی صف عملیات)
+                # ممکن است چند دقیقه طول بکشد و timeout ۱۸۰ ثانیه‌ای جوین
+                # وسطش کنسلش می‌کرد. لفت‌ها از همان ex_cd.action رد می‌شوند
+                # پس فاصله‌ی ۱۵–۲۰ ثانیه‌ای و محافظ فلود خودکار رعایت می‌شود.
+                if int(x.get("_capacity_cleanup_pending", 0) or 0):
+                    x["_capacity_cleanup_pending"] = False
+                    eng.st.save()
+                    try:
+                        left_count, stopped = await cleanup_capacity_for_slots()
+                    except Exception as cleanup_error:
+                        left_count, stopped = 0, (
+                            f"پاکسازی ناموفق: {type(cleanup_error).__name__}: {cleanup_error}")
+                        eng.log("warn", "ex_capacity_cleanup_error", stopped)
+                    x["_last_capacity_cleanup_at"] = int(time.time())
+                    eng.st.save()
+                    if left_count <= 0:
+                        # کاندید امن نبود/همه لفت‌ها شکست خورد؛ بدون این بلاک
+                        # هر جوین دوباره فلگ می‌زد و دور بی‌فایده تکرار می‌شد.
+                        block_joins_for_capacity(
+                            stopped or "کاندید امن برای لفت پیدا نشد")
+                        # گیتِ بلاک بالای حلقه است؛ همین دور دیگر جوین نزن تا
+                        # رکورد approved دست‌نخورده بماند و دور بعد پشت گیت بخوابد.
+                        continue
 
                 # ۱) لفت‌های دستی
                 for rec in eng.db.ex_list("leaving", 5):
@@ -8289,7 +8661,15 @@ async def connect_and_run(eng, creds):
                             stale_note = f"لینک بیش از {secs(max_age)} قدیمی است؛ Join نشد"
                             eng.db.ex_set(rec["id"], status="failed", note=stale_note)
                             eng.log("info", "ex_stale", f"#{rec['id']} {rec['link']}")
-                            await note(f"🕒 کانال قدیمی رد شد: `{rec['link']}`\n{stale_note}")
+                            # تجمیع به‌جای یک نوتیف per رکورد (طوفان پیام در
+                            # صف‌های شلوغ). سقفِ نمایش یا پنجره‌ی زمانی، فلاش می‌کند.
+                            if not stale_links:
+                                stale_since[0] = time.time()
+                                stale_age_sec[0] = max_age
+                            stale_links.append(rec["link"])
+                            if (len(stale_links) >= STALE_NOTE_MAX_LINKS
+                                    or time.time() - stale_since[0] >= STALE_FLUSH_SEC):
+                                await flush_stale()
                             await asyncio.sleep(1)
                             continue
                         eng.log("info", "ex_join_try", f"#{rec['id']} {rec['link']}")
