@@ -408,6 +408,54 @@ def group_failover_after_scan(ex_cfg, groups, now_ts, found, scan_error=False):
     return index, next_index
 
 
+# ── دروازه و اعلان‌های اسکن پیش‌قدم (ضد طوفانِ اعلان) ──────────────
+# چند رکورد «در صف Join» می‌تواند معلق بماند تا اسکنِ خودکار متوقف شود؟
+# با فاصله‌ی پیش‌فرض ۳۰–۶۰ ثانیه، این تعداد تقریباً کل پنجره‌ی ۵ دقیقه‌ای
+# «سن لینک» را پر می‌کند؛ بیشتر از این، رکوردها پیش از رسیدن نوبت پیر
+# می‌شدند و فقط رکورد مرده و اعلان تکراری می‌ساختند.
+SCAN_JOIN_BACKLOG_LIMIT = 5
+# اعلان خودکار «کانال تازه پیدا شد» حداکثر هر چند ثانیه یک‌بار و به‌صورت
+# تجمیعی برود (اسکن دستی مشمول این محدودیت نیست و همان لحظه جواب می‌دهد).
+SCAN_FOUND_NOTE_GAP_SEC = 300
+# خلاصه‌ی «کانال قدیمی رد شد»: حداکثر چند لینک داخل یک پیام نشان داده شود
+# و حداکثر چند ثانیه برای تجمیع صبر شود.
+STALE_NOTE_MAX_LINKS = 10
+STALE_FLUSH_SEC = 20
+
+
+def scan_gate_reason(blocked_until, approved_count, now_ts,
+                     limit=SCAN_JOIN_BACKLOG_LIMIT):
+    """چرا اسکنِ خودکار باید فعلاً رد شود؟ خروجی: 'flood' / 'backlog' / ''.
+
+    'flood'    → صفِ تک‌عملکردی به‌خاطر FloodWait بسته است و هیچ جوینی
+                 تا پایان جریمه اجرا نمی‌شود؛ اسکن جدید فقط انباشت می‌کند.
+    'backlog'  → به سقف رکوردهای معلقِ Join رسیده‌ایم؛ رکورد تازه قبل از
+                 رسیدن نوبت از پنجره‌ی سن لینک پیر می‌شود.
+    اسکنِ دستی (دستور «تبادل اسکن») عمداً از این دروازه رد نمی‌شود.
+    """
+    try:
+        if blocked_until and float(blocked_until) > float(now_ts):
+            return "flood"
+        if int(approved_count or 0) >= int(limit):
+            return "backlog"
+    except (TypeError, ValueError):
+        return ""
+    return ""
+
+
+def format_stale_batch(links, max_age_sec, shown=STALE_NOTE_MAX_LINKS):
+    """خلاصه‌ی یک‌پیامیِ رکوردهای منقضی‌شده، به‌جای اعلان جدا per-record."""
+    clean = [str(l) for l in (links or []) if l]
+    n = len(clean)
+    head = clean[:shown]
+    lines = [f"🕒 {fa(n)} کانال قدیمی (بیش از {secs(int(max_age_sec or 0))}) "
+             "رد شد؛ Join نشد."]
+    lines += [f"`{l}`" for l in head]
+    if n > len(head):
+        lines.append(f"و {fa(n - len(head))} مورد دیگر…")
+    return "\n".join(lines)
+
+
 def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None):
     """Choose the oldest reciprocated exchange channel to leave for a slot.
 
@@ -7597,6 +7645,25 @@ async def connect_and_run(eng, creds):
         groups_to_scan = group_failover_scan_groups(x, all_groups, int(scan_now))
         scan_error = False
 
+        # ── دروازه‌ی ضد-انباشت (فقط اسکن خودکار؛ اسکن دستی همیشه رد است) ──
+        # وقتی صفِ عملکرد به‌خاطر FloodWait بسته است یا هنوز انباری از
+        # رکوردهای Join‌نشده داریم، اسکنِ تازه نکن: هر کانالی که الان ثبت
+        # شود پیش از رسیدن نوبتش از پنجره‌ی سن لینک پیر می‌شود و فقط
+        # رکورد مرده + طوفانِ اعلان («کانال تازه…» و بعدش «کانال قدیمی
+        # رد شد») می‌سازد. scan_last هم جلو نمی‌رود تا بعد از باز شدنِ
+        # صف، همان پیام‌ها دوباره دیده شوند (ثبت تکراری با ex_by_link
+        # کنترل می‌شود).
+        if not manual:
+            gate = scan_gate_reason(
+                getattr(ex_cd, "blocked_until", 0),
+                len(eng.db.ex_list("approved", 100)),
+                scan_now)
+            if gate == "flood":
+                return 0, "صف تبادل به‌خاطر FloodWait بسته است"
+            if gate == "backlog":
+                return 0, (f"صف Join {fa(SCAN_JOIN_BACKLOG_LIMIT)} رکورد "
+                           "معلق دارد — بعد از تخلیه، اسکن ادامه می‌یابد")
+
         for g in groups_to_scan:
             key = str(g)
             previous = int(last.get(key, 0) or 0)
@@ -7718,6 +7785,20 @@ async def connect_and_run(eng, creds):
 
     # ---------- اسکن مستقل پیش‌قدم ----------
     async def scan_loop():
+        # تجمیع اعلان «کانال تازه پیدا شد»: به‌جای یک نوتیف per اسکن،
+        # شمارش‌ها جمع می‌شوند و حداکثر هر SCAN_FOUND_NOTE_GAP_SEC ثانیه
+        # یک پیام تجمیعی می‌رود تا Saved Messages طوفان نبیند.
+        found_buf = [0]
+        last_found_note = [0.0]
+
+        def _join_gate_now():
+            try:
+                return scan_gate_reason(
+                    getattr(ex_cd, "blocked_until", 0),
+                    len(eng.db.ex_list("approved", 100)), time.time())
+            except Exception:
+                return ""
+
         # اسکن مستقل است تا بررسی‌های طولانی عضویت، فرصت هر ۳۰ ثانیه
         # برای پیدا کردن کانال جدید را عقب نیندازد.
         last_scan = [0.0]
@@ -7754,15 +7835,33 @@ async def connect_and_run(eng, creds):
                                 state = "همین حالا برای Join امتحان می‌کنم"
                             await note(f"🔍 اسکن تمام شد — {fa(n)} کانال تازه پیدا شد؛ {state}.")
                     elif n:
-                        wait = eng.join_thr.wait_time()
-                        left = joins_left_today()
-                        if left <= 0:
-                            state = "به‌دلیل خطای داخلی امکان Join نیست"
-                        elif wait > 0:
-                            state = f"در صف Join؛ حدود {secs(int(wait))} دیگر"
-                        else:
-                            state = "برای Join همین نوبت"
-                        await note(f"🔍 {fa(n)} کانال تازه پیدا شد — {state}.")
+                        # اعلان تجمیعی و راستگو: وقتی صف بلاک/شلوغ است
+                        # هرگز قول «همین نوبت جوین» نده — همان قولی که
+                        # مشتری دید و عملاً هیچ جوینی اتفاق نمی‌افتاد.
+                        found_buf[0] += int(n)
+                        if (time.time() - last_found_note[0]
+                                >= SCAN_FOUND_NOTE_GAP_SEC):
+                            total = found_buf[0]
+                            found_buf[0] = 0
+                            last_found_note[0] = time.time()
+                            gate = _join_gate_now()
+                            wait = eng.join_thr.wait_time()
+                            if gate == "flood":
+                                state = ("صف تبادل به‌خاطر محدودیت تلگرام "
+                                         "(FloodWait) بسته است؛ به‌محض بازشدن "
+                                         "خودکار جوین می‌زنم")
+                            elif joins_left_today() <= 0:
+                                state = "به‌دلیل خطای داخلی امکان Join نیست"
+                            elif gate == "backlog" or wait > 0:
+                                state = (f"در صف Join؛ حدود "
+                                         f"{secs(int(max(wait, 0)))} دیگر")
+                            else:
+                                state = "برای Join همین نوبت"
+                            await note(f"🔍 {fa(total)} کانال تازه پیدا شد — {state}.")
+                    elif err:
+                        # اسکن خودکار عمداً رد شده (فلود/بک‌لاگ)؛ فقط لاگ،
+                        # بدون نوتیف تا طوفان پیام تکراری ساخته نشود.
+                        eng.log("info", "scan_gated", err)
 
                 # زمان‌بندی دقیق‌تر از حلقه‌ی اصلی تبادل.
                 await asyncio.sleep(1)
@@ -8244,8 +8343,27 @@ async def connect_and_run(eng, creds):
 
     # ---------- کارگر صف Join ----------
     async def exchange_worker():
+        # تجمیع اعلان «کانال قدیمی رد شد»: قبلاً هر رکورد منقضی یک پیام
+        # جدا می‌ساخت و چند ثانیه پشت سر هم Saved Messages را پر می‌کرد.
+        stale_links = []
+        stale_since = [0.0]
+        stale_age_sec = [300]
+
+        async def flush_stale():
+            if not stale_links:
+                return
+            links = stale_links[:]
+            age = stale_age_sec[0]
+            stale_links.clear()
+            stale_since[0] = 0.0
+            await note(format_stale_batch(links, age))
+
         while True:
             try:
+                # اگر پنجره‌ی تجمیع پر شد، یک پیام خلاصه بفرست.
+                if (stale_links and
+                        time.time() - stale_since[0] >= STALE_FLUSH_SEC):
+                    await flush_stale()
                 x = eng.ex_cfg()
 
                 # ارسال دوباره‌ی پیام برای Joinهایی که قبلاً انجام شده‌اند.
@@ -8356,7 +8474,15 @@ async def connect_and_run(eng, creds):
                             stale_note = f"لینک بیش از {secs(max_age)} قدیمی است؛ Join نشد"
                             eng.db.ex_set(rec["id"], status="failed", note=stale_note)
                             eng.log("info", "ex_stale", f"#{rec['id']} {rec['link']}")
-                            await note(f"🕒 کانال قدیمی رد شد: `{rec['link']}`\n{stale_note}")
+                            # تجمیع به‌جای یک نوتیف per رکورد (طوفان پیام در
+                            # صف‌های شلوغ). سقفِ نمایش یا پنجره‌ی زمانی، فلاش می‌کند.
+                            if not stale_links:
+                                stale_since[0] = time.time()
+                                stale_age_sec[0] = max_age
+                            stale_links.append(rec["link"])
+                            if (len(stale_links) >= STALE_NOTE_MAX_LINKS
+                                    or time.time() - stale_since[0] >= STALE_FLUSH_SEC):
+                                await flush_stale()
                             await asyncio.sleep(1)
                             continue
                         eng.log("info", "ex_join_try", f"#{rec['id']} {rec['link']}")
