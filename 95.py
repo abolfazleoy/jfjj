@@ -1776,6 +1776,57 @@ def invite_hash(link):
     return link.split("+")[-1].split("/")[-1]
 
 
+def strip_peer_links(text, peer):
+    """هر شکلی از لینکِ همین طرفِ تبادل را از متن حذف می‌کند.
+
+    قاعده‌ی قطعیِ محصول: لینکِ طرفِ تبادل هرگز نباید داخل متنِ پیام‌های
+    جفج (که در گروه ریپلای می‌شوند) بیاید — نه با توکنِ قدیمیِ
+    `{channel}` و نه اگر لینکش به‌صورت خام داخل متنِ ذخیره‌شده مانده
+    باشد (مثلاً تنظیماتِ به‌جامانده از نسخه‌های قدیمی که لینک طرف را
+    اتوماتیک زیر پیام می‌چسباندند). همه‌ی املای یک لینک پوشش داده
+    می‌شود: `@name`، `t.me/name`، `https://telegram.me/name`،
+    `t.me/+HASH` و `t.me/joinchat/HASH` و `+HASH`.
+
+    عمداً مستقل از `_LINK_PATTERNS` است تا منطقِ اسکن/تشخیص لینک دست
+    نخورد؛ فقط پاک‌سازی متن ارسالی کامل‌تر باشد. آیدی عددی کانال چون
+    لینکِ قابل‌کلیک در متن نیست عمداً حذف نمی‌شود.
+    """
+    if not text or not peer:
+        return text or ""
+    try:
+        def _bare(value):
+            s = str(value or "").strip().lower().rstrip("/")
+            s = re.sub(r"^https?://", "", s)
+            s = re.sub(r"^(?:www\.)?(?:t|telegram)\.me/", "", s)
+            s = s.replace("joinchat/", "").lstrip("+@")
+            return s
+
+        if is_invite(peer):
+            h = re.escape(invite_hash(peer))
+            if not h:
+                return text
+            patterns = [
+                r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/"
+                r"(?:joinchat/|\+)" + h + r"/?",
+                r"(?<![\w.\-])\+" + h + r"(?![\w.\-])",
+            ]
+        else:
+            u = re.escape(_bare(peer))
+            if not u or not re.match(r"^[a-z][a-z0-9_]{3,31}$", u):
+                # یوزرنیم معتبر نیست (مثلاً آیدی عددی) → حذفِ ناامن انجام نده.
+                return text
+            patterns = [
+                r"@" + u + r"\b",
+                r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/"
+                + u + r"/?(?![\w/])",
+            ]
+        for pat in patterns:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE)
+    except Exception:
+        return text
+    return text
+
+
 # ─────────────────────────────────────────────
 #  راهنما
 # ─────────────────────────────────────────────
@@ -4562,6 +4613,12 @@ class Engine:
         وقتی متن سفارشی msg_no ثبت شده باشد، فقط همان متن می‌رود و
         هیچ لینکی زیرش اضافه نمی‌شود — لینک طرف هرگز اتوماتیک نمی‌آید.
 
+        دو لایه محافظت برای لینکِ طرف اینجاست: (۱) توکنِ قدیمیِ
+        `{channel}` با هر فاصله/حرف‌بندی‌ای خالی می‌شود؛ (۲) اگر لینکِ
+        همین طرف به‌صورت خام هم داخل متن ذخیره شده باشد،
+        `strip_peer_links` حذفش می‌کند. لینکِ کانالِ خودم
+        (`{mychannel}`) چون با لینک طرف برابر نیست دست‌نخورده می‌ماند.
+
         «پیام پیش‌قدم» (msg_come و مسیرهای جایگزینش) جداست: کانالِ خودم
         همیشه زیرش می‌آید و این کار در `reply_joined` انجام می‌شود (نه
         اینجا) تا هر سه مسیرِ متن را پوشش بدهد."""
@@ -4581,12 +4638,22 @@ class Engine:
         try:
             rendered = (t.replace("{name}", name or "")
                          # لینکِ طرف نباید داخل متن پیام‌های جفج منتشر شود.
-                         # توکن قدیمی را خالی می‌کنیم تا از تنظیمات ذخیره‌شده
-                         # هم هیچ invite linkای بیرون نرود.
-                         .replace("{channel}", "")
+                         # توکن قدیمی را — با هر فاصله/حرف‌بندی‌ای — خالی
+                         # می‌کنیم تا از تنظیمات ذخیره‌شده هم هیچ invite
+                         # linkای بیرون نزند (باگ قدیمیِ «لینک یارو زیر پیام»).
                          .replace("{mychannel}", mych or ""))
+            rendered = re.sub(r"\{\s*channel\s*\}", "", rendered,
+                              flags=re.IGNORECASE)
+            # دفاعِ لایه‌دوم: اگر لینکِ همین طرف به‌صورت خام هم داخل متن
+            # مانده باشد (املای @name / t.me / +HASH)، حذفش کن. لینکِ
+            # کانالِ خودم دست‌نخورده می‌ماند چون با لینک طرف برابر نیست.
+            rendered = strip_peer_links(rendered, channel)
             rendered = re.sub(r"[ \t]{2,}", " ", rendered)
             rendered = re.sub(r"[ \t]+([،؛,:.!؟])", r"\1", rendered)
+            # اگر حذف لینک یک خط را خالی کرد، خطوط خالی پشت‌سرهم جمع شوند؛
+            # خطوط تک‌خطی و قالب‌بندی عمدی کاربر دست نمی‌خورد.
+            rendered = re.sub(r"[ \t]*\n[ \t]*(?=\n)", "", rendered)
+            rendered = re.sub(r"\n{2,}", "\n", rendered)
         except Exception:
             rendered = t
         rendered = rendered.strip()
