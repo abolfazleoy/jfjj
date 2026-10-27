@@ -4952,9 +4952,22 @@ class Manager:
         return bool(self.cfg.get("hub_on", True))
 
     def hub_sections(self):
-        """بخش‌هایی که در فهرست «🗂 توضیحات» دیده می‌شوند."""
+        """بخش‌هایی که در فهرست «🗂 توضیحات» دیده می‌شوند.
+
+        سه نوع بخش داریم:
+          • بخش‌های آموزشِ قدیمی (preset: wallet/points/sub/after_run) —
+            این‌ها «آموزش»اند نه «توضیح»، در فهرست توضیحات نمی‌آیند.
+          • بخش دست‌ساز مدیر (preset="") — در فهرست توضیحات می‌آید.
+          • توضیحِ تبدیل‌شده (preset="hub:*") — در فهرست می‌آید.
+        پرچم in_hub امکان حذف همان مورد از فهرست بدون پاک‌کردن بخش است."""
         return [s for s in self.tut_sections(on_only=True)
-                if s.get("in_hub", True) and s["preset"].startswith("hub:")]
+                if s.get("in_hub", True) and self._is_hub_section(s)]
+
+    @staticmethod
+    def _is_hub_section(section):
+        """بخشِ متعلق به فهرست توضیحات است یا آموزشِ قدیمی؟"""
+        preset = str(section.get("preset") or "")
+        return preset == "" or preset.startswith("hub:")
 
     def hub_page_size(self):
         try:
@@ -4981,8 +4994,22 @@ class Manager:
         return [d for d in self.HUB_DEFAULTS if d[0] not in done]
 
     def hub_default_items(self):
-        """توضیحات تبدیل‌نشده، مستقل از وجود بخش‌های آموزشی."""
+        """توضیحاتِ پیش‌فرضِ آماده‌ی نمایش در فهرست.
+
+        دو قانون:
+          • پیش‌فرضی که به بخشِ قابل‌ویرایش تبدیل شده (preset="hub:*")
+            دیگر نمی‌آید، ولی بقیه‌ی پیش‌فرض‌ها کنار همان بخش می‌مانند.
+          • به‌محض اینکه مدیر یک بخشِ دست‌ساز خودش (preset="") را در
+            فهرست بگذارد، همه‌ی پیش‌فرض‌ها کامل کنار می‌روند تا فهرست
+            فقط محتوای انتخابیِ مدیر را نشان دهد و صفحه‌بندی پایدار
+            بماند. وقتی هیچ بخشِ دست‌سازِ فعالی نیست، پیش‌فرض‌ها جای
+            خالی را پر می‌کنند."""
         if not self.hub_defaults_on():
+            return []
+        manual_active = any(
+            not str(s.get("preset") or "")
+            for s in self.hub_sections())
+        if manual_active:
             return []
         return self.hub_defaults_all()
 
@@ -5070,7 +5097,8 @@ class Manager:
                 "• 🎛 دو پروفایل مستقل: عادی و ویژه (VIP)\n"
                 "• 📊 وضعیت زنده و گزارش کار\n\n"
                 f"{L}\n"
-                "این قابلیت‌ها از پنل سلف در پیام‌های ذخیره‌شده قابل تنظیم‌اند."
+                "این قابلیت‌ها از پنل سلف در پیام‌های ذخیره‌شده قابل تنظیم‌اند؛ "
+                "کافی است در پیام‌های ذخیره‌شده فرمان <code>.panel</code> را بفرستی."
             )
         if key == "exchange":
             return (
@@ -5165,9 +5193,30 @@ class Manager:
             )
         return ""
 
+    def _hub_items(self):
+        """(آیتم‌ها, سقف هر صفحه) برای فهرست توضیحات.
+
+        بخش‌های مدیر صفحه‌بندی می‌شوند؛ اما توضیحاتِ پیش‌فرض (که فقط وقتی
+        هیچ بخشی نیست جای خالی را پر می‌کنند) مجموعه‌ی ثابت و کوچک‌اند و
+        همیشه یک‌صفحه‌ای نشان داده می‌شوند تا سقفِ کوچکِ صفحه (مثلاً ۴)
+        آن‌ها را پخش نکند."""
+        secs = self.hub_sections()
+        defaults = self.hub_default_items()
+        items = [("s", s) for s in secs] + [("d", d) for d in defaults]
+        per = self.hub_page_size()
+        # اگر بخش‌های متعلق به فهرست وجود دارند ولی الان همه in_hub=False
+        # شده‌اند، پیش‌فرض‌ها جای خالی را یک‌جا (تک‌صفحه‌ای) پر می‌کنند تا
+        # با سقف کوچک صفحه (مثلاً ۴) پخش نشوند. وقتی اصلاً هیچ بخشی ساخته
+        # نشده، پیش‌فرض‌ها طبق سقف عادی صفحه‌بندی می‌شوند.
+        hidden_sections = any(self._is_hub_section(s)
+                              for s in self.tut_sections())
+        if not secs and defaults and hidden_sections:
+            per = max(per, len(items))
+        return items, per
+
     def hub_pages(self):
-        n = len(self.hub_sections()) + len(self.hub_default_items())
-        return max(1, (n + self.hub_page_size() - 1) // self.hub_page_size())
+        items, per = self._hub_items()
+        return max(1, (len(items) + per - 1) // per)
 
     def hub_intro(self):
         t = str(self.cfg.get("hub_intro") or "").strip()
@@ -5180,11 +5229,7 @@ class Manager:
 
     def hub_view(self, page=0):
         """(متن, کیبورد) صفحه‌ی فهرست توضیحات. صفحه‌ی ۱ = ۰."""
-        secs = self.hub_sections()
-        defaults = self.hub_default_items()
-        # آیتم‌های فهرست: بخش‌های مدیر، بعد توضیحاتِ پیش‌فرضِ قابلیت‌ها
-        items = [("s", s) for s in secs] + [("d", d) for d in defaults]
-        per = self.hub_page_size()
+        items, per = self._hub_items()
         pages = max(1, (len(items) + per - 1) // per)
         try:
             page = int(page or 0)
@@ -5198,6 +5243,12 @@ class Manager:
             txt.append(f"📄 صفحه‌ی {_fa_digits(page + 1)} از {_fa_digits(pages)}")
 
         kb = []
+        # «آموزش فعال‌سازی کامل» فقط وقتی بخشی در فهرست هست و فقط در
+        # صفحه‌ی اول می‌آید؛ در حالتِ فقط-پیش‌فرض این دکمه نشان داده
+        # نمی‌شود (توضیحات از آموزش‌ها جداست).
+        has_secs = any(kind == "s" for kind, _ in items)
+        if page == 0 and has_secs:
+            kb.append([B("📖 آموزش فعال‌سازی (کامل)", "m:tut", "primary")])
         for kind, item in shown:
             if kind == "s":
                 kb.append([B(self.tut_sec_label(item), f"hub:s:{item['id']}",
@@ -5274,7 +5325,10 @@ class Manager:
     # ─────────── پنل مدیر: مدیریت بخش‌ها ───────────
     async def hub_admin(self, ev):
         """صفحه‌ی «🗂 توضیحات» در پنل مدیر — تنظیم فهرستِ مشتری."""
-        secs = [s for s in self.tut_sections() if s["preset"].startswith("hub:")]
+        # بخش‌های متعلق به فهرست توضیحات (دست‌ساز مدیر و پیش‌فرض‌های
+        # تبدیل‌شده) قابل ✅/⬜ کردن‌اند؛ آموزش‌های قدیمی (wallet/…) چون
+        # اصلاً به فهرست نمی‌آیند این‌جا هم کلید ندارند.
+        secs = [s for s in self.tut_sections() if self._is_hub_section(s)]
         in_hub = self.hub_sections()
         txt = [f"🗂 <b>توضیحات (فهرست تپ‌کردنی)</b>", self.LINE,
                "مشتری دکمه‌ی «🗂 توضیحات» را می‌زند و این‌جا هر توضیح را "
@@ -5292,7 +5346,8 @@ class Manager:
                f"📝 متن بالای صفحه: "
                f"{'✅ ثبت‌شده' if str(self.cfg.get('hub_intro') or '').strip() else '— (پیش‌فرض)'}",
                self.LINE,
-               "<i>توضیحات از آموزش‌ها جداست؛ بخش‌های آموزشی خودکار این‌جا نمی‌آیند.</i>",
+               "<i>هر بخش آموزشی با ✅ در فهرست مشتری دیده می‌شود؛ با ⬜ "
+               "کردنش از فهرست حذف می‌شود بدون اینکه بخش یا محتوایش پاک شود.</i>",
                "",
                "<b>توضیحاتِ پیش‌فرض:</b> معرفی سلف، دلیل دریافت شماره و تأیید ورود، "
                "قابلیت‌ها و امنیت. با «📥 تبدیل به بخش» "

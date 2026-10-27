@@ -571,7 +571,8 @@ INNER = textwrap.dedent('''
         check(all("{" not in b and "}" not in b and "None" not in b
                   and "<<" not in b for b in bodies.values()),
               "no leftover placeholders / raw braces in default texts")
-        want_kw = {"start": "سلف", "trial": "رایگان", "exchange": "جوین",
+        want_kw = {"start": "سلف", "phone": "شماره تلفن", "verify": "کد ورود",
+                   "trial": "رایگان", "exchange": "جوین",
                    "wallet": "کیف پول", "points": "امتیاز", "sub": "اشتراک",
                    "ref": "دعوت", "security": "کد", "panel": ".panel",
                    "svc": "خاموش", "support": "تیکت"}
