@@ -1240,8 +1240,8 @@ BOT_TOKEN = "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v0910-backup"
-BUILD_TAG = "JAFJ_MANAGER_82_v0911-stale-trial-sub_2026_10_23"
+BUILD_VERSION = "v1028-resume"
+BUILD_TAG = "JAFJ_MANAGER_82_v1028-resume-after-update_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -1915,7 +1915,8 @@ CREATE TABLE IF NOT EXISTS clients (
     trial_started_at INTEGER NOT NULL DEFAULT 0,
     trial_expires_at INTEGER NOT NULL DEFAULT 0,
     trial_warning_sent INTEGER NOT NULL DEFAULT 0,
-    rules_accepted INTEGER NOT NULL DEFAULT 1
+    rules_accepted INTEGER NOT NULL DEFAULT 1,
+    want_on INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1949,7 +1950,11 @@ class DB:
                               ("trial_started_at", "INTEGER NOT NULL DEFAULT 0"),
                               ("trial_expires_at", "INTEGER NOT NULL DEFAULT 0"),
                               ("trial_warning_sent", "INTEGER NOT NULL DEFAULT 0"),
-                              ("rules_accepted", "INTEGER NOT NULL DEFAULT 1")):
+                              ("rules_accepted", "INTEGER NOT NULL DEFAULT 1"),
+                              # «این سرویس باید روشن بماند؟» — پیش‌فرض ۱ تا
+                              # بعد از آپدیت، سرویسِ همه مثل قبل خودکار بالا
+                              # بیاید؛ خاموش‌کردنِ دستی آن را ۰ می‌کند.
+                              ("want_on", "INTEGER NOT NULL DEFAULT 1")):
                 if col not in cols:
                     self.c.execute(f"ALTER TABLE clients ADD COLUMN {col} {decl}")
                     if col == "trial_used":
@@ -2012,6 +2017,31 @@ class DB:
     def runnable(self):
         return self.x("SELECT * FROM clients WHERE status='active'"
                       " AND session IS NOT NULL AND session<>''", (), "all")
+
+    def wanted(self):
+        """سرویس‌هایی که «باید روشن باشند» — یعنی مشتری/مدیر خاموششان نکرده.
+
+        ستون `want_on` در نسخه‌های قبل نبود؛ برای همان رکوردهای قدیمی پیش‌فرض
+        ۱ است تا بعد از آپدیت همه مثل قبل خودکار بالا بیایند (وگرنه هیچ سرویسی
+        روشن نمی‌شد). فقط «خاموش کردنِ عمدی» این مقدار را ۰ می‌کند.
+        """
+        return self.x("SELECT * FROM clients WHERE status='active'"
+                      " AND session IS NOT NULL AND session<>''"
+                      " AND COALESCE(want_on, 1)<>0", (), "all")
+
+    def want_on(self, uid):
+        """آیا این سرویس باید روشن بماند؟ (رکوردِ قدیمی/نامعلوم = بله)"""
+        c = self.get(uid) or {}
+        v = c.get("want_on", None)
+        return True if v is None else bool(v)
+
+    def set_want(self, uid, on):
+        """ثبتِ «باید روشن بماند» روی دیسک تا بعد از آپدیت/ری‌استارت بماند."""
+        try:
+            self.set(uid, want_on=1 if on else 0)
+            return True
+        except Exception:
+            return False
 
     # ---------- تست رایگان ----------
     def trial_stats(self):
@@ -2141,6 +2171,29 @@ class DB:
             return False
 
 
+class _AdoptedProc:
+    """دستگیره‌ی سبک برای پروسه‌ی سلفی که ما نساختیمش (بعد از ری‌استارت manager).
+
+    فقط همان چیزی را دارد که Supervisor از یک Popen می‌خواهد: `pid` و
+    `poll()`. با آن، `is_running` / `running_count` / `stop` بدون تغییر
+    کار می‌کنند و نسخه‌ی دومِ سلف اجرا نمی‌شود.
+    """
+
+    def __init__(self, pid):
+        self.pid = int(pid)
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except ProcessLookupError:
+            return 1
+        except PermissionError:
+            return None
+        except Exception:
+            return 1
+
+
 # ═══════════════════════════════════════════════════
 #  ناظر پروسه‌ها — هر مشتری یک پروسه‌ی جدا
 # ═══════════════════════════════════════════════════
@@ -2151,7 +2204,34 @@ class Supervisor:
         self.procs = {}          # uid -> Popen
         self.last_failure = {}   # uid -> manager | selfbot
         self.mgr = None          # به Manager وصل می‌شود
+        # uid -> {"n": تعداد تلاش‌های ناموفق، "next": زمانِ تلاشِ بعدی}
+        # تا پروسه‌ای که فوراً می‌میرد (سشنِ خراب/FloodWait) هر ۳۰ ثانیه
+        # دوباره و دوباره اجرا نشود.
+        self._resume_fail = {}
+        # قفلِ «بالا آوردنِ همه» — بوتِ خودکار و بازیابیِ دستی نباید هم‌زمان
+        # یک سرویس را دو بار ری‌استارت کنند.
+        self.boot_lock = threading.Lock()
         os.makedirs(CLIENTS_DIR, exist_ok=True)
+
+    # ---------- «باید روشن بماند» ----------
+    def set_want(self, uid, on):
+        """نیتِ روشن‌بودن را ذخیره می‌کند تا بعد از دیپلوی/ری‌استارت برگردد.
+
+        چرا روی دیسک؟ پروسه‌های سلف فرزندِ همین manager هستند و هر آپدیت کد
+        (دیپلوی) همه را می‌کشد. بدون یادآوریِ این نیت، بعد از هر آپدیت مدیر
+        باید برای هر مشتری دوباره «روشن کن» بزند.
+        """
+        try:
+            self.db.set_want(uid, on)
+        except Exception:
+            try:
+                self.db.set(uid, want_on=1 if on else 0)
+            except Exception:
+                pass
+        try:
+            self.db.log(uid, "want_on" if on else "want_off", "")
+        except Exception:
+            pass
 
     def allowed(self, uid):
         """اجازه اجرا دارد؟ (اشتراک یا امتیاز کافی)"""
@@ -2367,8 +2447,93 @@ class Supervisor:
             return True, ""
         return False, err
 
+    # ---------- ردِ پای پروسه‌ی سلف (زنده‌ماندن بعد از ری‌استارتِ manager) ----------
+    def _pidfile(self, uid):
+        return os.path.join(self.folder(uid), ".jafj_self.pid")
+
+    def _write_pid(self, uid, pid):
+        try:
+            with open(self._pidfile(uid), "w", encoding="utf-8") as f:
+                f.write(str(int(pid)))
+        except Exception:
+            pass
+
+    def _clear_pid(self, uid):
+        try:
+            os.remove(self._pidfile(uid))
+        except Exception:
+            pass
+
+    def _pid_alive(self, pid):
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _pid_is_selfbot(self, uid, pid):
+        """آیا این PID واقعاً سلفِ همین پوشه است؟ (جلوگیری از PID بازاستفاده‌شده)
+
+        فایلِ pid روی دیسکِ ماندگار می‌ماند، ولی شماره‌ی پروسه‌ها در کانتینرِ
+        تازه از نو توزیع می‌شود؛ بدون این بررسی ممکن بود یک پروسه‌ی بی‌ربط
+        «پذیرفته» و سرویسِ واقعی هرگز اجرا نشود.
+        """
+        try:
+            with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        except Exception:
+            return True          # بدون /proc (مثلاً BSD) خوش‌بین باش
+        base = os.path.basename(SELFBOT or "95.py")
+        if base not in cmd and str(uid) not in cmd:
+            return False
+        try:
+            cwd = os.path.abspath(os.readlink(f"/proc/{int(pid)}/cwd"))
+            if cwd != os.path.abspath(self.folder(uid)):
+                return False
+        except Exception:
+            pass                 # cwd خوانده نشد → به cmdline بسنده کن
+        return True
+
+    def _adopt_orphan(self, uid):
+        """پروسه‌ی سلفی که بعد از ری‌استارتِ manager زنده مانده را «بپذیر».
+
+        فرزندهای سلف با start_new_session اجرا می‌شوند، پس اگر فقط manager
+        دوباره بالا بیاید (بدون کشته‌شدنِ کانتینر) آن‌ها زنده‌اند. بدون این
+        پذیرش، watchdog آن‌ها را «خاموش» می‌دید و نسخه‌ی دوم را اجرا می‌کرد
+        (دو سلف هم‌زمان روی یک سشن = خرابیِ سشن و پیام‌های تکراری).
+        """
+        try:
+            with open(self._pidfile(uid), encoding="utf-8") as f:
+                pid = int(f.read().strip() or 0)
+        except Exception:
+            return False
+        if not pid or not self._pid_alive(pid) or not self._pid_is_selfbot(uid, pid):
+            self._clear_pid(uid)
+            return False
+        self.procs[uid] = _AdoptedProc(pid)
+        self.db.log(uid, "adopt", f"pid={pid}")
+        return True
+
+    def _code_changed_since_start(self, uid):
+        """آیا 95.py بعد از شروعِ این پروسه عوض شده؟ (یعنی کدِ داخل حافظه کهنه است)"""
+        try:
+            started = os.path.getmtime(self._pidfile(uid))
+            return os.path.getmtime(SELFBOT) > started
+        except Exception:
+            return True      # نمی‌دانیم → مثل قبل ری‌استارت کن
+
     def is_running(self, uid):
         p = self.procs.get(uid)
+        if p is None:
+            # پروسه‌ای که خودمان نساختیم ولی هنوز زنده است (بعد از ری‌استارت)
+            if self._adopt_orphan(uid):
+                p = self.procs.get(uid)
+            else:
+                return False
         return bool(p and p.poll() is None)
 
     def start(self, uid):
@@ -2439,6 +2604,7 @@ class Supervisor:
             logf.close()
             return False, f"{type(e).__name__}: {e}"
         self.procs[uid] = p
+        self._write_pid(uid, p.pid)      # بمانَد تا بعد از ری‌استارت manager
         try:
             logf.close()
         except Exception:
@@ -2448,15 +2614,28 @@ class Supervisor:
         time.sleep(1.2)
         if p.poll() is not None:
             self.procs.pop(uid, None)
+            self._clear_pid(uid)
             self.last_failure[uid] = "selfbot"
             tail = self.tail(uid, 8).strip().replace("\n", " | ")[-900:]
             self.db.log(uid, "start_failed", tail)
             return False, "سلف اجرا نشد؛ Session یا اطلاعات ورود را بررسی کن.\n" + tail
-        self.db.set(uid, started_at=now())
+        self.db.set(uid, started_at=now(), want_on=1)
+        self._resume_fail.pop(uid, None)
         self.db.log(uid, "start", f"pid={p.pid}")
         return True, f"روشن شد (pid {p.pid})"
 
-    def stop(self, uid):
+    def stop(self, uid, remember_off=False):
+        """خاموش کردن پروسه.
+
+        `remember_off=True` یعنی «این خاموشی عمدی است» — پس روی دیسک ثبت
+        می‌شود (`want_on=0`) تا بعد از آپدیت/ری‌استارت خودکار روشن نشود.
+        خاموشی‌های سیستمی (انقضا، بن، ری‌استارت) این پرچم را نمی‌گذارند.
+        """
+        if remember_off:
+            try:
+                self.set_want(uid, False)
+            except Exception:
+                pass
         p = self.procs.get(uid)
         if not p or p.poll() is not None:
             self.procs.pop(uid, None)
@@ -2478,6 +2657,7 @@ class Supervisor:
             except Exception:
                 p.kill()
         self.procs.pop(uid, None)
+        self._clear_pid(uid)
         self.db.log(uid, "stop")
         return True, "خاموش شد"
 
@@ -2501,6 +2681,80 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def _bump_fail(self, uid):
+        """تلاشِ ناموفق را ثبت کن و دفعه‌ی بعد را عقب بینداز (۶۰s، ۱۲۰s … تا ۱۰m).
+
+        بدون این عقب‌گرد، سرویسی که سشنش خراب است هر ۳۰ ثانیه دوباره اجرا
+        می‌شد؛ ولی بدون هیچ تلاشی هم «خودش روشن نمی‌شود». عقب‌گرد هر دو را
+        حل می‌کند: سرویس سالم بلافاصله، سرویس خراب حداکثر هر ۱۰ دقیقه یک‌بار.
+        """
+        e = self._resume_fail.get(uid) or {"n": 0}
+        n = int(e.get("n") or 0) + 1
+        self._resume_fail[uid] = {"n": n, "next": time.time() + min(600, 60 * n)}
+
+    def resume_wanted(self, log_kind="autorestart", respect_backoff=True):
+        """همه‌ی سرویس‌هایی که «باید روشن باشند» ولی روشن نیستند را بالا بیاورد.
+
+        این همان چیزی است که بعد از هر آپدیت لازم است: پروسه‌های سلف فرزندِ
+        manager بودند و با دیپلوی همه مردند. حالا نیتِ «روشن بماند» روی دیسک
+        است و این تابع آن را دوباره اجرا می‌کند — بدون اینکه مدیر برای هر
+        مشتری «روشن کن» بزند.
+
+        خروجی: (شروع‌شده‌ها, ناموفق‌ها, رد‌شده‌ها) — لیستِ uid/پیام.
+        """
+        started, failed, skipped = [], [], []
+        try:
+            rows = self.db.wanted()
+        except Exception:
+            try:
+                rows = self.db.runnable()
+            except Exception:
+                return started, failed, skipped
+        for c in rows:
+            uid = c.get("uid")
+            if uid is None:
+                continue
+            if self.is_running(uid):
+                continue
+            self.procs.pop(uid, None)
+            if respect_backoff:
+                st = self._resume_fail.get(uid)
+                if st and float(st.get("next") or 0) > time.time():
+                    continue
+            ok, why = self.allowed(uid)
+            if not ok:
+                # اعتبار ندارد — «نیت» را پاک نمی‌کنیم؛ با شارژ شدن، خودش می‌آید.
+                self._bump_fail(uid)
+                self.db.log(uid, "no_credit", why)
+                skipped.append((uid, why))
+                continue
+            try:
+                started_ok, msg = self.start(uid)
+            except Exception as e:
+                started_ok, msg = False, f"{type(e).__name__}: {e}"
+            if started_ok:
+                started.append(uid)
+                self._resume_fail.pop(uid, None)
+                try:
+                    if self.mgr and self.mgr.shop and not self.mgr.has_sub(uid):
+                        # زمان خاموشی نباید به‌عنوان کارکرد امتیازی حساب شود.
+                        self.mgr.shop.p_reset_charge(uid)
+                except Exception:
+                    pass
+                try:
+                    self.db.set(uid, restarts=(int(c.get("restarts") or 0) + 1))
+                except Exception:
+                    pass
+                self.db.log(uid, log_kind, msg)
+            else:
+                failed.append((uid, msg))
+                self._bump_fail(uid)
+                self.db.log(uid, "resume_failed", msg)
+        if started or failed:
+            print(f"  ♻️ {log_kind}: {len(started)} روشن، {len(failed)} ناموفق، "
+                  f"{len(skipped)} بدون اعتبار", flush=True)
+        return started, failed, skipped
+
     def watchdog(self):
         while True:
             try:
@@ -2511,44 +2765,55 @@ class Supervisor:
                     self.db.set(c["uid"], status="expired")
                     self.db.log(c["uid"], "expired")
 
-                # افتاده‌ها را بلند کن — فقط اگر اعتبار دارند
-                if self.cfg["auto_restart"]:
-                    for c in self.db.runnable():
-                        uid = c["uid"]
-                        if uid in self.procs and not self.is_running(uid):
-                            self.procs.pop(uid, None)
-                            ok, why = self.allowed(uid)
-                            if not ok:
-                                self.db.log(uid, "no_credit", why)
-                                continue
-                            started, msg = self.start(uid)
-                            if started and self.mgr and self.mgr.shop and not self.mgr.has_sub(uid):
-                                # زمان خاموشی نباید به‌عنوان کارکرد امتیازی حساب شود.
-                                self.mgr.shop.p_reset_charge(uid)
-                            self.db.set(uid, restarts=(c["restarts"] or 0) + 1)
-                            self.db.log(uid, "autorestart", msg)
+                # افتاده‌ها را بلند کن — فقط اگر اعتبار دارند.
+                # اگر همین حالا «بالا آوردنِ همه» در جریان است صبر می‌کنیم؛
+                # وگرنه یک سرویس دو بار اجرا می‌شد.
+                if self.cfg["auto_restart"] and self.boot_lock.acquire(blocking=False):
+                    try:
+                        self.resume_wanted(log_kind="autorestart")
+                    finally:
+                        self.boot_lock.release()
             except Exception as e:
                 print("watchdog:", e)
             time.sleep(30)
 
-    def boot_all(self):
-        """سلف جدید را به همه منتقل می‌کند و سرویس‌های معتبر را از نو بالا می‌آورد."""
+    def boot_all(self, force_restart=False):
+        """سلف جدید را به همه منتقل می‌کند و سرویس‌های معتبر را از نو بالا می‌آورد.
+
+        فقط سرویس‌هایی که «باید روشن باشند» (`want_on`) — یعنی مشتری خودش
+        خاموششان نکرده. سرویسی که همین چند ثانیه پیش با همین کد بالا آمده
+        دست نمی‌خورد تا بوتِ دوباره (بعد از بازیابی) آن را بی‌دلیل قطع نکند.
+        """
         n = skipped = 0
-        for c in self.db.runnable():
-            # اگر از قبل روشن بود، نسخه قدیمی 95.py در حافظه مانده؛ باید ری‌استارت شود.
-            if self.is_running(c["uid"]):
-                self.stop(c["uid"])
+        self._resume_fail.clear()
+        try:
+            rows = self.db.wanted()
+        except Exception:
+            rows = self.db.runnable()
+        for c in rows:
+            uid = c["uid"]
+            # اگر از قبل روشن بود: فقط وقتی ری‌استارت کن که کدِ روی دیسک
+            # (95.py) بعد از شروعِ آن پروسه عوض شده باشد — یعنی نسخه‌ی
+            # درونِ حافظه کهنه است. ری‌استارتِ بی‌دلیل، سرویسِ سالمِ
+            # مشتری را بعد از هر بوت قطع می‌کند.
+            if self.is_running(uid):
+                # بعد از بازیابی، سشن/تنظیماتِ روی دیسک عوض شده و پروسه‌ی
+                # در حال اجرا نسخه‌ی قدیمی را در حافظه دارد → ری‌استارتِ اجباری.
+                if not force_restart and not self._code_changed_since_start(uid):
+                    n += 1          # با همین کد اجرا می‌شود؛ دست نزن
+                    continue
+                self.stop(uid)
                 time.sleep(0.4)
-            ok, why = self.allowed(c["uid"])
+            ok, why = self.allowed(uid)
             if not ok:
                 skipped += 1
-                self.db.log(c["uid"], "boot_skip", why)
+                self.db.log(uid, "boot_skip", why)
                 continue
-            started, _ = self.start(c["uid"])
+            started, _ = self.start(uid)
             if started:
                 n += 1
                 if self.mgr and self.mgr.shop:
-                    self.mgr.shop.p_reset_charge(c["uid"])
+                    self.mgr.shop.p_reset_charge(uid)
             time.sleep(0.5)
         if skipped:
             print(f"  ⚠️ {skipped} سرویس بدون اعتبار بالا نیامد")
@@ -2664,7 +2929,11 @@ ADMIN_HELP = """🛠 <b>پنل مدیر</b>
 
 <b>📦 پشتیبان</b>
 /backup یا .backup — گرفتن پشتیبان همین الان
-/restore یا .restore — بازیابی از آخرین پشتیبان"""
+/restore یا .restore — بازیابی از آخرین پشتیبان
+
+<b>♻️ بعد از آپدیت</b>
+/onall — همه‌ی سرویس‌هایی که باید روشن باشند را روشن کن
+(بعد از هر آپدیت/بازیابی خودکار هم همین کار انجام می‌شود)"""
 
 
 
@@ -2802,6 +3071,7 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("📜 رویدادها", "a:mlog", "primary")],
         [B("📦 بک‌آپ", "a:backup", "success"),
          B("♻️ بازیابی", "a:restore", "danger")],
+        [B("🟢 روشن کردن همه سرویس‌ها", "a:onall", "success")],
         back_btn(),
     ]
 
@@ -2828,6 +3098,69 @@ class Manager:
         self._backup_msg_id = None       # آیدی «تک‌پیامِ» پشتیبان در پیوی
         self._backup_extra_cleaned = False  # پاک‌سازیِ یکباره‌ی پیام‌های اضافی قدیمی
         self._restore_tries = 0          # چند تلاشِ بازیابی موقع بوت انجام شد
+        self._boot_last = (0, 0, 0)      # (شروع‌شده, ناموفق, بدون‌اعتبار)
+        self._loop = None                # حلقه‌ی asyncio (در run ست می‌شود)
+
+    # ---------- بالا آوردنِ سرویس‌ها بعد از آپدیت/بازیابی ----------
+    def _spawn_boot(self, notify_admins=False, why="", force_restart=False):
+        """همه‌ی سرویس‌هایی که «باید روشن باشند» را در پس‌زمینه بالا می‌آورد.
+
+        چرا thread؟ هر سرویس ~۱.۵ ثانیه وقت می‌برد؛ اگر همین‌جا و همگام اجرا
+        شود، ربات بعد از آپدیت دقیقاً وقتی بیشترین نیاز به آن است (مدیر
+        «روشن کن» می‌زند) چند دقیقه جواب نمی‌دهد.
+        """
+        def _worker():
+            got = self.sup.boot_lock.acquire(timeout=600)
+            if not got:
+                print("  ⚠️ بالا آوردنِ سرویس‌ها: قفل نگرفت — watchdog جبران می‌کند",
+                      flush=True)
+                return
+            try:
+                n = self.sup.boot_all(force_restart=force_restart)
+                try:
+                    self._boot_last = (n, 0, 0)
+                except Exception:
+                    pass
+                print(f"  ♻️ بالا آوردنِ سرویس‌ها ({why or 'بوت'}): "
+                      f"{n} سرویس روشن", flush=True)
+                if notify_admins and self.bot is not None and self._loop is not None:
+                    for a in (self.cfg.get("admin_ids") or []):
+                        try:
+                            note = (f"♻️ <b>سرویس‌ها دوباره بالا آمدند</b>\n\n"
+                                    f"🟢 {_fa_digits(n)} سرویس روشن شد\n"
+                                    f"<i>دلیل: {why or 'آپدیت'}</i>\n"
+                                    "اگر سرویسی روشن نشد، <code>/onall</code> را بزن.")
+                            asyncio.run_coroutine_threadsafe(
+                                self.say(a, note, key="boot_report"), self._loop)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"  ⚠️ بالا آوردنِ سرویس‌ها: {type(e).__name__}: {e}", flush=True)
+            finally:
+                self.sup.boot_lock.release()
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _resume_after_restore(self, why="بازیابی"):
+        """بعد از هر بازیابی: سرویس‌های «قبلاً روشن» را خودکار برگردان.
+
+        این همان حلقه‌ی گم‌شده بود: بازیابی اطلاعات را برمی‌گرداند ولی هیچ
+        سرویسی را روشن نمی‌کرد، پس مدیر باید برای تک‌تک مشتری‌ها «روشن کن»
+        می‌زد.
+        """
+        try:
+            n_want = len(self.db.wanted())
+        except Exception:
+            n_want = 0
+        if n_want <= 0:
+            return 0
+        try:
+            self._reload_cfg_from_disk()
+        except Exception:
+            pass
+        # force_restart: بعد از بازیابی، پروسه‌ی در حال اجرا اطلاعاتِ کهنه
+        # در حافظه دارد؛ باید با داده‌ی تازه بالا بیاید.
+        self._spawn_boot(notify_admins=True, why=why, force_restart=True)
+        return n_want
 
     # ---------- کمکی ----------
     def is_admin(self, uid):
@@ -6072,7 +6405,8 @@ class Manager:
                     ok, msg, fee_msg = self.start_service(
                         uid, restart=True, charge_success=False)
             elif act == "off":
-                ok, msg = self.sup.stop(uid)
+                # خاموشیِ عمدی ثبت می‌شود تا بعد از آپدیت خودکار روشن نشود.
+                ok, msg = self.sup.stop(uid, remember_off=True)
             elif act == "log":
                 await ans()
                 return await self.edit(ev, "📜 <b>گزارش</b>\n\n<pre>" +
@@ -7276,6 +7610,22 @@ class Manager:
                 return await self.edit(ev, ("✅ " if ok else "❌ ") + str(msg),
                                        [[B("📦 مدیریت بک‌آپ", "a:backup", "primary")],
                                         back_btn("a:home")])
+            if k == "onall":
+                # «روشن کردن همه» — همان کاری که بعد از آپدیت/بازیابی خودکار
+                # انجام می‌شود، ولی دستی و با گزارشِ فوری.
+                rows = self.db.wanted()
+                alive = sum(1 for c in rows if self.sup.is_running(c["uid"]))
+                self.sup._resume_fail.clear()      # عقب‌گرد را صفر کن
+                self._spawn_boot(notify_admins=False, why="دستور مدیر")
+                return await self.edit(ev,
+                    f"🟢 <b>روشن کردن همه سرویس‌ها</b>\\n{self.LINE}\\n"
+                    f"👥 باید روشن باشند: {_fa_digits(len(rows))}\\n"
+                    f"🟢 از قبل روشن: {_fa_digits(alive)}\\n"
+                    f"⏳ بقیه در پس‌زمینه روشن می‌شوند (~۲ ثانیه هر سرویس).\\n\\n"
+                    "<i>سرویس‌هایی که مشتری خودش خاموش کرده در این لیست نیستند؛ "
+                    "برای روشن‌کردنشان «روشن کن» خودش را بزن.</i>",
+                    [[B("🔄 بروزرسانی وضعیت", "a:stats", "primary")],
+                     back_btn("a:home")])
             if k in ("revenue", "stats", "users", "plans", "tk",
                      "mlog", "pstats", "doctor"):
                 cmd = {"revenue": "revenue", "stats": "stats", "users": "users",
@@ -7440,7 +7790,7 @@ class Manager:
         if data.startswith("aproc:") and adm:
             tid = int(digits(data[6:]) or 0)
             if self.sup.is_running(tid):
-                ok, msg = self.sup.stop(tid)
+                ok, msg = self.sup.stop(tid, remember_off=True)
             else:
                 ok, msg, _ = self.start_service(tid, charge_success=False)
             await ans(msg[:40])
@@ -8261,7 +8611,7 @@ class Manager:
                     uid, first=not bool(c.get("started_at")),
                     restart=False, charge_success=not self.sup.is_running(uid))
             elif cmd == "off":
-                ok, msg = self.sup.stop(uid)
+                ok, msg = self.sup.stop(uid, remember_off=True)
             else:
                 ok, msg, fee_msg = self.start_service(
                     uid, restart=True, charge_success=False)
@@ -8283,7 +8633,7 @@ class Manager:
                       "addplan", "editplan", "rmplan", "disc", "discs", "give",
                       "tk", "tr", "tclose", "packs", "addpack", "editpack",
                       "rmpack", "gp", "acct", "pstats", "pset", "lim", "admin", "panel",
-                      "backup", "restore"}
+                      "backup", "restore", "onall", "all_on"}
         if cmd in ADMIN_ONLY:
             return await self.say(chat,
                 f"🔒 <b>{cmd}</b> فقط برای مدیر است.\n\n"
@@ -8304,6 +8654,19 @@ class Manager:
         if cmd in ("restore",):
             ok, msg = await self.restore_from_backup(force=True)
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
+        if cmd in ("onall", "all_on"):
+            # دستور عجله‌ایِ مدیر: «همه‌ی سرویس‌هایی که باید روشن باشند را
+            # همین حالا روشن کن» — همان چیزی که بعد از آپدیت لازم است.
+            rows = self.db.wanted()
+            alive = sum(1 for c in rows if self.sup.is_running(c["uid"]))
+            self.sup._resume_fail.clear()
+            self._spawn_boot(notify_admins=False, why="دستور /onall")
+            return await self.say(chat,
+                f"🟢 <b>روشن کردن همه</b>\n{self.LINE}\n"
+                f"👥 باید روشن باشند: {_fa_digits(len(rows))}\n"
+                f"🟢 از قبل روشن: {_fa_digits(alive)}\n"
+                f"⏳ بقیه در پس‌زمینه روشن می‌شوند.\n"
+                "<i>برای دیدن نتیجه: /stats</i>")
         if cmd in ("admin", "panel"):
             sh = self.shop
             pend = len(sh.pending_orders()) if sh else 0
@@ -8419,7 +8782,7 @@ class Manager:
             if cmd == "pon":
                 ok, msg, _ = self.start_service(tid, charge_success=False)
             else:
-                ok, msg = self.sup.stop(tid)
+                ok, msg = self.sup.stop(tid, remember_off=True)
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
 
         if cmd == "plog":
@@ -10948,8 +11311,15 @@ class Manager:
                                 os.remove(admin_up)
                             except Exception:
                                 pass
-                            return True, f"بازیابی از فایلی که فرستادی: {n2} مشتری" + (f" + {regen} سشن" if regen else "")
-                        return True, f"بازیابی از دیسک محلی: {n2} مشتری" + (f" + {regen} سشن" if regen else "")
+                            # سرویس‌هایی که «باید روشن باشند» را خودکار برگردان
+                            want = self._resume_after_restore("بازیابی از فایل")
+                            return True, (f"بازیابی از فایلی که فرستادی: {n2} مشتری"
+                                          + (f" + {regen} سشن" if regen else "")
+                                          + (f" · {want} سرویس در حال روشن شدن" if want else ""))
+                        want = self._resume_after_restore("بازیابی از دیسک")
+                        return True, (f"بازیابی از دیسک محلی: {n2} مشتری"
+                                      + (f" + {regen} سشن" if regen else "")
+                                      + (f" · {want} سرویس در حال روشن شدن" if want else ""))
                     except Exception as e:
                         print(f"  ⚠️ restore local {cand}: {e}", flush=True)
                         continue
@@ -11159,7 +11529,10 @@ class Manager:
                 self._reload_cfg_from_disk()
             except Exception as e:
                 print(f"  ⚠️ تازه‌سازی تنظیمات بعد از بازیابی: {type(e).__name__}", flush=True)
-            return True, f"بازیابی شد: {n2} مشتری" + (f" + {regen} سشن بازسازی" if regen else "")
+            want = self._resume_after_restore("بازیابی از تلگرام")
+            return True, (f"بازیابی شد: {n2} مشتری"
+                          + (f" + {regen} سشن بازسازی" if regen else "")
+                          + (f" · {want} سرویس در حال روشن شدن" if want else ""))
         except Exception as e:
             try:
                 try:
@@ -11374,6 +11747,13 @@ class Manager:
             print("     اولین نفر مدیر می‌شود.")
         print(f"  سقف: {c['max_clients']} مشتری")
 
+        # حلقه‌ی جاری را نگه دار: بوتِ پس‌زمینه از یک thread جدا پیام‌ها را
+        # با run_coroutine_threadsafe به همین حلقه می‌فرستد.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except Exception:
+            self._loop = None
+
         # ── بازیابی خودکار از پشتیبان تلگرام (اگر دیتابیس خالی است) ──
         # مقصد از backup_target_raw() خوانده می‌شود که بدون BACKUP_CHAT هم
         # به «admin» برمی‌گردد، پس بعد از هر دیپلوی/ری‌استارت که دیتابیس
@@ -11385,11 +11765,13 @@ class Manager:
             print(f"  ⚠️ بازیابی خودکار: {type(e).__name__}: {e}", flush=True)
 
         self.boot_at = now()
-        n = self.sup.boot_all()
-        print(f"  {n} سرویس فعال بالا آمد")
-        print(f"{'='*54}\n")
-
+        # بالا آوردنِ سرویس‌ها در پس‌زمینه: هر سرویس ~۱.۵ ثانیه وقت می‌برد و
+        # اگر همگام اجرا شود، ربات بعد از آپدیت دقیقاً وقتی مدیر «روشن کن»
+        # می‌زند چند دقیقه جواب نمی‌دهد. watchdog هم از همان اول فعال است تا
+        # اگر یکی جا افتاد، خودش جبران کند.
         threading.Thread(target=self.sup.watchdog, daemon=True).start()
+        print(f"{'='*54}\n")
+        self._spawn_boot(notify_admins=False, why="بوت")
         # ارجاع را نگه دار؛ وگرنه حلقهٔ پشتیبان ممکن است وسط کار جمع شود و بک‌آپ نرود.
         self._bg_tasks = []
         for _coro in (self.duplicate_watch_loop(), self.reminder_loop(),
