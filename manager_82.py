@@ -5378,6 +5378,114 @@ class Manager:
             await asyncio.sleep(0.25)
         return ok, attached
 
+    # ── مدیریتِ دانه‌دانه‌ی محتوا: فهرست، حذف یک مورد، حذف همه ──
+    async def _tut_items(self, chat, ids):
+        """محتوای ثبت‌شده را با جای هر آیتم برمی‌گرداند.
+
+        خروجی: [(جایِ پیام در لیستِ ids, Message), ...]
+
+        چرا «جای در ids» مهم است: آیتم‌ها با شماره‌شان در همین فهرست حذف
+        می‌شوند؛ اگر چند پیام وسط کار از تلگرام پاک شده باشند (None) یا
+        پیام سرویس باشند، شماره‌ها نباید جابه‌جا شوند وگرنه مدیر به‌جای
+        ویدیوی اول، ویدیوی دوم را پاک می‌کند. فیلتر دقیقاً همان فیلترِ
+        _tut_load است تا شماره‌ی فهرست با چیزی که برای کاربر می‌رود یکی باشد.
+        """
+        items = []
+        if not chat or not ids:
+            return items
+        try:
+            got = await self.bot.get_messages(chat, ids=list(ids))
+        except Exception as e:
+            print("tut items:", type(e).__name__, e)
+            return items
+        for i, m in enumerate(got or []):
+            if i >= len(ids):
+                break
+            if m is None:
+                continue
+            if not (getattr(m, "media", None) or (getattr(m, "raw_text", "") or "").strip()):
+                continue
+            items.append((i, m))
+        return items
+
+    @staticmethod
+    def _content_kind(m=None, text=""):
+        """نوعِ یک پیام/مدیا به شکلِ برچسبِ خوانا (🎬 ویدیو، 📝 متن…)."""
+        if m is not None:
+            if getattr(m, "photo", None):
+                return "🖼 عکس"
+            if getattr(m, "video", None):
+                return "🎬 ویدیو"
+            if getattr(m, "gif", None):
+                return "🎞 گیف"
+            if getattr(m, "voice", None):
+                return "🎤 ویس"
+            if getattr(m, "audio", None):
+                return "🎵 آهنگ"
+            if getattr(m, "sticker", None):
+                return "🎨 استیکر"
+            if getattr(m, "contact", None):
+                return "👤 مخاطب"
+            if getattr(m, "document", None):
+                return "📎 فایل"
+        t = (text or "").strip()
+        if not t and m is not None:
+            t = (getattr(m, "raw_text", "") or "").strip()
+        return "📝 متن" if t else "💬 پیام"
+
+    @staticmethod
+    def _content_snippet(m, limit=42):
+        """یک خط خلاصه از پیام تا مدیر بفهمد کدام ویدیو/متن را دارد پاک می‌کند."""
+        raw = " ".join((getattr(m, "raw_text", "") or "").split())
+        if not raw:
+            try:
+                f = getattr(m, "file", None)
+                raw = str(getattr(f, "name", "") or "").strip()
+            except Exception:
+                raw = ""
+        raw = raw[:limit]
+        return Manager._esc(raw + ("…" if len(raw) >= limit else "")) if raw else ""
+
+    def tut_content_del(self, step, sid, index):
+        """یک آیتم از محتوای ثبت‌شده را پاک می‌کند (ویدیو، متن، ویس… فرقی ندارد).
+
+        index = جای آیتم در فهرستِ _tut_items (همان شماره‌ای که مدیر می‌بیند).
+        خروجی: تعداد آیتم‌های باقی‌مانده، یا None اگر بخش/محتوا پیدا نشد.
+        """
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return None
+        if step == "sec_set":
+            s = self.tut_find(sid)
+            if not s:
+                return None
+            ids = list(s["ids"] or [])
+            chat = int(s["chat"] or 0)
+        else:
+            chat, ids = self.tut_src()
+            ids = list(ids or [])
+        if index < 0 or index >= len(ids):
+            return None
+        del ids[index]
+        if step == "sec_set":
+            self.tut_update(sid, chat=chat, ids=ids)
+        else:
+            self.cfg["tut_chat"] = chat
+            self.cfg["tut_ids"] = ids
+            self.cfg.save()
+        return len(ids)
+
+    def tut_content_clear(self, step, sid=0):
+        """همه‌ی محتوای ثبت‌شده (متن/ویدیو/ویس/عکس/…) را یک‌جا پاک می‌کند."""
+        if step == "sec_set":
+            self.tut_update(sid, chat=0, ids=[])
+        else:
+            self.cfg["tut_chat"] = 0
+            self.cfg["tut_ids"] = []
+            self.cfg.save()
+        return True
+
     async def send_tutorial(self, uid):
         """محتوای «📚 آموزش فعال‌سازی» را برای کاربر می‌فرستد.
 
@@ -5580,6 +5688,36 @@ class Manager:
         rows.insert(j, rows.pop(idx))
         self.tut_save(rows)
         return True
+
+    # ═══════════════════════════════════════════════
+    #  ثبت محتوای آموزش/بخش — دو حالت: «افزودن» و «جایگزینی»
+    # ═══════════════════════════════════════════════
+    def tut_capture_start(self, uid, step, sid=0, append=False):
+        """حالتِ گرفتنِ پیام‌های مدیر را باز می‌کند و لیستِ در‌انتظار را می‌سازد.
+
+        append=True یعنی محتوای قبلیِ همین بخش (یا آموزش فعال‌سازی اصلی) سرِ
+        جایش می‌ماند و پیام‌های تازه <b>به آخرِ آن اضافه</b> می‌شوند — پس فردا
+        می‌شود ویدیوی دوم را پشت ویدیوی اول پیوند زد بدون اینکه چیزی پاک شود.
+        append=False رفتار قدیمی است: هرچه از قبل ثبت شده <b>جایگزین</b> می‌شود.
+
+        خروجی: (حالتِ واقعی, تعداد پیامِ قبلی)
+        """
+        mode = "append" if append else "replace"
+        have, src_chat = [], 0
+        if step == "sec_set":
+            s = self.tut_find(sid) or {}
+            have, src_chat = list(s.get("ids") or []), int(s.get("chat") or 0)
+        elif step == "tut_set":
+            chat0, ids0 = self.tut_src()
+            have, src_chat = list(ids0 or []), int(chat0 or 0)
+        if mode == "append" and not have:
+            mode = "replace"          # چیزی نیست که به آن اضافه شود
+        st = {"step": step, "mode": mode, "tut_chat": src_chat,
+              "tut_pending": list(have) if mode == "append" else []}
+        if step == "sec_set":
+            st["sec_id"] = int(sid)
+        self.fsm[uid] = st
+        return mode, len(have)
 
     # ═══════════════════════════════════════════════
     #  چهار متنِ آماده‌ی آموزش — مدیر با یک دکمه از پنل می‌سازد
@@ -6530,10 +6668,19 @@ class Manager:
                f"   ·   🗂 در فهرست توضیحات: "
                f"{'✅' if s.get('in_hub', True) else '⬜'}"
                + "\n".join(warn))
-        kb = [
-            [B("📤 ثبت / تغییر محتوا", f"a:sec_set:{sid}", "success")],
-            [B("👁 پیش‌نمایش", f"a:sec_vw:{sid}", "primary"),
-             B("🗑 پاک‌کردن محتوا", f"a:sec_clr:{sid}", "danger")],
+        kb = []
+        if n:
+            # محتوای قبلی هست → دو راهِ جدا: «اضافه‌کردن به آخرِ آن» (ویدیوی
+            # دوم پشت ویدیوی اول) یا «جایگزینی کل» (از صفر).
+            kb.append([B("➕ افزودن به محتوا", f"a:sec_add:{sid}", "success")])
+            kb.append([B("📤 ثبت / تغییر محتوا (جایگزینی)", f"a:sec_set:{sid}",
+                         "primary")])
+        else:
+            kb.append([B("📤 ثبت محتوا", f"a:sec_set:{sid}", "success")])
+        kb += [
+            [B("📦 مدیریت محتوا", f"a:sec_items:{sid}", "primary"),
+             B("🗑 پاک‌کردن همه", f"a:sec_clr:{sid}", "danger")],
+            [B("👁 پیش‌نمایش", f"a:sec_vw:{sid}", "primary")],
             [B("📝 متن بخش", f"a:sec_txt:{sid}", "success")]
             + ([B("♻️ متن آماده", f"a:sec_tpl_rst:{sid}", "primary")]
                if s.get("preset") else []),
@@ -6552,6 +6699,73 @@ class Manager:
             [B("🗑 حذف بخش", f"a:sec_rm:{sid}", "danger")],
             back_btn("a:secs")]
         return await self.edit(ev, txt, kb)
+
+    async def tut_admin_items(self, ev, sid):
+        """«📦 مدیریت محتوا»ی یک بخش: فهرستِ دانه‌دانه‌ی پیام‌های ثبت‌شده.
+
+        هر آیتم (ویدیو، متن، ویس، عکس، فایل، استیکر…) جدا با شماره دیده می‌شود
+        تا مدیر بتواند <b>همان یکی</b> را پاک کند — مثلاً از دو ویدیوی ثبت‌شده
+        فقط ویدیوی اول برود — یا با «🗑 پاک‌کردن همه» یک‌جا همه را بردارد.
+        شماره‌ها دقیقاً همان ترتیبی است که برای کاربر ارسال می‌شود.
+        """
+        s = self.tut_find(sid)
+        if not s:
+            return await self.edit(ev, "این بخش پیدا نشد.",
+                                   [back_btn("a:secs")])
+        items = await self._tut_items(s["chat"], s["ids"])
+        txt = [f"📦 <b>محتوای «{self.tut_sec_label(s)}»</b>", self.LINE]
+        kb = []
+        if not items:
+            txt.append("⚪ پیامی ثبت نشده (یا پیام‌های منبع در تلگرام پاک شده‌اند).")
+            txt.append("<i>با «➕ افزودن به محتوا» ویدیو/عکس/متن بفرست.</i>")
+        else:
+            txt.append(f"🔢 {_fa_digits(len(items))} پیام — به همان ترتیبی که "
+                       "برای کاربر می‌رود:")
+            txt.append("")
+            for num, (i, m) in enumerate(items, start=1):
+                kind = self._content_kind(m=m)
+                snip = self._content_snippet(m)
+                txt.append(f"{_fa_digits(num)}. {kind}" + (f" — {snip}" if snip else ""))
+                # تلگرام متنِ دکمه را هم محدود می‌کند؛ برچسب کوتاه و بی‌خطر:
+                lbl = f"🗑 {_fa_digits(num)}: {kind}" + (f" {snip}" if snip else "")
+                kb.append([B(lbl[:60], f"a:sec_di:{sid}:{i}", "danger")])
+            txt += ["", "<i>هر مورد را جدا می‌توانی پاک کنی؛ بقیه سر جایشان می‌مانند.</i>"]
+        if items:
+            kb.append([B("🗑 پاک‌کردن همه‌ی محتوا", f"a:sec_dall:{sid}", "danger")])
+        kb.append([B("➕ افزودن به آخرِ محتوا", f"a:sec_add:{sid}", "success")])
+        kb.append([B("📤 ثبت / تغییر محتوا (جایگزینی)", f"a:sec_set:{sid}", "primary"),
+                   B("👁 پیش‌نمایش", f"a:sec_vw:{sid}", "primary")])
+        kb.append([B("⬅️ بخش", f"a:sec:{sid}")])
+        return await self.edit(ev, "\n".join(txt), kb)
+
+    async def tut_admin_content(self, ev):
+        """«📦 مدیریت محتوا»ی آموزش فعال‌سازی اصلی — مثل بخش‌ها، دانه‌دانه."""
+        chat, ids = self.tut_src()
+        items = await self._tut_items(chat, ids)
+        txt = [f"📦 <b>محتوای «🎬 آموزش فعال‌سازی»</b>", self.LINE]
+        kb = []
+        if not items:
+            txt.append("⚪ پیامی ثبت نشده (متن پیش‌فرض برای کاربر می‌رود).")
+            txt.append("<i>با «➕ افزودن به محتوا» یا «📤 ثبت محتوا» پیام بفرست.</i>")
+        else:
+            txt.append(f"🔢 {_fa_digits(len(items))} پیام — به همان ترتیبی که "
+                       "برای کاربر می‌رود:")
+            txt.append("")
+            for num, (i, m) in enumerate(items, start=1):
+                kind = self._content_kind(m=m)
+                snip = self._content_snippet(m)
+                txt.append(f"{_fa_digits(num)}. {kind}" + (f" — {snip}" if snip else ""))
+                # تلگرام متنِ دکمه را هم محدود می‌کند؛ برچسب کوتاه و بی‌خطر:
+                lbl = f"🗑 {_fa_digits(num)}: {kind}" + (f" {snip}" if snip else "")
+                kb.append([B(lbl[:60], f"a:tut_di:{i}", "danger")])
+            txt += ["", "<i>هر مورد را جدا می‌توانی پاک کنی؛ بقیه سر جایشان می‌مانند.</i>"]
+        if items:
+            kb.append([B("🗑 پاک‌کردن همه‌ی محتوا", "a:tut_dall", "danger")])
+        kb.append([B("➕ افزودن به آخرِ محتوا", "a:tut_add", "success")])
+        kb.append([B("📤 ثبت / تغییر محتوا (جایگزینی)", "a:tut_set", "primary"),
+                   B("👁 پیش‌نمایش", "a:tut_view", "primary")])
+        kb.append([B("⬅️ بازگشت", "a:tut")])
+        return await self.edit(ev, "\n".join(txt), kb)
 
     async def tut_admin_when(self, ev, sid):
         """انتخاب زمان ارسال بخش."""
@@ -6658,8 +6872,12 @@ class Manager:
                                              "rt_set",
                                              "cm_add", "cm_edit", "cm_intro",
                                              "hub_intro", "rules_set", "rules_btn_set"):
-            keep = data in ("wq:0", "kc:x", "a:tut_done") \
-                or data.startswith(("a:sec_done",)) or data == "a:sample_done" or (
+            # a:tut_add / a:sec_add / a:sec_set: خودشان حالتِ ثبت محتوا را
+            # (از نو) باز می‌کنند؛ اگر اینجا پاکشان کنیم، سوییچ بین
+            # «➕ افزودن» و «📤 جایگزینی» وسطِ کار حالت را از بین می‌برد.
+            keep = data in ("wq:0", "kc:x", "a:tut_done", "a:tut_add") \
+                or data.startswith(("a:sec_done", "a:sec_add:", "a:sec_set:")) \
+                or data == "a:sample_done" or (
                 st_now.get("step") in ("verify_phone", "verify_referral") and data.startswith(("ko:", "o:", "wq:", "kc:", "kp:")))
             if st_now.get("step") in ("verify_phone", "verify_referral") and data not in ("m:home",):
                 keep = True
@@ -7807,10 +8025,17 @@ class Manager:
                 n = len(ids)
                 stat = (f"✅ ثبت شده — {_fa_digits(n)} پیام" if chat and n
                         else "⚪ هنوز محتوا ثبت نشده (متن پیش‌فرض می‌رود)")
-                kb = [[B("📤 ثبت / تغییر محتوا", "a:tut_set", "success")],
-                      [B("👁 پیش‌نمایش", "a:tut_view", "primary")]]
                 if chat and n:
-                    kb.append([B("🗑 پاک کردن محتوا", "a:tut_del", "danger")])
+                    kb = [[B("➕ افزودن به محتوا", "a:tut_add", "success")],
+                          [B("📤 ثبت / تغییر محتوا (جایگزینی)", "a:tut_set",
+                             "primary")],
+                          [B("📦 مدیریت محتوا", "a:tut_items", "primary"),
+                           B("🗑 پاک‌کردن همه", "a:tut_del", "danger")],
+                          [B("👁 پیش‌نمایش", "a:tut_view", "primary")]]
+                else:
+                    kb = [[B("📤 ثبت محتوا", "a:tut_set", "success")],
+                          [B("📦 مدیریت محتوا", "a:tut_items", "primary"),
+                           B("👁 پیش‌نمایش", "a:tut_view", "primary")]]
                 kb.append([B("🧩 بخش‌بندی آموزش (تگ‌ها)", "a:secs", "success")])
                 kb.append(back_btn("a:home"))
                 return await self.edit(ev,
@@ -7820,23 +8045,65 @@ class Manager:
                     "<b>کپی‌شده</b> (بدون هدر فوروارد) برایش ارسال می‌شود.\n\n"
                     "<b>هر چیزی قابل ثبت است:</b> متن، لینک، عکس، ویدیو، ویس، "
                     "فایل، استیکر، آلبوم — به ترتیبی که می‌خواهی کاربر ببیند.\n\n"
+                    "«➕ افزودن به محتوا» = پیام‌های تازه <b>به آخرِ</b> همین‌ها "
+                    "اضافه می‌شوند (قبلی‌ها سر جایشان می‌مانند).\n"
+                    "«📦 مدیریت محتوا» = فهرستِ دانه‌دانه؛ هر ویدیو/متن/ویس را "
+                    "خواستی جدا پاک کن.\n\n"
                     "<i>محتوا در چتِ خودت با ربات نگه داشته می‌شود؛ "
                     "پیام‌هایش را پاک نکن.</i>", kb)
-            if k == "tut_set":
-                self.fsm[uid] = {"step": "tut_set", "tut_chat": 0, "tut_pending": []}
+            if k == "tut_set" or k == "tut_add":
+                mode, had = self.tut_capture_start(uid, "tut_set",
+                                                   append=(k == "tut_add"))
+                done = B("✅ تمام شد — ذخیره", "a:tut_done", "success")
+                if mode == "append":
+                    return await self.edit(ev,
+                        f"➕ <b>افزودن به محتوای آموزش فعال‌سازی</b>\n{self.LINE}\n"
+                        f"📦 {_fa_digits(had)} پیام قبلی <b>سر جایش می‌ماند</b>؛ "
+                        "هرچه الان بفرستی به <b>آخرِ</b> همان‌ها اضافه می‌شود.\n\n"
+                        "ویدیو/عکس/ویس/متن را همین‌جا بفرست — چند پیام "
+                        "پشت‌سرهم هم اشکال ندارد.\n"
+                        "تمام شد؟ «✅ تمام شد — ذخیره» را بزن.\n\n"
+                        "<i>هر دکمه‌ی دیگر = لغو (چیزی ذخیره یا پاک نمی‌شود)</i>",
+                        [[done], [B("⬅️ بازگشت", "a:tut")]])
                 return await self.edit(ev,
                     f"📤 <b>ثبت محتوای آموزش فعال‌سازی</b>\n{self.LINE}\n"
-                    "محتوا را <b>همین‌جا</b> بفرست — هر چیزی:\n"
+                    + (f"⚠️ {_fa_digits(had)} پیامِ ثبت‌شده <b>جایگزین</b> می‌شود؛ "
+                       "اگر می‌خواهی قبلی‌ها بمانند «➕ افزودن به محتوا» را بزن.\n\n"
+                       if had else "")
+                    + "محتوا را <b>همین‌جا</b> بفرست — هر چیزی:\n"
                     "• 📝 متن و لینک\n"
                     "• 🖼 عکس / 🎬 ویدیو / 🎤 ویس / 📎 فایل / 🎨 استیکر\n"
                     "• 🖼🖼 آلبوم (چند مدیا با هم)\n\n"
                     "هر پیام به ترتیب ثبت می‌شود؛ چند پیام پشت‌سرهم هم اشکال ندارد.\n"
                     "تمام شد؟ دکمه‌ی «✅ تمام شد» را بزن.\n\n"
                     "<i>/cancel برای لغو</i>",
-                    [[B("✅ تمام شد — ذخیره", "a:tut_done", "success")],
-                     [B("⬅️ بازگشت", "a:tut")]])
+                    [[done], [B("⬅️ بازگشت", "a:tut")]])
+            if k == "tut_items":
+                return await self.tut_admin_content(ev)
+            if k.startswith("tut_di:") or k == "tut_dall":
+                if k == "tut_dall":
+                    self.tut_content_clear("tut_set")
+                    self.db.log(uid, "tut_items_del", "همه")
+                    return await self.edit(ev,
+                        "🗑 همه‌ی محتوای آموزش فعال‌سازی پاک شد.\n"
+                        "از این به بعد متن پیش‌فرض برای کاربر می‌رود.",
+                        [[B("📤 ثبت محتوا", "a:tut_set", "success")],
+                         [B("⬅️ بازگشت", "a:tut")]])
+                idx = int(digits(k.split(":")[-1]) or -1)
+                left = self.tut_content_del("tut_set", 0, idx)
+                if left is None:
+                    return await self.edit(ev, "این آیتم پیدا نشد.",
+                                           [[B("📦 مدیریت محتوا", "a:tut_items",
+                                               "primary")],
+                                            [B("⬅️ بازگشت", "a:tut")]])
+                self.db.log(uid, "tut_item_del", f"#{idx}")
+                await self.say(uid,
+                    f"🗑 آن آیتم پاک شد.\n📦 {_fa_digits(left)} پیام باقی ماند.",
+                    key=f"tut:del:{left}:{int(time.time())}")
+                return await self.tut_admin_content(ev)
             if k == "tut_done":
                 st_tut = self.fsm.get(uid) or {}
+                mode = st_tut.get("mode") or "replace"
                 pend = st_tut.get("tut_pending") or []
                 if not pend:
                     return await self.edit(ev,
@@ -7845,13 +8112,18 @@ class Manager:
                         [[B("✅ تمام شد — ذخیره", "a:tut_done", "success")],
                          [B("⬅️ بازگشت", "a:tut")]])
                 self.fsm.pop(uid, None)
+                _c0, ids0 = self.tut_src()
+                had = 0 if mode == "append" else len(ids0 or [])
                 self.cfg["tut_chat"] = st_tut.get("tut_chat") or uid
                 self.cfg["tut_ids"] = pend
                 self.cfg.save()
-                self.db.log(uid, "tut_set", f"{len(pend)} پیام")
+                self.db.log(uid, "tut_set", f"{len(pend)} پیام ({mode})")
                 return await self.edit(ev,
                     f"✅ <b>آموزش فعال‌سازی ذخیره شد</b>\n"
-                    f"📦 {_fa_digits(len(pend))} پیام ثبت شد.\n\n"
+                    + (f"➕ {_fa_digits(had)} پیام قبلی ماند و "
+                       f"{_fa_digits(len(pend) - had)} پیام تازه به آخرش اضافه شد.\n"
+                       if mode == "append" and len(pend) > had else "")
+                    + f"📦 مجموع: {_fa_digits(len(pend))} پیام.\n\n"
                     "از «👁 پیش‌نمایش» ببین کاربر دقیقاً چه می‌گیرد.",
                     [[B("👁 پیش‌نمایش", "a:tut_view", "primary")],
                      [B("🎬 صفحه‌ی آموزش", "a:tut")]])
@@ -8239,6 +8511,7 @@ class Manager:
             if k.startswith("sec_done"):
                 st_sec = self.fsm.get(uid) or {}
                 sid = int(st_sec.get("sec_id") or 0)
+                mode = st_sec.get("mode") or "replace"
                 pend = list(st_sec.get("tut_pending") or [])
                 kb_back = ([[B("🧩 همان بخش", f"a:sec:{sid}", "success")]]
                            if sid else [])
@@ -8253,29 +8526,51 @@ class Manager:
                         "اول محتوا را بفرست (ویدیو، عکس، متن…)، بعد «✅ تمام شد».",
                         kb)
                 self.fsm.pop(uid, None)
+                s_before = self.tut_find(sid) or {}
+                had = 0 if mode == "append" else len(s_before.get("ids") or [])
                 chat = int(st_sec.get("tut_chat") or uid)
                 self.tut_update(sid, chat=chat, ids=pend)
-                self.db.log(uid, "sec_set", f"#{sid} {len(pend)} پیام")
+                self.db.log(uid, "sec_set", f"#{sid} {len(pend)} پیام ({mode})")
                 s = self.tut_find(sid) or {"name": "", "id": sid}
                 return await self.edit(ev,
                     f"✅ <b>محتوای بخش ذخیره شد</b>\n{self.LINE}\n"
                     f"🧩 {s.get('name')}\n"
-                    f"📦 {_fa_digits(len(pend))} پیام ثبت شد.\n\n"
-                    "از «👁 پیش‌نمایش» ببین کاربر دقیقاً چه می‌گیرد.",
+                    + (f"➕ {_fa_digits(had)} پیام قبلی ماند و "
+                       f"{_fa_digits(len(pend) - had)} پیام تازه به آخرش اضافه شد.\n"
+                       if mode == "append" and len(pend) > had else "")
+                    + f"📦 مجموع: {_fa_digits(len(pend))} پیام.\n\n"
+                    "از «👁 پیش‌نمایش» ببین کاربر دقیقاً چه می‌گیرد؛\n"
+                    "با «📦 مدیریت محتوا» هم می‌توانی هر کدام را جدا پاک کنی.",
                     [[B("👁 پیش‌نمایش", f"a:sec_vw:{sid}", "primary")],
+                     [B("📦 مدیریت محتوا", f"a:sec_items:{sid}", "primary")],
                      [B("🎛 زمان ارسال", f"a:sec_when:{sid}", "primary")],
                      back_btn("a:secs")])
-            if k.startswith("sec_set:"):
-                sid = int(digits(k[8:]) or 0)
+            if k.startswith("sec_add:") or k.startswith("sec_set:"):
+                append = k.startswith("sec_add:")
+                sid = int(digits(k.split(":", 1)[1]) or 0)
                 s = self.tut_find(sid)
                 if not s:
                     return await self.edit(ev, "این بخش پیدا نشد.",
                                            [back_btn("a:secs")])
-                self.fsm[uid] = {"step": "sec_set", "sec_id": sid,
-                                 "tut_chat": 0, "tut_pending": []}
+                mode, had = self.tut_capture_start(uid, "sec_set", sid=sid,
+                                                   append=append)
+                done = B("✅ تمام شد — ذخیره", f"a:sec_done:{sid}", "success")
+                if mode == "append":
+                    return await self.edit(ev,
+                        f"➕ <b>افزودن به محتوای «{s['name']}»</b>\n{self.LINE}\n"
+                        f"📦 {_fa_digits(had)} پیام قبلی <b>سر جایش می‌ماند</b>؛ "
+                        "هرچه الان بفرستی به <b>آخرِ</b> همان‌ها اضافه می‌شود.\n\n"
+                        "ویدیو/عکس/ویس/متن را همین‌جا بفرست — چند پیام "
+                        "پشت‌سرهم هم اشکال ندارد.\n"
+                        "تمام شد؟ «✅ تمام شد — ذخیره» را بزن.\n\n"
+                        "<i>هر دکمه‌ی دیگر = لغو (چیزی ذخیره یا پاک نمی‌شود)</i>",
+                        [[done], [B("⬅️ بخش", f"a:sec:{sid}")]])
                 return await self.edit(ev,
                     f"📤 <b>ثبت محتوای «{s['name']}»</b>\n{self.LINE}\n"
-                    "محتوا را <b>همین‌جا</b> بفرست — هر چیزی:\n"
+                    + (f"⚠️ {_fa_digits(had)} پیامِ ثبت‌شده <b>جایگزین</b> می‌شود؛ "
+                       "اگر می‌خواهی قبلی‌ها بمانند «➕ افزودن به محتوا» را بزن.\n\n"
+                       if had else "")
+                    + "محتوا را <b>همین‌جا</b> بفرست — هر چیزی:\n"
                     "• 📝 متن و لینک\n"
                     "• 🎬 ویدیو / 🖼 عکس / 🎤 ویس / 📎 فایل / 🎨 استیکر\n"
                     "• 🖼🖼 آلبوم (چند مدیا با هم)\n\n"
@@ -8283,8 +8578,36 @@ class Manager:
                     "متن و کپشن‌ها دست‌نخورده می‌مانند.\n"
                     "تمام شد؟ «✅ تمام شد — ذخیره» را بزن.\n\n"
                     "<i>هر دکمه‌ی دیگر = لغو</i>",
-                    [[B("✅ تمام شد — ذخیره", f"a:sec_done:{sid}", "success")],
-                     [B("⬅️ بخش", f"a:sec:{sid}")]])
+                    [[done], [B("⬅️ بخش", f"a:sec:{sid}")]])
+            if k.startswith("sec_items:"):
+                sid = int(digits(k.split(":", 1)[1]) or 0)
+                return await self.tut_admin_items(ev, sid)
+            if k.startswith("sec_di:") or k.startswith("sec_dall:"):
+                sid = int(digits(k.split(":")[1]) or 0)
+                if not self.tut_find(sid):
+                    return await self.edit(ev, "این بخش پیدا نشد.",
+                                           [back_btn("a:secs")])
+                if k.startswith("sec_dall:"):
+                    self.tut_content_clear("sec_set", sid)
+                    self.db.log(uid, "sec_items_del", f"#{sid} همه")
+                    return await self.edit(ev,
+                        f"🗑 همه‌ی محتوای «{self.tut_sec_label(self.tut_find(sid))}» "
+                        "پاک شد.",
+                        [[B("➕ افزودن به محتوا", f"a:sec_add:{sid}", "success")],
+                         [B("⬅️ بخش", f"a:sec:{sid}")], back_btn("a:secs")])
+                parts = k.split(":")
+                idx = int(digits(parts[2]) if len(parts) > 2 else -1)
+                left = self.tut_content_del("sec_set", sid, idx)
+                if left is None:
+                    return await self.edit(ev, "این آیتم پیدا نشد.",
+                                           [[B("📦 مدیریت محتوا",
+                                               f"a:sec_items:{sid}", "primary")],
+                                            [B("⬅️ بخش", f"a:sec:{sid}")]])
+                self.db.log(uid, "sec_item_del", f"#{sid} آیتم {idx}")
+                await self.say(uid,
+                    f"🗑 آن آیتم پاک شد.\n📦 {_fa_digits(left)} پیام باقی ماند.",
+                    key=f"sec:del:{sid}:{left}:{int(time.time())}")
+                return await self.tut_admin_items(ev, sid)
             if k == "fjoin":
                 rows = self.force_chans()
                 txt = [f"📣 <b>جوین اجباری</b>", self.LINE,
@@ -12981,29 +13304,26 @@ class Manager:
                     is_sample = stp == "sample_set"
                     pending_key = "sample_pending" if is_sample else "tut_pending"
                     chat_key = "sample_chat" if is_sample else "tut_chat"
+                    mode = st0.get("mode") or "replace"
+                    src_chat = int(st0.get(chat_key) or 0)
+                    if (not is_sample and mode == "append" and src_chat
+                            and int(ev.chat_id or 0) != src_chat):
+                        # محتوای قبلی در چتِ دیگری ثبت شده و یک لیستِ پیام فقط
+                        # یک چتِ منبع دارد؛ هیچ چیزی دست نمی‌خورد تا محتوای
+                        # قبلیِ مدیر پاک یا قاطی نشود.
+                        return await self.say(ev.chat_id,
+                            "⚠️ <b>این پیام ثبت نشد</b>\n\n"
+                            "محتوای قبلیِ این آموزش در چتِ دیگری ثبت شده و "
+                            "نمی‌شود پیامِ چتِ دیگر را به آن چسباند.\n"
+                            "محتوا را در <b>همان چتی</b> بفرست که قبلی‌ها را "
+                            "فرستاده بودی، یا از «📤 ثبت / تغییر محتوا "
+                            "(جایگزینی)» از اول ثبت کن.",
+                            key=f"tut:chatdiff:{int(time.time())}")
                     pend = st0.setdefault(pending_key, [])
                     st0.setdefault(chat_key, ev.chat_id)
+                    had_before = len(pend)
                     pend.append(ev.id)
-                    if ev.photo:
-                        kind = "🖼 عکس"
-                    elif getattr(ev, "video", None):
-                        kind = "🎬 ویدیو"
-                    elif getattr(ev, "gif", None):
-                        kind = "🎞 گیف"
-                    elif getattr(ev, "voice", None):
-                        kind = "🎤 ویس"
-                    elif getattr(ev, "audio", None):
-                        kind = "🎵 آهنگ"
-                    elif getattr(ev, "sticker", None):
-                        kind = "🎨 استیکر"
-                    elif getattr(ev, "document", None):
-                        kind = "📎 فایل"
-                    elif getattr(ev, "contact", None):
-                        kind = "👤 مخاطب"
-                    elif text:
-                        kind = "📝 متن"
-                    else:
-                        kind = "💬 پیام"
+                    kind = self._content_kind(m=ev, text=text)
                     if is_sample:
                         head = "🎞 نمونه‌های جفج رفتن ربات\n"
                         btn = "a:sample_done"
@@ -13014,9 +13334,13 @@ class Manager:
                     else:
                         head = ""
                         btn = "a:tut_done"
+                    tail = (f"➕ {_fa_digits(had_before)} پیام قبلی + "
+                            f"{_fa_digits(len(pend) - had_before)} پیام تازه\n"
+                            if mode == "append" and had_before else "")
                     return await self.say(ev.chat_id,
                         f"➕ ثبت شد: {kind}\n"
                         f"📦 مجموع: {_fa_digits(len(pend))} پیام\n"
+                        f"{tail}"
                         f"{head}"
                         "<i>تمام شد؟ دکمه‌ی «✅ تمام شد — ذخیره» در پیامِ بالا را بزن.</i>",
                         [[B("✅ تمام شد — ذخیره", btn, "success")]])
