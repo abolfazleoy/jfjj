@@ -390,7 +390,7 @@ async def main():
             return True, "spy"
         m9.backup_once = _spy
         started = m9._reanchor_backup("تست")
-        await asyncio.sleep(4.0)
+        await asyncio.sleep(6.0)
         check("P9a_reanchor_scheduled", started is True)
         check("P9b_reanchor_makes_backup", hits["n"] == 1, hits)
 
@@ -408,7 +408,7 @@ async def main():
         m10.backup_once = _spy
         before = hits["n"]
         m10._reanchor_backup("خالی")
-        await asyncio.sleep(4.0)
+        await asyncio.sleep(6.0)
         check("P9c_reanchor_skips_empty_db", hits["n"] == before, hits)
     except Exception as e:
         import traceback
@@ -444,6 +444,10 @@ def main():
     env["FAKE_BACKUP_DIR"] = STORE
     env["PORT"] = "8371"
     env["BACKUP_CHAT"] = "111"
+    # پیش‌فرضِ production برای بازسازیِ پشتیبان ۲۰ ثانیه تأخیر دارد؛ در تست
+    # صفر می‌کنیم تا سناریوها سریع بمانند.
+    env["JAFJ_REANCHOR_DELAY"] = "1"
+    env["JAFJ_MIN_FREE_MB"] = "0"
     for k in ("BOT_TOKEN", "API_ID", "API_HASH", "ADMIN_IDS", "BACKUP_EVERY"):
         env.pop(k, None)
     p = subprocess.run([sys.executable, "-c", DRIVER], cwd=APP, env=env,

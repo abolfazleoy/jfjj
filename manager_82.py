@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import traceback
 import zipfile
 
 # --- فیکس آف شدن بعد 30 دقیقه بدون فعالیت (Railway) - وب سرور سالم ---
@@ -882,6 +883,155 @@ CONFIG_FILE = os.path.join(BASE_DIR, "manager_config.json")
 DB_FILE = os.path.join(BASE_DIR, "manager.db")
 CLIENTS_DIR = os.path.join(BASE_DIR, "clients")
 
+# ═══════════════════════════════════════════════════════════════════════
+#  کرش و پایداریِ داده
+#
+#  چرا این بخش لازم شد: روی میزبانی که دیسکِ ماندگار ندارد (یا Disk روی
+#  مسیرِ اشتباه مانت شده)، هر کرش/ری‌استارت پوشه‌ی داده را از نو می‌سازد.
+#  یعنی «ربات اطلاعات را گرفته بود» ولی با اولین کرش همه‌چیز رفت. تنها
+#  چیزی که از کرش جان سالم به‌در می‌برد، یک نسخه‌ی بیرونی است (تلگرام یا
+#  گیت‌هاب). پس این بخش:
+#    ۱) هر تغییرِ مهم را بلافاصله (با تأخیرِ کوتاه) به گیت‌هاب می‌فرستد؛
+#    ۲) کرش را با دلیلش در crash.log ثبت می‌کند تا دفعه‌ی بعد معلوم باشد؛
+#    ۳) هنگامِ مرگِ غیرمنتظره هم یک «ذخیره‌ی نجات» می‌زند.
+# ═══════════════════════════════════════════════════════════════════════
+
+# «سرد» بوت شدیم؟ یعنی پوشه‌ی داده از قبل هیچ دیتابیسی نداشت — نشانه‌ی
+# قویِ اینکه دیسک پاک شده (یا ماندگار نیست).
+COLD_START = not os.path.exists(DB_FILE)
+# رکوردِ آخرین خروجِ ناظر (railway-start.sh) — برای گزارشِ «چرا مرد».
+LAST_EXIT_FILE = os.path.join(BASE_DIR, ".jafj_last_exit")
+CRASH_LOG_FILE = os.path.join(BASE_DIR, "crash.log")
+
+_CRASH_LOCK = threading.Lock()
+_CRASH_MAX_BYTES = 256 * 1024
+
+# هوک‌هایی که Manager وصل می‌کند؛ DB/Config هم می‌توانند صدایش بزنند بدون
+# اینکه به کلاس Manager وابسته باشند.
+_DATA_TOUCH = [None]          # callable(reason) → None
+
+
+def touch_data(reason=""):
+    """«داده عوض شد» را به Manager خبر بده (بدون هیچ خطری اگر وصل نباشد)."""
+    fn = _DATA_TOUCH[0]
+    if not fn:
+        return False
+    try:
+        fn(reason)
+        return True
+    except Exception:
+        return False
+
+
+def log_crash(reason, detail=""):
+    """یک بلوک به crash.log اضافه کن (چرخشی، حداکثر ۲۵۶KB)."""
+    try:
+        with _CRASH_LOCK:
+            d = os.path.dirname(CRASH_LOG_FILE) or "."
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(CRASH_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} [{reason}] "
+                        f"build={BUILD_VERSION} pid={os.getpid()} "
+                        f"host={HOST_LABEL} =====\n")
+                tail = (detail or "").strip()
+                f.write((tail[-8000:] if len(tail) > 8000 else tail) + "\n")
+            try:
+                if os.path.getsize(CRASH_LOG_FILE) > _CRASH_MAX_BYTES:
+                    with open(CRASH_LOG_FILE, encoding="utf-8",
+                              errors="ignore") as f:
+                        keep = f.read()[-_CRASH_MAX_BYTES // 2:]
+                    with open(CRASH_LOG_FILE, "w", encoding="utf-8") as f:
+                        f.write(keep)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def read_crash_log(max_bytes=4000):
+    """بخشِ آخرِ crash.log (برای پیامِ مدیر و /diag)."""
+    try:
+        with open(CRASH_LOG_FILE, encoding="utf-8", errors="ignore") as f:
+            return f.read()[-max_bytes:].strip()
+    except Exception:
+        return ""
+
+
+def crash_blocks(within_secs=None):
+    """بلوک‌های crash.log → [(ts, reason, body), …] (تازه‌ترین آخر)."""
+    out = []
+    try:
+        with open(CRASH_LOG_FILE, encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+    except Exception:
+        return out
+    cur = None
+    for line in txt.splitlines():
+        if line.startswith("=====") and "[" in line:
+            if cur:
+                out.append(cur)
+            ts = 0
+            try:
+                stamp = line.split("=====")[1].strip().split()[0] + " " + \
+                    line.split("=====")[1].strip().split()[1]
+                ts = int(time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")))
+            except Exception:
+                ts = 0
+            reason = ""
+            try:
+                reason = line.split("[", 1)[1].split("]", 1)[0]
+            except Exception:
+                pass
+            cur = (ts, reason, [])
+        elif cur is not None:
+            cur[2].append(line)
+    if cur:
+        out.append(cur)
+    res = [(ts, r, "\n".join(b).strip()) for ts, r, b in out]
+    if within_secs:
+        cutoff = int(time.time()) - int(within_secs)
+        res = [x for x in res if x[0] >= cutoff]
+    return res
+
+
+def last_exit_info():
+    """آخرین خروجِ ثبت‌شده توسط railway-start.sh → dict یا {}."""
+    try:
+        with open(LAST_EXIT_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def write_last_exit(code, uptime=0, note=""):
+    try:
+        with open(LAST_EXIT_FILE, "w", encoding="utf-8") as f:
+            json.dump({"code": int(code), "uptime": int(uptime or 0),
+                       "ts": now(), "note": note,
+                       "build": BUILD_VERSION}, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def mem_available_mb():
+    """حافظه‌ی آزاد (MB) یا None اگر معلوم نبود."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return max(0, int(rss) // 1024)
+    except Exception:
+        return None
+
 # سلف فقط 95.py است - 77/78 پاک میشوند
 SELF_NAMES = ("95.py",)
 # فقط «نام» فایل — برای ساختن مسیر داخل پوشه‌ی مشتری. هیچ‌وقت SELFBOT کامل
@@ -1240,8 +1390,8 @@ BOT_TOKEN = "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1028-restore-ref"
-BUILD_TAG = "JAFJ_MANAGER_82_v1028-restore-ref_2026_10_28"
+BUILD_VERSION = "v1028-crashsafe"
+BUILD_TAG = "JAFJ_MANAGER_82_v1028-crashsafe_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -1928,6 +2078,11 @@ class Config:
             os.chmod(CONFIG_FILE, 0o600)
         except Exception:
             pass
+        # تنظیمات عوض شد → نسخه‌ی بیرونی هم باید تازه شود (کرش نباید ببردش)
+        try:
+            touch_data("config")
+        except Exception:
+            pass
 
     def __getitem__(self, k):
         return self.d[k]
@@ -2053,12 +2208,25 @@ class DB:
         self.x("INSERT INTO clients (uid,username,name,created_at,expires_at,status)"
                " VALUES (?,?,?,?,?,?)", (uid, username, name, now(), exp, status))
 
+    # ستون‌هایی که تغییرشان «داده‌ی مشتری» است و باید سریع بیرون ذخیره شود.
+    # عمداً started_at/restarts اینجا نیستند: watchdog هر ۳۰ ثانیه عوضشان
+    # می‌کند و اگر آن‌ها هم trigger بودند، هر ۳۰ ثانیه یک sync می‌رفت.
+    CRITICAL_COLS = ("session", "phone", "tg_id", "status", "expires_at",
+                     "trial_expires_at", "trial_started_at", "trial_used",
+                     "current_plan_id", "max_accounts", "want_on",
+                     "phone_verified", "rules_accepted")
+
     def set(self, uid, **kw):
         if not kw:
             return
         cols = ",".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE clients SET {cols} WHERE uid=?",
                tuple(kw.values()) + (uid,))
+        try:
+            if any(k in self.CRITICAL_COLS for k in kw):
+                touch_data("clients")
+        except Exception:
+            pass
 
     def all(self, status=None):
         if status:
@@ -2985,7 +3153,11 @@ ADMIN_HELP = """🛠 <b>پنل مدیر</b>
 
 <b>♻️ بعد از آپدیت</b>
 /onall — همه‌ی سرویس‌هایی که باید روشن باشند را روشن کن
-(بعد از هر آپدیت/بازیابی خودکار هم همین کار انجام می‌شود)"""
+(بعد از هر آپدیت/بازیابی خودکار هم همین کار انجام می‌شود)
+
+<b>🔍 عیب‌یابی</b>
+/diag — چرا داده می‌پرد یا چرا کرش می‌کند؟
+(دیسک، نسخه‌ی بیرونی، کرش‌های آخر، حافظه)"""
 
 
 
@@ -3110,6 +3282,7 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("💳 شماره کارت", "a:card", "primary")],
         [B("🎯 آمار امتیاز", "a:pstats", "success"),
          B("🩺 سلامت سیستم", "a:doctor", "success")],
+        [B("🔍 عیب‌یابی (کرش/دیسک/پشتیبان)", "a:diag", "primary")],
         [B("🎬 آموزش فعال‌سازی", "a:tut", "success"),
          B("🧩 بخش‌های آموزش", "a:secs", "success")],
         [B("🗂 توضیحات (فهرست تپ‌کردنی)", "a:hub", "success"),
@@ -3153,6 +3326,197 @@ class Manager:
         self._restore_tries = 0          # چند تلاشِ بازیابی موقع بوت انجام شد
         self._boot_last = (0, 0, 0)      # (شروع‌شده, ناموفق, بدون‌اعتبار)
         self._loop = None                # حلقه‌ی asyncio (در run ست می‌شود)
+        # ── پایداریِ داده در برابر کرش ──
+        self._sync_lock = threading.Lock()
+        self._dirty_at = 0.0             # آخرین تغییرِ مهم
+        self._dirty_reason = ""
+        self._flush_thread = None
+        self._last_flush = 0.0           # آخرین pushِ موفق (throttle)
+        self._flushed_on_exit = False
+        self._crash_hooks_done = False
+        self._boot_notice = []           # خطوطِ هشدار برای پیامِ «بالا آمد»
+
+    # ---------- پایداریِ داده (کرش نباید اطلاعات را ببرد) ----------
+    def _gh_sync_cmd(self):
+        """فرمانِ pushِ سینکِ گیت‌هاب، یا None اگر توکن/ابزار نبود."""
+        if not (os.environ.get("DATA_GITHUB_TOKEN") or "").strip():
+            return None
+        tool = os.path.join(image_dir(), "tools", "gh_data_sync.py")
+        if not os.path.isfile(tool):
+            tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tools", "gh_data_sync.py")
+        if not os.path.isfile(tool):
+            return None
+        return [sys.executable, tool, "push"]
+
+    def _run_gh_sync(self, why="", timeout=180):
+        """pushِ همگام (در thread جدا صدا زده می‌شود؛ قفل دارد)."""
+        cmd = self._gh_sync_cmd()
+        if not cmd:
+            return False
+        if not self._sync_lock.acquire(timeout=5):
+            print("  ☁️ سینکِ گیت‌هاب: یک pushِ دیگر در حال اجراست — رد شد",
+                  flush=True)
+            return False
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=max(20, int(timeout)))
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            ok = (r.returncode == 0)
+            print(f"  {'☁️' if ok else '⚠️'} سینکِ گیت‌هاب ({why or 'دوره‌ای'}): "
+                  f"{out[-300:]}", flush=True)
+            if ok:
+                self._last_flush = time.time()
+            return ok
+        except Exception as e:
+            print(f"  ⚠️ سینکِ گیت‌هاب ({why or 'دوره‌ای'}): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return False
+        finally:
+            self._sync_lock.release()
+
+    def _push_gh_sync(self, why=""):
+        """push در پس‌زمینه (بدون بلاک‌کردنِ ربات)."""
+        if not self._gh_sync_cmd():
+            return False
+        threading.Thread(target=self._run_gh_sync, args=(why,),
+                         daemon=True).start()
+        return True
+
+    def _flush_durable(self, why="", timeout=180, force=False):
+        """همین حالا داده را بیرون از این ماشین ذخیره کن.
+
+        فقط گیت‌هاب (اگر توکن هست) — چون فقط همان از «پاک‌شدنِ دیسک» جان
+        سالم به‌در می‌برد. throttle دارد تا تغییرهای پشتِ‌سرهم، push نسازند.
+        """
+        if self._gh_sync_cmd():
+            if not force and (time.time() - self._last_flush) < 45:
+                return False
+            return self._run_gh_sync(why or "تغییرِ داده", timeout=timeout)
+        # ── بدون گیت‌هاب: تنها نسخه‌ی بیرونی، پیامِ پشتیبان در تلگرام است ──
+        # پس بعد از هر تغییرِ مهم (با فاصله‌ی حداقل ۲ دقیقه) همان تک‌پیام
+        # به‌روز می‌شود. کرشِ ناگهانی حداکثر ~۲ دقیقه داده را می‌برد، نه کلِ
+        # آن روز. (فقط یک بار در هر ۲ دقیقه، وگرنه FloodWait می‌خوریم.)
+        if self.bot is None or self._loop is None:
+            return False
+        if not force and (time.time() - self._last_flush) < 120:
+            return False
+
+        async def _tg():
+            try:
+                ok, msg = await self.backup_once(force=False)
+                if ok:
+                    self._last_flush = time.time()
+                elif "بدون تغییر" not in (msg or ""):
+                    print(f"  ℹ️ پشتیبانِ فوری ({why or 'تغییر'}): {msg}",
+                          flush=True)
+            except Exception as e:
+                print(f"  ⚠️ پشتیبانِ فوری: {type(e).__name__}: {e}", flush=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_tg(), self._loop)
+            return True
+        except Exception as e:
+            print(f"  ⚠️ پشتیبانِ فوری: {type(e).__name__}", flush=True)
+            return False
+
+    def _touch_data(self, reason=""):
+        """تغییرِ مهم ثبت شد → یک flushِ کوتاهِ تأخیری (debounce) بزن.
+
+        تأخیر عمدی است: ثبتِ سشن/تنظیمات معمولاً چند نوشتنِ پشتِ‌سرهم دارد و
+        نمی‌خواهیم برای هر کدام یک push برود. ۲۰ ثانیه بعد از «آخرین»
+        تغییر می‌رود، پس حداکثر ۲۰ ثانیه داده در معرضِ کرش است — نه ۳۰ دقیقه.
+        """
+        try:
+            self._dirty_at = time.time()
+            self._dirty_reason = reason or "تغییر"
+        except Exception:
+            pass
+        th = getattr(self, "_flush_thread", None)
+        if th is not None and th.is_alive():
+            return True               # همان تایمر، آخرین وضعیت را می‌فرستد
+
+        def _later():
+            gap_sec = 20.0
+            try:
+                gap_sec = max(5.0, float(os.environ.get("JAFJ_FLUSH_SEC", "20") or 20))
+            except Exception:
+                gap_sec = 20.0
+            for _ in range(int(600 / max(5, gap_sec))):   # حداکثر ۱۰ دقیقه صبر
+                time.sleep(1.0)
+                if (time.time() - self._dirty_at) >= gap_sec:
+                    break
+            self._dirty_at = 0.0
+            self._flush_durable(self._dirty_reason or "تغییرِ داده")
+
+        try:
+            self._flush_thread = threading.Thread(target=_later, daemon=True)
+            self._flush_thread.start()
+        except Exception:
+            return False
+        return True
+
+    def _atexit_flush(self):
+        """اگر پروسه از راهِ غیرمنتظره بسته شد، آخرین ذخیره را بزن."""
+        if self._flushed_on_exit:
+            return
+        self._flushed_on_exit = True
+        try:
+            if self._dirty_at or True:
+                log_crash("exit", f"خروجِ پروسه (uptime={int(time.time() - self.boot_at)}s)")
+        except Exception:
+            pass
+        try:
+            self._flush_durable("خروجِ پروسه", timeout=45, force=True)
+        except Exception:
+            pass
+
+    def _install_crash_hooks(self):
+        """هر مرگِ غیرمنتظره را ثبت و «ذخیره‌ی نجات» را اجرا کن."""
+        if self._crash_hooks_done:
+            return
+        self._crash_hooks_done = True
+
+        def _on_exc(exc_type, exc, tb):
+            try:
+                txt = "".join(traceback.format_exception(exc_type, exc, tb))
+            except Exception:
+                txt = f"{exc_type}: {exc}"
+            log_crash("uncaught", txt)
+            try:
+                self._flush_durable("کرشِ ربات", timeout=45, force=True)
+            except Exception:
+                pass
+            try:
+                sys.__excepthook__(exc_type, exc, tb)
+            except Exception:
+                pass
+
+        try:
+            sys.excepthook = _on_exc
+        except Exception:
+            pass
+
+        def _on_thread(args):
+            try:
+                txt = (f"{args.exc_type.__name__}: {args.exc_value}\n"
+                       + "".join(traceback.format_tb(args.exc_traceback)))
+            except Exception:
+                txt = "thread exception"
+            log_crash("thread", txt)
+        try:
+            threading.excepthook = _on_thread
+        except Exception:
+            pass
+        try:
+            import atexit
+            atexit.register(self._atexit_flush)
+        except Exception:
+            pass
+        try:
+            _DATA_TOUCH[0] = self._touch_data
+        except Exception:
+            pass
 
     # ---------- بالا آوردنِ سرویس‌ها بعد از آپدیت/بازیابی ----------
     def _spawn_boot(self, notify_admins=False, why="", force_restart=False):
@@ -3220,35 +3584,6 @@ class Manager:
         self._reanchor_backup(why)
         return n_want
 
-    def _push_gh_sync(self, why=""):
-        """همین حالا یک push در سینکِ گیت‌هاب بزن (اگر توکن تنظیم شده باشد).
-
-        چرا دستی؟ حلقهٔ `gh_data_sync loop` هر ۳۰ دقیقه یک‌بار push می‌کند؛
-        اگر بین بازیابی و دیپلویِ بعدی این ۳۰ دقیقه پر نشود، دادهٔ تازه‌ی
-        بازیابی‌شده هیچ‌جا ماندگار نیست. این تابع همان شکاف را می‌بندد.
-        """
-        if not (os.environ.get("DATA_GITHUB_TOKEN") or "").strip():
-            return False
-        tool = os.path.join(image_dir(), "tools", "gh_data_sync.py")
-        if not os.path.isfile(tool):
-            tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tools", "gh_data_sync.py")
-        if not os.path.isfile(tool):
-            return False
-
-        def _run():
-            try:
-                r = subprocess.run([sys.executable, tool, "push"],
-                                   capture_output=True, text=True, timeout=180)
-                print(f"  ☁️ سینکِ گیت‌هاب ({why or 'دستی'}): "
-                      f"{(r.stdout or r.stderr or '').strip()[-300:]}", flush=True)
-            except Exception as e:
-                print(f"  ⚠️ سینکِ گیت‌هاب ({why or 'دستی'}): "
-                      f"{type(e).__name__}: {e}", flush=True)
-
-        threading.Thread(target=_run, daemon=True).start()
-        return True
-
     def _reanchor_backup(self, reason=""):
         """بعد از بازیابی، تک‌پیامِ پشتیبان را بازسازی و اشاره‌گرش را ثبت کن.
 
@@ -3260,7 +3595,27 @@ class Manager:
 
         async def _go():
             try:
-                await asyncio.sleep(3)      # بگذار سشن‌ها/دیتابیس جا بیفتند
+                try:
+                    _delay = float(os.environ.get("JAFJ_REANCHOR_DELAY", "20") or 20)
+                except Exception:
+                    _delay = 20.0
+                try:
+                    _min_free = int(os.environ.get("JAFJ_MIN_FREE_MB", "150") or 150)
+                except Exception:
+                    _min_free = 150
+                await asyncio.sleep(max(0.0, _delay))  # بگذار سشن‌ها جا بیفتند
+                # ساختِ zip حافظه می‌خواهد؛ بلافاصله بعد از بازیابی که چند
+                # سلف هم دارند بالا می‌آیند، این می‌تواند OOM کند و همان
+                # «کرش بعد از بازیابی» را بسازد.
+                free = mem_available_mb()
+                if free is not None and free < _min_free:
+                    log_crash("backup-skipped-low-mem", f"free={free}MB")
+                    print(f"  ⚠️ حافظه‌ی آزاد {free}MB است — بازسازیِ پشتیبان "
+                          "به تعویق افتاد", flush=True)
+                    await asyncio.sleep(60)
+                    free = mem_available_mb()
+                    if free is not None and free < _min_free:
+                        return
                 try:
                     r = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
                     n = r["c"] if r else 0
@@ -7750,6 +8105,8 @@ class Manager:
                 return await self.edit(ev, text,
                                        [[B("📦 مدیریت بک‌آپ", "a:backup", "primary")],
                                         back_btn("a:home")])
+            if k == "diag":
+                return await self.edit(ev, self.diag_text(), [back_btn("a:home")])
             if k == "onall":
                 # «روشن کردن همه» — همان کاری که بعد از آپدیت/بازیابی خودکار
                 # انجام می‌شود، ولی دستی و با گزارشِ فوری.
@@ -8773,7 +9130,8 @@ class Manager:
                       "addplan", "editplan", "rmplan", "disc", "discs", "give",
                       "tk", "tr", "tclose", "packs", "addpack", "editpack",
                       "rmpack", "gp", "acct", "pstats", "pset", "lim", "admin", "panel",
-                      "backup", "restore", "onall", "all_on"}
+                      "backup", "restore", "onall", "all_on",
+                      "diag", "why", "diagnose"}
         if cmd in ADMIN_ONLY:
             return await self.say(chat,
                 f"🔒 <b>{cmd}</b> فقط برای مدیر است.\n\n"
@@ -8805,6 +9163,8 @@ class Manager:
             ok, msg = await self.restore_from_backup(
                 force=True, ref_chat=ref_chat, ref_msg_id=ref_mid)
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
+        if cmd in ("diag", "why", "diagnose"):
+            return await self.say(chat, self.diag_text())
         if cmd in ("onall", "all_on"):
             # دستور عجله‌ایِ مدیر: «همه‌ی سرویس‌هایی که باید روشن باشند را
             # همین حالا روشن کن» — همان چیزی که بعد از آپدیت لازم است.
@@ -11968,9 +12328,115 @@ class Manager:
         return ok, msg
 
 
+    def diag_text(self):
+        """🔍 عیب‌یابی: چرا داده می‌پرد / چرا کرش می‌کند؟ (همه در یک نگاه)"""
+        L = self.LINE
+        try:
+            n = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")["c"]
+        except Exception:
+            n = -1
+        try:
+            n_want = len(self.db.wanted())
+        except Exception:
+            n_want = -1
+        data_dir = os.path.abspath(BASE_DIR)
+        writable = "✅" if os.access(data_dir, os.W_OK) else "❌ فقط‌خواندنی"
+        token = bool((os.environ.get("DATA_GITHUB_TOKEN") or "").strip())
+        try:
+            up = int(time.time() - self.boot_at)
+        except Exception:
+            up = 0
+        free = mem_available_mb()
+        dbsz = ""
+        try:
+            if os.path.isfile(DB_FILE):
+                dbsz = f"{os.path.getsize(DB_FILE) // 1024}KB"
+        except Exception:
+            dbsz = ""
+        t = [f"🔍 <b>عیب‌یابی</b>\n{L}",
+             f"📂 داده: <code>{data_dir}</code> ({writable})",
+             f"🧊 بوت سرد: {'بله — دیسک پاک شده بود' if COLD_START else 'نه'}",
+             f"👥 مشتری: {_fa_digits(n)} · باید روشن: {_fa_digits(n_want)}"
+             f" · روشن: {_fa_digits(self.sup.running_count())}",
+             f"🗄 دیتابیس: {dbsz or '—'}",
+             f"☁️ نسخه‌ی بیرونی (گیت‌هاب): "
+             f"{'✅ فعال' if token else '❌ تنظیم نشده — کرش = پاک‌شدنِ داده'}",
+             f"🧠 حافظه‌ی آزاد: {free}MB" if free is not None else "🧠 حافظه: ؟",
+             f"⏱ بالا: {up // 60} دقیقه"]
+        ex = last_exit_info()
+        if ex:
+            t.append(f"💥 آخرین خروج: کد {ex.get('code')} بعد از "
+                     f"{int(ex.get('uptime') or 0)}s")
+        blocks = crash_blocks()
+        if blocks:
+            t.append("")
+            t.append(f"🧯 <b>کرش‌ها ({_fa_digits(len(blocks))})</b>")
+            for ts, reason, body in blocks[-3:]:
+                when = f"{local_dt(ts):%m-%d %H:%M}" if ts else "?"
+                first = ""
+                for ln in (body or "").splitlines():
+                    ln = ln.strip()
+                    if ln and not ln.startswith("File "):
+                        first = ln[:120]
+                        break
+                t.append(f"  • {when} [{reason}] {first or '—'}")
+        else:
+            t.append("")
+            t.append("🧯 کرشی ثبت نشده ✅")
+        t += [L,
+              "💡 <b>اگر داده می‌پرد:</b> دیسکِ ماندگار روی <code>/data</code> با "
+              "<code>DATA_DIR=/data</code> بگذار، یا "
+              "<code>DATA_GITHUB_TOKEN</code> را تنظیم کن. بدون یکی از این دو، "
+              "هر کرش/دیپلوی دادهٔ دیسک را پاک می‌کند.",
+              "",
+              "<code>.backup</code> پشتیبان فوری · <code>.restore</code> بازیابی "
+              "· <code>/onall</code> روشن‌کردنِ همه"]
+        return "\n".join(t)
+
     # ═══════════════════════════════════════════════
     #  اجرا
     # ═══════════════════════════════════════════════
+    def _startup_notices(self):
+        """هشدارهای بوت: دیسکِ پاک‌شده، کرشِ قبلی، نبودِ نسخه‌ی بیرونی.
+
+        همه‌ی این‌ها همان سؤالِ «چرا اطلاعات می‌پرد؟» را در همان لحظه جواب
+        می‌دهند، به‌جای اینکه مدیر بعد از چند روز خودش حدس بزند.
+        """
+        out = []
+        try:
+            n = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")["c"]
+        except Exception:
+            n = 0
+        token = bool((os.environ.get("DATA_GITHUB_TOKEN") or "").strip())
+        if COLD_START:
+            out.append("🧊 بوت سرد: پوشه‌ی داده از قبل دیتابیس نداشت "
+                       "(دیسک پاک شده یا ماندگار نیست).")
+        # هشدارِ مهم مستقل از بوتِ سرد است: بدونِ نسخه‌ی بیرونی، هر کرشی که
+        # دیسک را نبرد هم، داده‌ی چند دقیقه‌ی آخر را می‌برد.
+        if not token:
+            out.append("⚠️ <b>DATA_GITHUB_TOKEN تنظیم نیست</b> — تنها نسخه‌ی "
+                       "بیرونی، پیامِ پشتیبان در تلگرام است. بدون Diskِ ماندگار "
+                       "روی <code>/data</code>، هر کرش/دیپلوی داده‌ی دیسک را "
+                       "می‌برد. یکی از این دو را فعال کن.")
+        ex = last_exit_info()
+        if ex and ex.get("code"):
+            up = int(ex.get("uptime") or 0)
+            out.append(f"💥 آخرین خروج با کد {ex.get('code')} بعد از "
+                       f"{up}s ({ex.get('build') or '?'})")
+        blocks = crash_blocks(within_secs=6 * 3600)
+        if blocks:
+            last_ts, reason, body = blocks[-1]
+            first = ""
+            for ln in (body or "").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("File "):
+                    first = ln[:160]
+            if not first:
+                first = "(بدون جزئیات)"
+            out.append(f"🧯 {len(blocks)} کرش در ۶ ساعتِ اخیر — آخری "
+                       f"({reason}): {first}")
+        return out
+
     async def run(self):
         try:
             from telethon import TelegramClient, events
@@ -12078,6 +12544,20 @@ class Manager:
             self._loop = asyncio.get_running_loop()
         except Exception:
             self._loop = None
+
+        # ── کرش‌گیری ──
+        # از همین‌جا هر مرگِ غیرمنتظره ثبت می‌شود و یک «ذخیره‌ی نجات» می‌زند،
+        # تا داده‌ی چند دقیقه‌ی آخر با هیچ کرشی از دست نرود.
+        try:
+            self._install_crash_hooks()
+        except Exception as e:
+            print(f"  ⚠️ نصبِ قلاب‌های کرش: {type(e).__name__}", flush=True)
+        try:
+            self._boot_notice = self._startup_notices()
+            for line in self._boot_notice:
+                print("  " + line.replace("<b>", "").replace("</b>", ""), flush=True)
+        except Exception as e:
+            print(f"  ⚠️ گزارشِ وضعیتِ بوت: {type(e).__name__}", flush=True)
 
         # ── بازیابی خودکار از پشتیبان تلگرام (اگر دیتابیس خالی است) ──
         # مقصد از backup_target_raw() خوانده می‌شود که بدون BACKUP_CHAT هم
@@ -12866,14 +13346,19 @@ class Manager:
                 except Exception:
                     pass
 
+        _boot_lines = list(getattr(self, "_boot_notice", []) or [])
+        _boot_txt = "🟢 <b>ربات مدیر بالا آمد</b>\n"
+        _boot_txt += (f"<i>نسخه {BUILD_VERSION} · نمونه {INSTANCE_ID} · "
+                      f"{HOST_LABEL}</i>\n")
+        if _boot_lines:
+            _boot_txt += "\n" + "\n".join(_boot_lines) + "\n"
+        _boot_txt += ("\nاگر دو پیام «بالا آمد» با نمونه‌های متفاوت می‌بینی، یعنی "
+                      "یک سرویس قدیمی هنوز روشن است — همان را خاموش کن.")
         for a in c["admin_ids"]:
             await self.say(
-                a,
-                "🟢 <b>ربات مدیر بالا آمد</b>\n"
-                f"<i>نسخه {BUILD_VERSION} · نمونه {INSTANCE_ID} · {HOST_LABEL}</i>\n"
-                "اگر دو پیام «بالا آمد» با نمونه‌های متفاوت می‌بینی، یعنی یک "
-                "سرویس قدیمیِ Railway هنوز روشن است — همان را خاموش کن.",
-                [[B("🛠 پنل مدیر", "a:home", "primary")]])
+                a, _boot_txt,
+                [[B("🛠 پنل مدیر", "a:home", "primary")],
+                 [B("🩺 عیب‌یابی", "a:diag", "success")]])
         if not c["admin_ids"]:
             print("  ⏳ منتظر اولین /start …\n", flush=True)
 
@@ -12943,12 +13428,48 @@ def main():
         return asyncio.run(m.run())
     except KeyboardInterrupt:
         print("\nدر حال خاموش کردن سرویس‌ها…")
+        try:
+            m._flush_durable("خاموشیِ دستی", timeout=40, force=True)
+        except Exception:
+            pass
         m.sup.shutdown()
         release_lock()
         return 0
+    except BaseException as e:
+        # هر مرگِ غیرمنتظره: دلیلش را ثبت کن و قبل از مردن یک نسخه‌ی بیرونی
+        # بگیر. اگر همین‌جا هم شکست بخورد، ناظرِ shell (railway-start.sh)
+        # بعد از خروجِ غیرصفر دوباره push می‌زند.
+        try:
+            log_crash("main", "".join(traceback.format_exc()))
+        except Exception:
+            pass
+        print(f"\n⛔ ربات با خطا ایستاد: {type(e).__name__}: {e}", flush=True)
+        try:
+            m._flushed_on_exit = True     # atexit دوباره تلاش نکند
+            m._flush_durable("کرشِ ربات", timeout=45, force=True)
+        except Exception:
+            pass
+        raise
     finally:
+        try:
+            m.sup.shutdown()
+        except Exception:
+            pass
         release_lock()
 
 
+def _boot_guard():
+    """اگر بوتِ قبلی خراب بوده، علتش را در خروجی نگه دار (برای /diag)."""
+    try:
+        ex = last_exit_info()
+        if ex and int(ex.get("code") or 0) != 0:
+            print(f"  ⚠️ بوتِ قبلی با کد {ex.get('code')} تمام شد "
+                  f"(بعد از {int(ex.get('uptime') or 0)}s) — /diag را ببین",
+                  flush=True)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _boot_guard()
     sys.exit(main())

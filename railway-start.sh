@@ -123,6 +123,22 @@ stop_sync() {
         SYNC_PID=0
     fi
 }
+# ذخیره‌ی دوره‌ای + ذخیره‌ی پایانی هنگام خاموشی — یک تابع، تا بعد از هر
+# کرش هم دوباره راه بیفتد (وگرنه بعد از یک بار pushِ نجات، سینکِ دوره‌ای
+# تا آخرِ عمرِ کانتینر خاموش می‌ماند).
+start_sync() {
+    if [ -z "${DATA_GITHUB_TOKEN:-}" ] || [ ! -f "$SYNC" ]; then
+        return 0
+    fi
+    if [ "${SYNC_PID:-0}" -gt 0 ] && kill -0 "$SYNC_PID" 2>/dev/null; then
+        return 0
+    fi
+    "$PY" "$SYNC" loop &
+    SYNC_PID=$!
+    log "gh_data_sync: ذخیره‌ی دوره‌یی شروع شد (pid=$SYNC_PID)"
+    return 0
+}
+
 if [ -n "${DATA_GITHUB_TOKEN:-}" ] && [ -f "$SYNC" ]; then
     # قبل از بوت: اطلاعات را از ریپوی گیت‌هاب برگردان (دیپلوی → wipe → بازیابی)
     if "$PY" "$SYNC" pull; then
@@ -130,10 +146,7 @@ if [ -n "${DATA_GITHUB_TOKEN:-}" ] && [ -f "$SYNC" ]; then
     else
         log "WARNING: gh_data_sync pull ناموفق بود — با داده‌های فعلی ادامه می‌دهیم"
     fi
-    # ذخیره‌ی دوره‌ای + ذخیره‌ی پایانی هنگام خاموشی
-    "$PY" "$SYNC" loop &
-    SYNC_PID=$!
-    log "gh_data_sync: ذخیره‌ی دوره‌یی شروع شد (pid=$SYNC_PID)"
+    start_sync
 fi
 
 # ── 3) run it ───────────────────────────────────────────────────────────────
@@ -183,7 +196,44 @@ while :; do
         exit 0
     fi
 
+    # ── خروجِ غیرصفر = کرش ────────────────────────────────────────────
+    # ۱) دلیلش را جایی بنویس که بوتِ بعدی بتواند به مدیر نشان دهد
+    #    (/diag و پیامِ «بالا آمد» از همین .jafj_last_exit و crash.log می‌خوانند).
+    # ۲) داده‌های چند ثانیه‌ی آخر را بیرون بفرست: خودِ manager هم موقع مرگ
+    #    تلاش می‌کند، ولی اگر OOM/SIGKILL بوده هیچ کدی اجرا نمی‌شود و این
+    #    تنها شانسِ نجاتِ داده است.
     ran=$(( $(date +%s) - started ))
+    {
+        printf '{"code": %s, "uptime": %s, "ts": %s, "note": "supervisor", "build": "shell"}\n' \
+            "$code" "$ran" "$(date +%s)" > "$DATA_DIR/.jafj_last_exit.tmp" 2>/dev/null \
+            && mv "$DATA_DIR/.jafj_last_exit.tmp" "$DATA_DIR/.jafj_last_exit" 2>/dev/null
+    } || true
+    {
+        printf '\n===== %s [supervisor] exit=%s after %ss =====\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$code" "$ran" \
+            >> "$DATA_DIR/crash.log"
+    } 2>/dev/null || true
+
+    if [ -n "${DATA_GITHUB_TOKEN:-}" ] && [ -f "$SYNC" ]; then
+        log "کرش — ذخیره‌ی نجاتِ داده در گیت‌هاب…"
+        # ناظرِ سینک را متوقف کن تا با push تداخل نکند (قفل فایل ندارد).
+        stop_sync
+        if command -v timeout >/dev/null 2>&1; then
+            if timeout 90 "$PY" "$SYNC" push; then
+                log "ذخیره‌ی نجات انجام شد"
+            else
+                log "WARNING: ذخیره‌ی نجات ناموفق بود"
+            fi
+        else
+            if "$PY" "$SYNC" push; then
+                log "ذخیره‌ی نجات انجام شد"
+            else
+                log "WARNING: ذخیره‌ی نجات ناموفق بود"
+            fi
+        fi
+        start_sync          # سینکِ دوره‌ای دوباره راه بیفتد
+    fi
+
     if [ "$ran" -lt "$CRASH_WINDOW" ]; then
         crashes=$((crashes + 1))
     else
