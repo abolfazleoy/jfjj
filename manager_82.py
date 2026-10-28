@@ -1240,8 +1240,8 @@ BOT_TOKEN = "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1028-resume"
-BUILD_TAG = "JAFJ_MANAGER_82_v1028-resume-after-update_2026_10_28"
+BUILD_VERSION = "v1028-restore-ref"
+BUILD_TAG = "JAFJ_MANAGER_82_v1028-restore-ref_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -1568,6 +1568,46 @@ def _backup_clients_count(caption):
     return int(m.group(1)) if m else None
 
 
+def parse_restore_ref(text, reply_id=None):
+    """ارجاعِ پیامِ پشتیبان را از متنِ مدیر بیرون بکشد → (چت, آیدی پیام).
+
+    سه شکل پذیرفته می‌شود (همه بدون نیاز به هیچ فایلی روی دیسک):
+
+        .restore            → (None, None)  یعنی «آخرین پشتیبانِ شناخته‌شده»
+        .restore 12345      → (None, 12345) یعنی پیامِ شمارهٔ ۱۲۳۴۵ در چتِ پشتیبان
+        .restore https://t.me/c/123456789/45
+                            → (-100123456789, 45) از روی لینک
+        (ریپلای روی همان پیام و نوشتنِ `.restore`) → (None, reply_id)
+
+    چرا لازم است؟ رباتِ تلگرام `messages.getHistory` ندارد؛ اگر دیسک پاک شود
+    هیچ راهی برای «گشتن» در پیام‌ها نمی‌ماند. ولی `getMessages` با آیدیِ
+    مشخص کار می‌کند — و این آیدی را خودِ مدیر با ریپلای/لینک می‌دهد.
+    """
+    t = (text or "").strip()
+    if t:
+        tok = t.split()[0].strip("<>")
+        m = re.search(r"(?:https?://)?t\.me/(?:c/)?([A-Za-z0-9_+\-]+)/(\d+)/?", tok)
+        if m:
+            chat, mid = m.group(1), int(m.group(2))
+            # t.me/c/<internal_id>/<msg> → آیدیِ داخلیِ کانال/گروه
+            if "/c/" in tok:
+                try:
+                    return int("-100" + str(int(chat))), mid
+                except Exception:
+                    return None, mid
+            return chat, mid
+        if re.fullmatch(r"\d{1,12}", tok):
+            return None, int(tok)
+        m2 = re.fullmatch(r"(?:msg|message)?[:#]?(\d{1,12})", tok, re.I)
+        if m2:
+            return None, int(m2.group(1))
+    try:
+        rid = int(reply_id) if reply_id else 0
+    except Exception:
+        rid = 0
+    return None, (rid or None)
+
+
 def command_text(text):
     """`.backup` / `.restore` و شکلِ فارسیِ تک‌کلمه‌ای را به دستور اسلش تبدیل می‌کند.
 
@@ -1591,8 +1631,13 @@ def command_text(text):
     mapped = _CMD_ALIASES.get(head) or _CMD_ALIASES.get(head.replace(" ", ""))
     if not mapped:
         return t
-    # فقط خودِ دستور، نه یک جمله که با این کلمه شروع شده
+    rest = " ".join(body.split()[1:]).strip()
+    # فقط خودِ دستور، نه یک جمله که با این کلمه شروع شده — به‌جز `.restore`
+    # که آرگومان (آیدی/لینکِ پیامِ پشتیبان) می‌گیرد.
     if len(body.split()) > 1:
+        if mapped == "restore" and (re.fullmatch(r"\d{1,12}", rest or "")
+                                    or "t.me/" in rest):
+            return "/restore " + rest
         return t
     return "/" + mapped
 
@@ -1665,6 +1710,13 @@ DEFAULTS = {
     "rules_btn": "",        # متن دکمه تأیید قوانین (خالی = پیش‌فرض)
     # ── بک‌آپ خودکار (فقط در صورت ثبت اطلاعات جدید) ──
     "auto_backup_on": True, # گرفتن بک‌آپ خودکار فقط موقع ثبت/تغییر اطلاعات جدید
+    # ── اشاره‌گرِ «تک‌پیامِ» پشتیبان (چت + آیدی پیام) ──
+    # رباتِ تلگرام اجازه‌ی خواندنِ تاریخچه را ندارد؛ بدون این اشاره‌گر، بعد از
+    # پاک‌شدنِ دیسک پیامِ پشتیبان پیدا نمی‌شود («پشتیبانی پیدا نشد»). عمداً
+    # داخل manager_config.json هم هست، چون خودِ آن فایل داخل zipِ پشتیبان و
+    # سینکِ گیت‌هاب است — یعنی بازیابی بعدی اشاره‌گر را با خودش می‌آورد.
+    "backup_msg_chat": "",
+    "backup_msg_id": 0,
     # ── سلامِ بالای منوی اصلی (هر خط یک جمله؛ خالی = پیش‌فرض) ──
     "greet_morning": "",    # ۵ تا ۱۲
     "greet_noon": "",       # ۱۲ تا ۱۷
@@ -3096,6 +3148,7 @@ class Manager:
         self._say_last = {}      # کش ضد تکرار say (روی self نه روی bound method)
         self._backup_fp_loaded = False   # اثرانگشتِ خوانده‌شده از دیسک؟
         self._backup_msg_id = None       # آیدی «تک‌پیامِ» پشتیبان در پیوی
+        self._backup_msg_chat = None     # کلیدِ چتِ همان پیام (برای getMessages)
         self._backup_extra_cleaned = False  # پاک‌سازیِ یکباره‌ی پیام‌های اضافی قدیمی
         self._restore_tries = 0          # چند تلاشِ بازیابی موقع بوت انجام شد
         self._boot_last = (0, 0, 0)      # (شروع‌شده, ناموفق, بدون‌اعتبار)
@@ -3160,7 +3213,88 @@ class Manager:
         # force_restart: بعد از بازیابی، پروسه‌ی در حال اجرا اطلاعاتِ کهنه
         # در حافظه دارد؛ باید با داده‌ی تازه بالا بیاید.
         self._spawn_boot(notify_admins=True, why=why, force_restart=True)
+        # بعد از بازیابی، «تک‌پیامِ» پشتیبان را فوراً تازه کن: هم داده‌ی
+        # همین حالا داخلش برود، هم اشاره‌گرش (چت + آیدی) ثبت شود. بدون این،
+        # پشتیبانِ تازه‌ای ساخته نمی‌شد و بوتِ بعدی دوباره «پشتیبان پیدا نشد»
+        # می‌داد — همان حلقه‌ای که مدیر را مجبور می‌کرد هر بار zip بفرستد.
+        self._reanchor_backup(why)
         return n_want
+
+    def _push_gh_sync(self, why=""):
+        """همین حالا یک push در سینکِ گیت‌هاب بزن (اگر توکن تنظیم شده باشد).
+
+        چرا دستی؟ حلقهٔ `gh_data_sync loop` هر ۳۰ دقیقه یک‌بار push می‌کند؛
+        اگر بین بازیابی و دیپلویِ بعدی این ۳۰ دقیقه پر نشود، دادهٔ تازه‌ی
+        بازیابی‌شده هیچ‌جا ماندگار نیست. این تابع همان شکاف را می‌بندد.
+        """
+        if not (os.environ.get("DATA_GITHUB_TOKEN") or "").strip():
+            return False
+        tool = os.path.join(image_dir(), "tools", "gh_data_sync.py")
+        if not os.path.isfile(tool):
+            tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tools", "gh_data_sync.py")
+        if not os.path.isfile(tool):
+            return False
+
+        def _run():
+            try:
+                r = subprocess.run([sys.executable, tool, "push"],
+                                   capture_output=True, text=True, timeout=180)
+                print(f"  ☁️ سینکِ گیت‌هاب ({why or 'دستی'}): "
+                      f"{(r.stdout or r.stderr or '').strip()[-300:]}", flush=True)
+            except Exception as e:
+                print(f"  ⚠️ سینکِ گیت‌هاب ({why or 'دستی'}): "
+                      f"{type(e).__name__}: {e}", flush=True)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def _reanchor_backup(self, reason=""):
+        """بعد از بازیابی، تک‌پیامِ پشتیبان را بازسازی و اشاره‌گرش را ثبت کن.
+
+        در پس‌زمینه اجرا می‌شود تا بازیابی/بوت کند نشود. اگر دیتابیس هنوز
+        خالی باشد کاری نمی‌کند (پشتیبانِ خالی نباید پشتیبانِ خوب را بپُراند).
+        """
+        if self.bot is None:
+            return False
+
+        async def _go():
+            try:
+                await asyncio.sleep(3)      # بگذار سشن‌ها/دیتابیس جا بیفتند
+                try:
+                    r = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
+                    n = r["c"] if r else 0
+                except Exception:
+                    n = 0
+                if not n:
+                    print("  ℹ️ پشتیبانِ تازه بعد از بازیابی: دیتابیس خالی است — "
+                          "پشتیبان قبلی دست‌نخورده می‌ماند", flush=True)
+                    return
+                ok, msg = await self.backup_once(force=True)
+                print(f"  {'📦' if ok else '⚠️'} بازسازیِ تک‌پیامِ پشتیبان پس از "
+                      f"{reason or 'بازیابی'}: {msg}", flush=True)
+                # و یک «ذخیره‌ی فوری» در گیت‌هاب: سینکِ دوره‌ای هر ۳۰ دقیقه
+                # است، ولی بین بازیابی و دیپلویِ بعدی ممکن است نرسد. داده‌ی
+                # همین حالا باید از قبل جایی ماندگار داشته باشد.
+                self._push_gh_sync("پس از " + (reason or "بازیابی"))
+            except Exception as e:
+                print(f"  ⚠️ بازسازیِ پشتیبان بعد از بازیابی: {type(e).__name__}: {e}",
+                      flush=True)
+
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(_go())
+            return True
+        except RuntimeError:
+            try:
+                if self._loop is not None:
+                    asyncio.run_coroutine_threadsafe(_go(), self._loop)
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
 
     # ---------- کمکی ----------
     def is_admin(self, uid):
@@ -7607,7 +7741,13 @@ class Manager:
                 return await self.edit(ev, t, kb)
             if k == "restore":
                 ok, msg = await self.restore_from_backup(force=True)
-                return await self.edit(ev, ("✅ " if ok else "❌ ") + str(msg),
+                text = ("✅ " if ok else "❌ ") + str(msg)
+                if not ok:
+                    text += ("\n\n💡 اگر «پشتیبانی پیدا نشد» داد، روی همان پیامِ "
+                             "پشتیبان در تلگرام <b>ریپلای</b> کن و بنویس "
+                             "<code>.restore</code> — یا آیدی همان پیام را بفرست: "
+                             "<code>.restore 12345</code>")
+                return await self.edit(ev, text,
                                        [[B("📦 مدیریت بک‌آپ", "a:backup", "primary")],
                                         back_btn("a:home")])
             if k == "onall":
@@ -8645,14 +8785,25 @@ class Manager:
     # ═══════════════════════════════════════════════
     #  دستورهای مدیر
     # ═══════════════════════════════════════════════
-    async def admin_cmd(self, uid, chat, cmd, arg):
+    async def admin_cmd(self, uid, chat, cmd, arg, ev=None):
         p = arg.split()
 
         if cmd in ("backup",):
             ok, msg = await self.backup_once(force=True)
             return await self.say(chat, ("✅ " if ok else "ℹ️ ") + msg)
         if cmd in ("restore",):
-            ok, msg = await self.restore_from_backup(force=True)
+            # ارجاعِ پیام: `.restore` به‌صورت ریپلای روی همان پیامِ پشتیبان،
+            # یا `.restore 12345` / `.restore https://t.me/c/…/12345`.
+            reply_id = None
+            try:
+                reply_id = (getattr(ev, "reply_to_msg_id", None)
+                            or getattr(getattr(ev, "message", None),
+                                       "reply_to_msg_id", None))
+            except Exception:
+                reply_id = None
+            ref_chat, ref_mid = parse_restore_ref(arg, reply_id=reply_id)
+            ok, msg = await self.restore_from_backup(
+                force=True, ref_chat=ref_chat, ref_msg_id=ref_mid)
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
         if cmd in ("onall", "all_on"):
             # دستور عجله‌ایِ مدیر: «همه‌ی سرویس‌هایی که باید روشن باشند را
@@ -10224,11 +10375,68 @@ class Manager:
             import json as _json
             with open(self._backup_fp_path(), "w", encoding="utf-8") as f:
                 _json.dump([list(x) for x in (fp or ())], f)
-            if getattr(self, "_backup_msg_id", None):
-                with open(self._backup_meta_path(), "w", encoding="utf-8") as f:
-                    _json.dump({"msg_id": self._backup_msg_id}, f)
         except Exception:
             pass
+        if getattr(self, "_backup_msg_id", None):
+            self._remember_backup_pointer(
+                getattr(self, "_backup_msg_chat", None), self._backup_msg_id)
+
+    def _remember_backup_pointer(self, chat, mid):
+        """آدرسِ «تک‌پیامِ» پشتیبان را در دو جای ماندگار ثبت کن.
+
+        چرا دو جا؟
+          • `.jafj_backup_meta` روی دیسکِ داده — سریع و ساده.
+          • `manager_config.json` — چون همین فایل داخل zipِ پشتیبان و در
+            سینکِ گیت‌هاب است. یعنی پشتیبان «آدرسِ خودش» را هم حمل می‌کند و
+            بعد از بازیابی، بوتِ بعدی می‌تواند پیام را با getMessages بخواند
+            (ربات‌ها getHistory ندارند، پس گشتن در چت ممکن نیست).
+        """
+        try:
+            self._backup_msg_id = int(mid) if mid else None
+        except Exception:
+            self._backup_msg_id = None
+        if chat is not None:
+            try:
+                self._backup_msg_chat = self._chat_key(chat)
+            except Exception:
+                pass
+        chat_key = getattr(self, "_backup_msg_chat", None)
+        try:
+            import json as _json
+            with open(self._backup_meta_path(), "w", encoding="utf-8") as f:
+                _json.dump({"msg_id": self._backup_msg_id,
+                            "chat": chat_key, "ts": now()}, f)
+        except Exception:
+            pass
+        try:
+            self.cfg["backup_msg_id"] = int(self._backup_msg_id or 0)
+            self.cfg["backup_msg_chat"] = chat_key or ""
+            self.cfg.save()
+        except Exception:
+            pass
+
+    def _backup_pointer(self):
+        """(چت, آیدی پیام) از حافظه → meta → cfg؛ هر کدام که بود."""
+        mid = getattr(self, "_backup_msg_id", None)
+        chat = getattr(self, "_backup_msg_chat", None)
+        if not mid or not chat:
+            try:
+                self._load_backup_fp()
+            except Exception:
+                pass
+            mid = mid or getattr(self, "_backup_msg_id", None)
+            chat = chat or getattr(self, "_backup_msg_chat", None)
+        if not mid:
+            try:
+                mid = int(self.cfg.get("backup_msg_id") or 0) or None
+            except Exception:
+                mid = None
+        if not chat:
+            try:
+                chat = (self.cfg.get("backup_msg_chat") or "").strip() or None
+            except Exception:
+                chat = None
+        return chat, mid
 
     def _load_backup_fp(self):
         """فقط یکبار در هر پروسه: اثرانگشتِ ذخیره‌شده از بوتِ قبل را بخوان."""
@@ -10249,6 +10457,21 @@ class Manager:
                     meta = _json.load(f) or {}
                 if meta.get("msg_id"):
                     self._backup_msg_id = int(meta["msg_id"])
+                if meta.get("chat"):
+                    self._backup_msg_chat = str(meta["chat"])
+        except Exception:
+            pass
+        # آخرین خطِ دفاع: اشاره‌گری که داخل خودِ manager_config.json است
+        # (همان فایلی که با zipِ پشتیبان و سینکِ گیت‌هاب برمی‌گردد).
+        try:
+            if not getattr(self, "_backup_msg_id", None):
+                mid = int(self.cfg.get("backup_msg_id") or 0)
+                if mid:
+                    self._backup_msg_id = mid
+            if not getattr(self, "_backup_msg_chat", None):
+                ch = (self.cfg.get("backup_msg_chat") or "").strip()
+                if ch:
+                    self._backup_msg_chat = ch
         except Exception:
             pass
 
@@ -10303,6 +10526,18 @@ class Manager:
         نقل‌قولی مقدم است؛ اگر هیچ فایل‌داری نبود، همان تازه‌ترین پیامِ
         نشانه‌دار برمی‌گردد (رفتار قدیمی)."""
         self._last_iter_ok = True
+        # ۱) اشاره‌گرِ ذخیره‌شده — تنها راهِ مطمئن برای رباتِ تلگرام، چون
+        #    ربات`messages.getHistory` ندارد و `iter_messages` خطا می‌دهد.
+        try:
+            _chat, _mid = self._backup_pointer()
+            if _mid:
+                got = await self.bot.get_messages(target, ids=[int(_mid)])
+                m = got[0] if isinstance(got, (list, tuple)) and got else got
+                if m is not None and getattr(m, "id", None):
+                    if not prefer_media or self._msg_has_media(m):
+                        return m
+        except Exception as e:
+            print(f"  ⚠️ خواندنِ پشتیبان با اشاره‌گر: {type(e).__name__}", flush=True)
         try:
             bot_id = 0
             try:
@@ -10343,6 +10578,43 @@ class Manager:
                 except Exception:
                     pass
         return None
+
+    async def _find_backup_by_pointer(self, fallback_chat=None):
+        """پیامِ پشتیبان را با آدرسِ ذخیره‌شده پیدا کن → (چت, پیام) یا (None, None).
+
+        مزیتِ اصلی: هیچ گشتنی در تاریخچه لازم نیست. ربات‌های تلگرام
+        `messages.getHistory` ندارند، پس این تنها راهِ کار کردنِ بازیابیِ
+        خودکار روی یک ربات است.
+        """
+        if self.bot is None:
+            return None, None
+        chat, mid = self._backup_pointer()
+        if not mid:
+            return None, None
+        cands = []
+        for c in (chat, fallback_chat):
+            if c is None:
+                continue
+            k = str(c).strip()
+            try:
+                if re.fullmatch(r"-?\d+", k):
+                    c = int(k)
+            except Exception:
+                pass
+            if c not in cands:
+                cands.append(c)
+        for c in cands:
+            try:
+                got = await self.bot.get_messages(c, ids=[int(mid)])
+                m = got[0] if isinstance(got, (list, tuple)) and got else got
+                if m is not None and getattr(m, "id", None) and self._msg_has_media(m):
+                    print(f"  🔗 پشتیبان از اشاره‌گر پیدا شد "
+                          f"(چت {self._chat_key(c)}، id={mid})", flush=True)
+                    return c, m
+            except Exception as e:
+                print(f"  ⚠️ اشاره‌گر در چت {self._chat_key(c)}: "
+                      f"{type(e).__name__}", flush=True)
+        return None, None
 
     async def _find_backup_anywhere(self, limit=40, skip=None, max_chats=12):
         """جست‌وجوی سراسری: پیامِ پشتیبان در «همهٔ» چت‌های ربات → (مقصد, پیام).
@@ -10733,7 +11005,7 @@ class Manager:
                       f"{self._chat_key(alt_t)} (مقصد فعلی: "
                       f"{self._chat_key(target)})", flush=True)
                 target, old_msg = alt_t, alt_m
-                self._backup_msg_id = getattr(alt_m, "id", None)
+                self._remember_backup_pointer(alt_t, getattr(alt_m, "id", None))
         sent = None
         if old_msg is not None:
             try:
@@ -10902,7 +11174,10 @@ class Manager:
             if getattr(self, "_last_iter_ok", True):
                 return None  # پشتیبانی در این چت نبوده؛ چیزی برای حفظ کردن نیست
             return ("⚠️ دیتابیس خالی است و نتوانستم پشتیبانِ قبلی را در تلگرام پیدا کنم؛ "
-                    "پشتیبانِ خالی نفرستادم.")
+                    "پشتیبانِ خالی نفرستادم.\n"
+                    "راهِ درست: روی همان پیامِ پشتیبان <b>ریپلای</b> کن و بنویس "
+                    "<code>.restore</code> — یا آیدی‌اش را بفرست: "
+                    "<code>.restore 12345</code>.")
         if not self._msg_has_media(prev):
             return None
         prev_n = _backup_clients_count(getattr(prev, "caption", "") or getattr(prev, "text", ""))
@@ -10912,7 +11187,10 @@ class Manager:
         return (f"⚠️ دیتابیسِ الان خالی است (۰ مشتری) و پشتیبانِ قبلیِ ({shown} مشتری) "
                 "بازنویسی نشد.\n"
                 "اگر بعد از آپدیت هستی، <code>.restore</code> را بزن (یا فایل zip پشتیبان را "
-                "در پیوی بفرست و بعد <code>.restore</code>).")
+                "در پیوی بفرست و بعد <code>.restore</code>).\n"
+                "اگر «پشتیبانی پیدا نشد» داد: روی همان پیامِ پشتیبان ریپلای کن و "
+                "<code>.restore</code> بفرست، یا آیدی‌اش را بده: "
+                "<code>.restore 12345</code>.")
 
     async def backup_once(self, force=False):
         """یک پشتیبان zip بساز و به تلگرام + دیسک بفرست.
@@ -11035,9 +11313,9 @@ class Manager:
             if sent is None:
                 raise last_up or RuntimeError("ارسال پشتیبان ناموفق")
             try:
-                self._backup_msg_id = getattr(sent, "id", None)
+                self._remember_backup_pointer(target, getattr(sent, "id", None))
             except Exception:
-                self._backup_msg_id = None
+                self._backup_msg_id = getattr(sent, "id", None)
             # تایید متنی کوتاه در PV مدیر (غیر از فایل) — فقط در حالت دستی / موقع اولین بکاپ خودکار بعد از تغییری بزرگ
             # از اسپم جلوگیری: فقط اگر force بود یا بیش از یک ساعت از آخرین تایید گذشته
             try:
@@ -11116,8 +11394,13 @@ class Manager:
                 print(f"backup_loop: {e}", flush=True)
                 await asyncio.sleep(120)
 
-    async def restore_from_backup(self, force=False):
-        """بازیابی از آخرین پشتیبان تلگرام (یا کپی محلی روی دیسک). (موفق, پیام)"""
+    async def restore_from_backup(self, force=False, ref_chat=None, ref_msg_id=None):
+        """بازیابی از آخرین پشتیبان تلگرام (یا کپی محلی روی دیسک). (موفق, پیام)
+
+        `ref_msg_id` (و اختیاری `ref_chat`): پیامِ دقیقِ پشتیبان — از ریپلایِ
+        مدیر روی همان پیام یا از لینکِ `t.me/...`. این تنها راهِ قطعیِ بازیابی
+        است وقتی دیسک پاک شده و ربات هم اجازه‌ی گشتن در تاریخچه را ندارد.
+        """
         target = self._backup_target()
         if not target:
             return False, "BACKUP_CHAT تنظیم نشده"
@@ -11133,19 +11416,50 @@ class Manager:
         # زیپی که مدیر همین الان در پیوی فرستاده، در `.restore` دستی بر پشتیبانِ
         # قدیمیِ تلگرام مقدم است. (بوت خودکار همان قبلی را می‌خواند.)
         admin_up = _admin_upload_path()
-        prefer_admin = bool(force) and os.path.isfile(admin_up)
+        prefer_admin = bool(force) and os.path.isfile(admin_up) and not ref_msg_id
         # ── پیدا کردنِ پیامِ پشتیبان ──
         # اول در چتِ مقصد، با اولویتِ «فایل» بر متنِ نقل‌قولی (prefer_media):
         # پیامِ متنی که فقط نشانهٔ JAFJBACKUP1 را دارد هیچ zipی ندارد و اگر
         # همان انتخاب شود، بازیابی شکست می‌خورد.
         last = None
         search_err = None
+        if ref_msg_id:
+            # پیام را دقیقاً با آیدی می‌خوانیم؛ هیچ گشتنی لازم نیست.
+            cand_chats = []
+            for ch in (ref_chat, target) + tuple(self.cfg.get("admin_ids") or []):
+                if ch is None:
+                    continue
+                k = self._chat_key(ch)
+                if k and k not in [self._chat_key(c) for c in cand_chats]:
+                    cand_chats.append(ch)
+            for ch in cand_chats:
+                try:
+                    got = await self.bot.get_messages(ch, ids=[int(ref_msg_id)])
+                    m = got[0] if isinstance(got, (list, tuple)) and got else got
+                    if m is not None and getattr(m, "id", None):
+                        last, target = m, ch
+                        self._remember_backup_pointer(ch, getattr(m, "id", None))
+                        print(f"  🔗 پشتیبان با ارجاعِ مدیر در چت "
+                              f"{self._chat_key(ch)} (id={ref_msg_id})", flush=True)
+                        break
+                except Exception as e:
+                    print(f"  ⚠️ خواندنِ پیامِ {ref_msg_id} در "
+                          f"{self._chat_key(ch)}: {type(e).__name__}", flush=True)
+            if last is None:
+                return False, (f"پیامِ پشتیبان با شناسهٔ {ref_msg_id} پیدا نشد. "
+                               "آیدی را چک کن یا همان zip را در پیوی بفرست و "
+                               "<code>.restore</code> بزن.")
+        if last is None and not ref_msg_id and not prefer_admin:
+            # اشاره‌گر (چت + آیدی) از meta/cfg — بدون گشتن در تاریخچه
+            p_chat, p_msg = await self._find_backup_by_pointer(target)
+            if p_msg is not None:
+                last, target = p_msg, p_chat
         try:
-            if not prefer_admin:
+            if not prefer_admin and last is None:
                 last = await self._find_last_backup_msg(target, limit=200, prefer_media=True)
         except Exception as e:
             search_err = f"{type(e).__name__}: {e}"
-        if last is None and not prefer_admin:
+        if last is None and not prefer_admin and not ref_msg_id:
             # چتِ مقصد چیزی نداشت (بعد از دیپلوی BACKUP_CHAT/admin_ids عوض یا
             # پاک شده) → جست‌وجوی سراسری در همهٔ چت‌های ربات؛ تک‌پیامِ پشتیبان
             # هر جا باشد پیدا می‌شود و بازیابی از دست نمی‌رود.
@@ -11159,7 +11473,7 @@ class Manager:
                       f"(مقصدِ تنظیم‌شده: {self._chat_key(target)})", flush=True)
                 target, last = alt_target, alt_msg
                 try:
-                    self._backup_msg_id = getattr(last, "id", None)
+                    self._remember_backup_pointer(alt_target, getattr(last, "id", None))
                 except Exception:
                     pass
             elif search_err:
@@ -11624,12 +11938,23 @@ class Manager:
                           "<i>بازیابیِ دستی: <code>.restore</code></i>")
             else:
                 status = ("⚠️ <b>بازیابیِ اطلاعات ناموفق بود</b>\n\n"
-                          f"{msg}\n\nدیتابیس خالی است و پشتیبانی پیدا نشد.\n"
+                          f"{msg}\n\nدیتابیس خالی است و پشتیبانی پیدا نشد.\n\n"
+                          "<b>سه راهِ قطعی (هر کدام راحت‌تر بود):</b>\n"
+                          "۱) روی همان <b>پیامِ پشتیبان</b> در تلگرام <b>ریپلای</b> کن و "
+                          "بنویس <code>.restore</code>\n"
+                          "۲) آیدیِ همان پیام را بفرست: "
+                          "<code>.restore 12345</code> (یا لینکش: "
+                          "<code>.restore https://t.me/c/.../12345</code>)\n"
+                          "۳) همان zipِ پشتیبان را در این چت بفرست و بعد "
+                          "<code>.restore</code> بزن.\n"
                           f"• چتِ پشتیبان: <code>{backup_target_raw()}</code>\n"
-                          "• اگر تک‌پیامِ فایلِ پشتیبان را پاک کرده‌ای، همان zip را "
-                          "دوباره در این چت بفرست.\n"
-                          "• بعد از رفع، <code>.restore</code> را بفرست.\n"
-                          "• گرفتنِ دستی: <code>.backup</code> — اگر خودکار خطا بدهد دلیلش همین‌جا می‌آید.")
+                          "• گرفتنِ دستی: <code>.backup</code>\n\n"
+                          "<b>چرا پیدا نشد؟</b> رباتِ تلگرام اجازهٔ گشتن در تاریخچهٔ "
+                          "چت را ندارد؛ اگر دیسک هم پاک شود، آدرسِ پیام از دست "
+                          "می‌رود. برای اینکه دیگر تکرار نشود، در رندر یک "
+                          "<b>Disk</b> روی <code>/data</code> با "
+                          "<code>DATA_DIR=/data</code> بگذار یا "
+                          "<code>DATA_GITHUB_TOKEN</code> را فعال کن.")
             sent_any = False
             for a in (self.cfg.get("admin_ids") or []):
                 try:
@@ -12519,7 +12844,7 @@ class Manager:
                 if self.is_admin(uid):
                     if await self.shop_admin(uid, ev.chat_id, cmd, arg) is not None:
                         return
-                    if await self.admin_cmd(uid, ev.chat_id, cmd, arg) is not None:
+                    if await self.admin_cmd(uid, ev.chat_id, cmd, arg, ev=ev) is not None:
                         return
                 if await self.shop_user(uid, ev.chat_id, cmd, arg, user) is not None:
                     return
