@@ -296,7 +296,7 @@ INNER = textwrap.dedent('''
               "auto hook after subscription purchase")
         check('stp == "tut_set"' in src and '"sec_set"' in src,
               "content capture covers tut_set + sec_set")
-        check('data in ("wq:0", "kc:x", "a:tut_done")' in src,
+        check('data in ("wq:0", "kc:x", "a:tut_done", "a:tut_add")' in src,
               "legacy fsm keep-list literal still there")
         check('a:sec_done' in src, "a:sec_done survives fsm cleanup")
 

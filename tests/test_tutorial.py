@@ -263,7 +263,7 @@ INNER = textwrap.dedent('''
         check('if data == "m:tut":' in src, "on_callback handles m:tut")
         check('"ok_days", "acct_n", "fjoin_add", "tut_set"' in src,
               "fsm cleanup list includes tut_set")
-        check('data in ("wq:0", "kc:x", "a:tut_done")' in src,
+        check('data in ("wq:0", "kc:x", "a:tut_done", "a:tut_add")' in src,
               "a:tut_done survives fsm cleanup")
         check('"tut_chat": 0' in src and '"tut_ids": []' in src,
               "DEFAULTS has tut_chat/tut_ids")
