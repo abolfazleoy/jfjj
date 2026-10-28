@@ -5812,20 +5812,71 @@ async def connect_and_run(eng, creds):
                 return v
             print("   شماره کوتاه بود، دوباره بزن.")
 
+    # ═══════════════════════════════════════════════════════════════════
+    #  ورود — و این‌جا مهم‌ترین قاعده: **هیچ کدِ ورودیِ ناخواسته نرود**
+    #
+    #  `client.start(phone=...)` وقتی سشن معتبر نباشد برای صاحبِ شماره کد
+    #  می‌فرستد. بعد از آپدیت/بازیابی، اگر فایل سشن خراب یا کلیدش باطل شده
+    #  باشد، این یک خط برای **همه‌ی مشتری‌ها** کد می‌فرستد (اسپمِ کد).
+    #
+    #  حالا: اول وصل می‌شویم و `is_user_authorized()` را می‌پرسیم (این کار
+    #  هیچ کدی نمی‌فرستد). اگر authorized نبود:
+    #    • با NO_AUTO_LOGIN=1 (حالتِ مدیر) → کد نمی‌فرستیم، دلیل را چاپ
+    #      می‌کنیم و با کدِ ۷۸ خارج می‌شویم تا مدیر اکانت را «نیاز به
+    #      لاگینِ دوباره» علامت بزند و حلقهٔ ری‌استارت کد نسازد.
+    #    • بدون آن (اجرای دستی روی لپ‌تاپ) → رفتار قبلی، با پرسیدن از کاربر.
+    # ═══════════════════════════════════════════════════════════════════
+    no_auto = (os.environ.get("JAFJ_NO_AUTO_LOGIN") or "").strip() not in ("", "0", "false", "نه")
+    authorized = False
     try:
-        await client.start(phone=phone_cb)
-    except RuntimeError:
-        print("\n⚠️ ترمینال تعاملی نیست — PHONE را بالای فایل بگذار.")
-        return "stop"
-    except FloodWaitError as e:
-        w = getattr(e, "seconds", 60)
-        print(f"\n⏳ تلگرام برای ورود {secs(w)} صبر خواسته. منتظر می‌مانم…")
-        await asyncio.sleep(w + 5)
-        return "retry"
+        await client.connect()
+        try:
+            authorized = bool(await client.is_user_authorized())
+        except Exception as e:
+            print(f"\n⚠️ بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
+            authorized = False
     except Exception as e:
-        print(f"\n⚠️ ورود ناموفق: {type(e).__name__}: {e}")
-        print("   ۳۰ ثانیه دیگر دوباره تلاش می‌کنم… (Ctrl+C برای خروج)")
-        await asyncio.sleep(30)
+        print(f"\n⚠️ اتصال برای بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(5)
+        return "retry"
+
+    if not authorized:
+        if no_auto:
+            print("\n⛔ سشنِ این اکانت معتبر نیست (از تلگرام خارج یا باطل شده).",
+                  flush=True)
+            print("   ✅ کدِ ورود **فرستاده نشد** — عمداً؛ تا اسپمِ کد نسازیم.",
+                  flush=True)
+            print("   👉 از پنلِ مدیر: «🚀 راه‌اندازی سلف روی اکانتم» را برای این "
+                  "اکانت بزن.", flush=True)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return "needs_relogin"
+        # اجرای دستی: همان رفتارِ قبلی (کد می‌رود، چون خودِ کاربر نشسته)
+        try:
+            await client.start(phone=phone_cb)
+        except RuntimeError:
+            print("\n⚠️ ترمینال تعاملی نیست — PHONE را بالای فایل بگذار.")
+            return "stop"
+        except FloodWaitError as e:
+            w = getattr(e, "seconds", 60)
+            print(f"\n⏳ تلگرام برای ورود {secs(w)} صبر خواسته. منتظر می‌مانم…")
+            await asyncio.sleep(w + 5)
+            return "retry"
+        except Exception as e:
+            print(f"\n⚠️ ورود ناموفق: {type(e).__name__}: {e}")
+            print("   ۳۰ ثانیه دیگر دوباره تلاش می‌کنم… (Ctrl+C برای خروج)")
+            await asyncio.sleep(30)
+            return "retry"
+    # وصل بمان: بقیه‌ی کد به اتصالِ زنده نیاز دارد (قبلاً start() خودش وصل
+    # می‌ماند؛ حالا ما وصل می‌کنیم).
+    try:
+        if not client.is_connected():
+            await client.connect()
+    except Exception as e:
+        print(f"\n⚠️ اتصال دوباره: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(5)
         return "retry"
 
     me = await client.get_me()
@@ -8999,6 +9050,12 @@ async def run_bot():
             r = await connect_and_run(eng, creds)
             if r == "stop":
                 return 1
+            if r == "needs_relogin":
+                # عمداً retry نمی‌کنیم: هر تلاشِ دوباره = یک کدِ ورودِ تازه
+                # برای مشتری. مدیر باید از پنل دوباره لاگین کند.
+                print("\n⛔ تا لاگینِ دوباره از پنل، این سرویس اجرا نمی‌شود.",
+                      flush=True)
+                return 78
             backoff = 10
         except KeyboardInterrupt:
             raise

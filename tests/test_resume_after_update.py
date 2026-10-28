@@ -23,6 +23,7 @@
 import importlib.util
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -63,13 +64,31 @@ def fresh_sup(db):
     return s
 
 
+def write_valid_session(path):
+    """یک فایلِ سشنِ sqlite واقعی بساز (بدون نیاز به telethon).
+
+    `Supervisor.start()` قبل از اجرا با `session_health()` فایل را چک می‌کند؛
+    اگر فایل «خراب/بدون کلید» باشد اکانت به «نیاز به لاگین» می‌رود و بالا
+    نمی‌آید — پس اینجا همان ساختارِ جدولِ telethon ساخته می‌شود.
+    """
+    con = sqlite3.connect(path)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS sessions (dc_id integer primary key,"
+                    " server_address text, port integer, auth_key blob,"
+                    " takeout_id integer)")
+        con.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?)",
+                    (2, "149.154.167.51", 443, b"A" * 256, None))
+        con.commit()
+    finally:
+        con.close()
+
+
 def add_client(db, uid, want=1):
     db.add(uid, "u%s" % uid, "user%s" % uid, 0)
     db.set(uid, status="active", session="x" * 40, phone="0912", want_on=want)
     folder = os.path.join(DATA, "clients", str(uid))
     os.makedirs(folder, exist_ok=True)
-    with open(os.path.join(folder, "jafj.session"), "wb") as f:
-        f.write(b"fake-session")
+    write_valid_session(os.path.join(folder, "jafj.session"))
     return uid
 
 

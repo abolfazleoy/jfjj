@@ -1390,8 +1390,8 @@ BOT_TOKEN = "8832561144:AAFSRpyaD4M9GWWsiltBMXs6acbbo6W0J-M"
 API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
-BUILD_VERSION = "v1028-crashsafe"
-BUILD_TAG = "JAFJ_MANAGER_82_v1028-crashsafe_2026_10_28"
+BUILD_VERSION = "v1028-nocode"
+BUILD_TAG = "JAFJ_MANAGER_82_v1028-nocode_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  شناسه‌ی نمونه (instance) + تشخیص «سرویس قدیمی هنوز روشنه»
@@ -2123,7 +2123,8 @@ CREATE TABLE IF NOT EXISTS clients (
     trial_expires_at INTEGER NOT NULL DEFAULT 0,
     trial_warning_sent INTEGER NOT NULL DEFAULT 0,
     rules_accepted INTEGER NOT NULL DEFAULT 1,
-    want_on INTEGER NOT NULL DEFAULT 1
+    want_on INTEGER NOT NULL DEFAULT 1,
+    need_login INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2161,7 +2162,11 @@ class DB:
                               # «این سرویس باید روشن بماند؟» — پیش‌فرض ۱ تا
                               # بعد از آپدیت، سرویسِ همه مثل قبل خودکار بالا
                               # بیاید؛ خاموش‌کردنِ دستی آن را ۰ می‌کند.
-                              ("want_on", "INTEGER NOT NULL DEFAULT 1")):
+                              ("want_on", "INTEGER NOT NULL DEFAULT 1"),
+                              # ۱ = سشن باطل است و باید از پنل دوباره لاگین شود؛
+                              # تا آن موقع هیچ پروسه‌ای بالا نمی‌آید (وگرنه هر
+                              # بار تلگرام برای مشتری کدِ ورود می‌فرستد).
+                              ("need_login", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in cols:
                     self.c.execute(f"ALTER TABLE clients ADD COLUMN {col} {decl}")
                     if col == "trial_used":
@@ -2391,6 +2396,72 @@ class DB:
             return False
 
 
+# ── اعتبارسنجیِ فایل سشن (بدون نیاز به telethon) ─────────────────────────
+# چرا: `TelegramClient.start(phone=...)` وقتی سشن معتبر نباشد **کد ورود
+# می‌فرستد**. بعد از هر بازیابی/آپدیت، اگر فایل سشن خراب یا کلیدش باطل شده
+# باشد، یک‌جا برای همه‌ی مشتری‌ها کد می‌رفت. قبل از اجرا اعتبارسنجی می‌کنیم
+# تا هرگز کدِ ناخواسته نرود.
+
+# جدولِ سشنِ تلگرام (SQLiteSession): auth_key خالی = لاگین‌نشده.
+_SESSION_SQLS = (
+    "SELECT auth_key FROM sessions LIMIT 1",
+    "SELECT auth_key FROM session LIMIT 1",
+)
+
+
+# نشانه‌های «کدِ ورود فرستاده شد» در لاگِ سلف — اگر جایی دیدیم، فوراً
+# متوقف می‌کنیم تا اسپمِ کد نسازد.
+_LOGIN_CODE_RE = re.compile(
+    r"(code request|send_code_request|PHONE_CODE|phone_code|Code request|"
+    r"کد ورود|Login code)", re.I)
+
+
+def session_health(path):
+    """فایل‌های سشن را بررسی کن → (سالم؟, دلیل).
+
+    چک‌ها همه محلی و بی‌خطرند (هیچ اتصالی به تلگرام زده نمی‌شود):
+      • فایل هست و خالی نیست
+      • sqlite سالم است (نه نیمه‌کاره/خراب)
+      • جدولِ سشن و auth_key دارد
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False, "فایل سشن نیست"
+        if os.path.getsize(path) == 0:
+            return False, "فایل سشن خالی است"
+        con = None
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            cur = con.execute("PRAGMA quick_check")
+            row = cur.fetchone()
+            if not row or str(row[0]).lower() != "ok":
+                return False, "فایل سشن خراب است"
+            for sql in _SESSION_SQLS:
+                try:
+                    r = con.execute(sql).fetchone()
+                except Exception:
+                    continue
+                if r is None:
+                    return False, "سشن خالی است (بدون کلید)"
+                key = r[0]
+                if isinstance(key, memoryview):
+                    key = bytes(key)
+                if not key:
+                    return False, "کلید سشن خالی است"
+                return True, ""
+            return False, "جدولِ سشن پیدا نشد"
+        except sqlite3.DatabaseError:
+            return False, "فایل سشن قابل خواندن نیست"
+        finally:
+            try:
+                if con is not None:
+                    con.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return False, f"خطا: {type(e).__name__}"
+
+
 class _AdoptedProc:
     """دستگیره‌ی سبک برای پروسه‌ی سلفی که ما نساختیمش (بعد از ری‌استارت manager).
 
@@ -2465,15 +2536,28 @@ class Supervisor:
         return p
 
     # ---------- تبدیل StringSession به فایل .session ----------
-    def write_session(self, uid, string_session):
-        """StringSession را به فایل .session تبدیل می‌کند."""
+    def write_session(self, uid, string_session, keep_existing=True):
+        """StringSession را به فایل .session تبدیل می‌کند.
+
+        `keep_existing=True` (پیش‌فرض): اگر فایلِ سالمی از قبل هست، **دست به
+        آن نمی‌زنیم**. قبلاً فایلِ زنده پاک و از رشته‌ی داخل DB بازنویسی می‌شد؛
+        اگر آن رشته قدیمی‌تر بود، کلیدِ زنده دور ریخته می‌شد، سشن باطل می‌شد و
+        سلف برای «روشن شدن» از تلگرام **کدِ ورود** می‌گرفت.
+        """
         if not string_session or len(string_session) < 20:
             raise ValueError("سشن خالی یا نامعتبر")
-        from telethon.sessions import StringSession, SQLiteSession
         folder = self.folder(uid)
         path = os.path.join(folder, "jafj.session")
+        if keep_existing and os.path.isfile(path):
+            ok, _why = session_health(path)
+            if ok:
+                return path                     # فایلِ سالم را خراب نکن
+        from telethon.sessions import StringSession, SQLiteSession
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
         ss = StringSession(string_session)
         sq = SQLiteSession(path[:-8])       # بدون پسوند
         sq.set_dc(ss.dc_id, ss.server_address, ss.port)
@@ -2746,6 +2830,96 @@ class Supervisor:
         except Exception:
             return True      # نمی‌دانیم → مثل قبل ری‌استارت کن
 
+    # ---------- «این اکانت باید لاگین شود» ----------
+    def needs_login(self, uid):
+        try:
+            return bool((self.db.get(uid) or {}).get("need_login"))
+        except Exception:
+            return False
+
+    def mark_needs_login(self, uid, reason="سشن باطل است", quarantine=True):
+        """اکانت را «نیاز به لاگینِ دوباره» علامت بزن و اجرای خودکارش را ببند.
+
+        چرا want_on=0 هم می‌شود؟ وگرنه watchdog/resume هر ۳۰ ثانیه پروسه را
+        بالا می‌آورد و هر بار تلگرام یک **کد ورود** به گوشیِ مشتری می‌فرستد.
+        """
+        try:
+            self.db.set(uid, need_login=1, want_on=0)
+        except Exception:
+            pass
+        try:
+            self.db.log(uid, "need_login", str(reason)[:300])
+        except Exception:
+            pass
+        if quarantine:
+            try:
+                p = os.path.join(self.folder(uid), "jafj.session")
+                if os.path.isfile(p):
+                    bad = p + ".bad"
+                    try:
+                        os.replace(p, bad)
+                    except Exception:
+                        shutil.copy2(p, bad)
+                self._clear_pid(uid)
+            except Exception:
+                pass
+        try:
+            if self.mgr and hasattr(self.mgr, "_notify_needs_login"):
+                self.mgr._notify_needs_login(uid, reason)
+        except Exception:
+            pass
+        return True
+
+    def clear_needs_login(self, uid):
+        try:
+            self.db.set(uid, need_login=0)
+            return True
+        except Exception:
+            return False
+
+    def verify_session(self, uid, rebuild=True):
+        """قبل از اجرا مطمئن شو سشن سالم است → (آماده؟, دلیل).
+
+        اگر فایل نبود/خراب بود، از رشته‌ی داخل DB بازسازی می‌کند (اگر آن هم
+        نبود، «نیاز به لاگین»). هیچ اتصالی به تلگرام زده نمی‌شود و هیچ کدی
+        نمی‌رود؛ فقط جلوی «کد برای همه» گرفته می‌شود.
+        """
+        path = os.path.join(self.folder(uid), "jafj.session")
+        ok, why = session_health(path)
+        if ok:
+            return True, ""
+        row = None
+        try:
+            row = self.db.get(uid)
+        except Exception:
+            row = None
+        sess = (row or {}).get("session") or ""
+        if rebuild and sess and not os.path.isfile(path + ".bad"):
+            try:
+                self.write_session(uid, sess, keep_existing=False)
+            except Exception as e:
+                print(f"  ⚠️ بازسازیِ سشن {uid}: {type(e).__name__}", flush=True)
+            ok2, why2 = session_health(path)
+            if ok2:
+                self.db.log(uid, "session_rebuilt", why or "بدون فایل")
+                return True, ""
+            why = why2 or why
+        if not sess:
+            why = why or "سشن ندارد"
+        return False, why
+
+    def _session_ok_or_mark(self, uid):
+        """(آماده؟, پیام) — قبل از هر start صدا زده می‌شود."""
+        ok, why = self.verify_session(uid)
+        if ok:
+            if self.needs_login(uid):
+                self.clear_needs_login(uid)
+            return True, ""
+        self.mark_needs_login(uid, why)
+        return False, ("سشنِ این اکانت معتبر نیست (" + why + ") — کدِ ورود عمداً "
+                       "فرستاده نشد. از «🚀 راه‌اندازی سلف روی اکانتم» دوباره "
+                       "لاگین کن.")
+
     def is_running(self, uid):
         p = self.procs.get(uid)
         if p is None:
@@ -2796,6 +2970,11 @@ class Supervisor:
             else:
                 self.last_failure[uid] = "manager"
                 return False, "سشن ندارد"
+        # ── ۱) سشن سالم است؟ (وگرنه سلف برای «روشن شدن» کد می‌گیرد) ──
+        ready, why_not = self._session_ok_or_mark(uid)
+        if not ready:
+            self.last_failure[uid] = "session"
+            return False, why_not
         # قبل از هر اجرا/ری‌استارت، هم امتیاز و هم محدودیت جدید پلن را Sync کن.
         if self.mgr:
             try:
@@ -2815,10 +2994,14 @@ class Supervisor:
         logf.write(f"\n===== start {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
         logf.flush()
         try:
+            # JAFJ_NO_AUTO_LOGIN=1 → سلف هرگز خودش کدِ ورود نمی‌فرستد؛ اگر
+            # سشن معتبر نباشد با کدِ ۷۸ خارج می‌شود و ما علامت می‌زنیم.
+            _env = dict(os.environ)
+            _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
             p = subprocess.Popen(
                 [sys.executable, SELFBOT],
                 cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, env=_env,
                 start_new_session=True)
         except Exception as e:
             logf.close()
@@ -2835,11 +3018,19 @@ class Supervisor:
         if p.poll() is not None:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
+            rc = p.returncode
+            tail = self.tail(uid, 10).strip().replace("\n", " | ")[-900:]
+            self.db.log(uid, "start_failed", f"rc={rc} {tail}")
+            if rc == 78 or _LOGIN_CODE_RE.search(tail or ""):
+                # سشن باطل (یا بدتر: یک جایی کد ورود رفته) → دیگر تلاش نکن
+                self.last_failure[uid] = "session"
+                self.mark_needs_login(uid, "سشن باطل/خارج‌شده")
+                return False, ("این اکانت باید دوباره لاگین شود — کدِ ورودِ اضافی "
+                               "فرستاده نشد و اجرای خودکارش تا لاگین متوقف شد.")
             self.last_failure[uid] = "selfbot"
-            tail = self.tail(uid, 8).strip().replace("\n", " | ")[-900:]
-            self.db.log(uid, "start_failed", tail)
             return False, "سلف اجرا نشد؛ Session یا اطلاعات ورود را بررسی کن.\n" + tail
-        self.db.set(uid, started_at=now(), want_on=1)
+        # اگر سلف با موفقیت بالا آمد، مهرِ «نیاز به لاگین» برداشته می‌شود
+        self.db.set(uid, started_at=now(), want_on=1, need_login=0)
         self._resume_fail.pop(uid, None)
         self.db.log(uid, "start", f"pid={p.pid}")
         return True, f"روشن شد (pid {p.pid})"
@@ -2912,7 +3103,8 @@ class Supervisor:
         n = int(e.get("n") or 0) + 1
         self._resume_fail[uid] = {"n": n, "next": time.time() + min(600, 60 * n)}
 
-    def resume_wanted(self, log_kind="autorestart", respect_backoff=True):
+    def resume_wanted(self, log_kind="autorestart", respect_backoff=True,
+                      force=False):
         """همه‌ی سرویس‌هایی که «باید روشن باشند» ولی روشن نیستند را بالا بیاورد.
 
         این همان چیزی است که بعد از هر آپدیت لازم است: پروسه‌های سلف فرزندِ
@@ -2935,6 +3127,10 @@ class Supervisor:
             if uid is None:
                 continue
             if self.is_running(uid):
+                continue
+            if self.needs_login(uid) and not force:
+                # سشن باطل → هیچ تلاشی نکن (هر تلاش = یک کد برای مشتری)
+                skipped.append((uid, "نیاز به لاگین"))
                 continue
             self.procs.pop(uid, None)
             if respect_backoff:
@@ -3012,6 +3208,11 @@ class Supervisor:
             rows = self.db.runnable()
         for c in rows:
             uid = c["uid"]
+            if self.needs_login(uid) and not force_restart:
+                # سشنِ باطل: بالا آوردنش فقط کدِ ورود برای مشتری می‌سازد.
+                skipped += 1
+                self.db.log(uid, "boot_skip", "نیاز به لاگین")
+                continue
             # اگر از قبل روشن بود: فقط وقتی ری‌استارت کن که کدِ روی دیسک
             # (95.py) بعد از شروعِ آن پروسه عوض شده باشد — یعنی نسخه‌ی
             # درونِ حافظه کهنه است. ری‌استارتِ بی‌دلیل، سرویسِ سالمِ
@@ -3574,6 +3775,10 @@ class Manager:
             self._reload_cfg_from_disk()
         except Exception:
             pass
+        # داده‌ی تازه از پشتیبان آمده؛ مهرِ «نیاز به لاگین» ممکن است مربوط به
+        # وضعیت قبلی باشد. پاکش می‌کنیم، ولی هر اکانتی که فایل سشنش خراب
+        # باشد دوباره (بدون فرستادنِ کد) علامت می‌خورد.
+        self._clear_all_needs_login()
         # force_restart: بعد از بازیابی، پروسه‌ی در حال اجرا اطلاعاتِ کهنه
         # در حافظه دارد؛ باید با داده‌ی تازه بالا بیاید.
         self._spawn_boot(notify_admins=True, why=why, force_restart=True)
@@ -3583,6 +3788,59 @@ class Manager:
         # می‌داد — همان حلقه‌ای که مدیر را مجبور می‌کرد هر بار zip بفرستد.
         self._reanchor_backup(why)
         return n_want
+
+    def _notify_needs_login(self, uid, reason=""):
+        """به مدیر بگو کدام اکانت سشنش باطل است — یک‌بار برای هر اکانت.
+
+        عمداً فقط یک پیام کوتاه و یک‌بار (نه هر دور watchdog) تا پیوی مدیر
+        پر نشود؛ لیستِ کامل با /needlogin.
+        """
+        if self.bot is None or self._loop is None:
+            return False
+        now_t = time.time()
+        seen = getattr(self, "_login_notified", None)
+        if seen is None:
+            seen = self._login_notified = {}
+        if now_t - float(seen.get(uid, 0) or 0) < 6 * 3600:
+            return False
+        seen[uid] = now_t
+        try:
+            c = self.db.get(uid) or {}
+            nm = c.get("name") or str(uid)
+        except Exception:
+            nm = str(uid)
+
+        async def _say():
+            for a in (self.cfg.get("admin_ids") or []):
+                try:
+                    await self.say(
+                        a,
+                        "🔑 <b>یک اکانت نیاز به لاگین دارد</b>\n\n"
+                        f"👤 {self._esc(nm)}\n<code>{uid}</code>\n"
+                        f"دلیل: {self._esc(reason or 'سشن باطل')}\n\n"
+                        "⛔ برای اینکه برای مشتری <b>کدِ ورود</b> نرود، اجرای "
+                        "خودکارش متوقف شد.\n"
+                        "👉 از «🚀 راه‌اندازی سلف روی اکانتم» (یا با مشتری) "
+                        "دوباره لاگین کن.\n"
+                        "لیست کامل: <code>/needlogin</code>",
+                        key=f"needlogin:{uid}")
+                    break
+                except Exception:
+                    continue
+
+        try:
+            asyncio.run_coroutine_threadsafe(_say(), self._loop)
+            return True
+        except Exception:
+            return False
+
+    def _clear_all_needs_login(self):
+        try:
+            n = self.db.x("UPDATE clients SET need_login=0 WHERE need_login<>0",
+                          (), None)
+            return int(n or 0) if isinstance(n, int) else 0
+        except Exception:
+            return 0
 
     def _reanchor_backup(self, reason=""):
         """بعد از بازیابی، تک‌پیامِ پشتیبان را بازسازی و اشاره‌گرش را ثبت کن.
@@ -3936,14 +4194,22 @@ class Manager:
         if trial:
             trial_start = now()
             trial_end = trial_start + max(1, int(self.cfg.get("trial_minutes", 30) or 30)) * 60
-            self.db.set(uid, phone=st["phone"], phone_verified=1, session=s, tg_id=me.id,
+            self.db.set(uid, phone=st["phone"], phone_verified=1, session=s, tg_id=me.id, need_login=0,
                         name=name, status="active", expires_at=trial_end,
                         current_plan_id=0, trial_used=1,
                         trial_started_at=trial_start, trial_expires_at=trial_end,
                         trial_warning_sent=0)
         else:
             self.db.set(uid, phone=st["phone"], phone_verified=1, session=s, tg_id=me.id,
-                        name=name, status="active")
+                        name=name, status="active", need_login=0)
+        # لاگینِ موفق = سشن تازه و سالم → مهرِ «نیاز به لاگین» برداشته می‌شود و
+        # اجازه می‌دهیم بعد از این خودکار روشن بماند.
+        try:
+            self.db.set(uid, need_login=0, want_on=1)
+            self.sup.clear_needs_login(uid)
+            self._login_notified and self._login_notified.pop(uid, None)
+        except Exception:
+            pass
         self.db.log(uid, "login", f"tg_id={me.id}" + (" trial" if trial else ""))
         ref_uid, ref_points = self.reward_verified_referral(uid)
         if ref_uid:
@@ -9131,7 +9397,8 @@ class Manager:
                       "tk", "tr", "tclose", "packs", "addpack", "editpack",
                       "rmpack", "gp", "acct", "pstats", "pset", "lim", "admin", "panel",
                       "backup", "restore", "onall", "all_on",
-                      "diag", "why", "diagnose"}
+                      "diag", "why", "diagnose",
+                      "needlogin", "nlogin", "relogin"}
         if cmd in ADMIN_ONLY:
             return await self.say(chat,
                 f"🔒 <b>{cmd}</b> فقط برای مدیر است.\n\n"
@@ -9165,6 +9432,26 @@ class Manager:
             return await self.say(chat, ("✅ " if ok else "❌ ") + msg)
         if cmd in ("diag", "why", "diagnose"):
             return await self.say(chat, self.diag_text())
+        if cmd in ("needlogin", "nlogin", "relogin"):
+            try:
+                rows = self.db.x("SELECT * FROM clients WHERE need_login<>0"
+                                 " ORDER BY uid", (), "all")
+            except Exception:
+                rows = []
+            if not rows:
+                return await self.say(chat, "✅ هیچ اکانتی نیاز به لاگین ندارد.")
+            lines = ["🔑 <b>اکانت‌هایی که باید دوباره لاگین شوند</b>",
+                     f"<i>{_fa_digits(len(rows))} مورد — برای هر کدام اجرای خودکار "
+                     "متوقف است تا کدِ ورود نرود.</i>", ""]
+            for c in rows[:30]:
+                lines.append(f"• <code>{c['uid']}</code> — "
+                             f"{self._esc(c.get('name') or '—')} — "
+                             f"{self._esc((c.get('phone') or '—'))}")
+            if len(rows) > 30:
+                lines.append(f"… و {_fa_digits(len(rows) - 30)} مورد دیگر")
+            lines += ["", "👉 هر اکانت را از «🚀 راه‌اندازی سلف روی اکانتم» "
+                          "دوباره لاگین کن."]
+            return await self.say(chat, "\n".join(lines))
         if cmd in ("onall", "all_on"):
             # دستور عجله‌ایِ مدیر: «همه‌ی سرویس‌هایی که باید روشن باشند را
             # همین حالا روشن کن» — همان چیزی که بعد از آپدیت لازم است.
@@ -12039,6 +12326,20 @@ class Manager:
                     zip_path = tmpzip
                 else:
                     return False, "فایل پشتیبان دانلود نشد"
+            # ── سلف‌های در حال اجرا را ببند ──
+            # اگر فایلِ سشنِ یک پروسهٔ زنده را زیر پایش عوض کنیم، یا سشن
+            # نیمه‌کاره می‌شود یا دو نسخه هم‌زمان روی یک کلید می‌روند؛ هر دو
+            # یعنی «سشن باطل» و بعدش کدِ ورود برای مشتری. پس اول می‌بندیم.
+            try:
+                running = [u for u in list(self.sup.procs)
+                           if self.sup.is_running(u)]
+                if running:
+                    print(f"  ⏹ بستنِ {len(running)} سرویس پیش از بازیابی…",
+                          flush=True)
+                self.sup.shutdown()
+            except Exception as e:
+                print(f"  ⚠️ بستنِ سرویس‌ها قبل از بازیابی: "
+                      f"{type(e).__name__}", flush=True)
             # ── بستن اتصال‌ها قبل از نوشتن (وگرنه SQLite خالی را برمی‌گرداند) ──
             try:
                 if hasattr(self.db, "close"):
@@ -12339,6 +12640,12 @@ class Manager:
             n_want = len(self.db.wanted())
         except Exception:
             n_want = -1
+        try:
+            n_login = int(self.db.x(
+                "SELECT COUNT(*) c FROM clients WHERE need_login<>0",
+                (), "one")["c"] or 0)
+        except Exception:
+            n_login = 0
         data_dir = os.path.abspath(BASE_DIR)
         writable = "✅" if os.access(data_dir, os.W_OK) else "❌ فقط‌خواندنی"
         token = bool((os.environ.get("DATA_GITHUB_TOKEN") or "").strip())
@@ -12361,6 +12668,8 @@ class Manager:
              f"🗄 دیتابیس: {dbsz or '—'}",
              f"☁️ نسخه‌ی بیرونی (گیت‌هاب): "
              f"{'✅ فعال' if token else '❌ تنظیم نشده — کرش = پاک‌شدنِ داده'}",
+             (f"🔑 نیاز به لاگین: {_fa_digits(n_login)}"
+              f" (کد نمی‌رود؛ /needlogin)" if n_login else "🔑 نیاز به لاگین: ۰"),
              f"🧠 حافظه‌ی آزاد: {free}MB" if free is not None else "🧠 حافظه: ؟",
              f"⏱ بالا: {up // 60} دقیقه"]
         ex = last_exit_info()
