@@ -616,7 +616,84 @@ INNER = textwrap.dedent('''
         check(m.tut_find(sub["id"])["ids"] == [600 + ids[1], 777],
               "ویدیوی دوم پشتِ ویدیوی برگشتی نشست (آیدیِ اصلیِ پیام حفظ شد)")
 
-        # ---- 4b) محتوای یک بخشِ «موجود» می‌پرد (کیف پول/امتیاز/اشتراک) ----
+        # ---- 4b) منبعِ قدیمیِ بیرونی: فایلِ پشتیبانِ خودِ ربات (zip) ----
+        # کسی که این قابلیت را تازه دیپلوی می‌کند تاریخچه‌اش خالی است؛ تنها
+        # نسخه‌ی قدیمیِ موجود همان jafj_backup_latest.zip است.
+        import zipfile as _zf
+        zrich = {"bot_token": "t", "tut_chat": 100, "tut_ids": [11, 12],
+                 "cmd_items": [], "rules_text": "قوانینِ پشتیبان"}
+        zrich["tut_sections"] = [
+            {"id": 1, "name": "آموزش بعد از فعال‌سازی", "emoji": "🚀",
+             "chat": 100, "ids": [601, 701], "when": "after_run",
+             "text": "متنِ پشتیبان", "note": "", "btn_cmd": "m:svc",
+             "btn_label": "⚙️ سرویس من", "on": True, "once": True},
+            {"id": 2, "name": "آموزش خرید اشتراک", "emoji": "💎",
+             "chat": 100, "ids": [801], "when": "after_sub", "text": "",
+             "note": "", "btn_cmd": "m:plans", "btn_label": "💎 اشتراک ماهانه",
+             "on": True, "once": True},
+            {"id": 3, "name": "آموزش کیف پول", "emoji": "💳", "chat": 100,
+             "ids": [901, 902], "when": "after_wallet", "text": "", "note": "",
+             "btn_cmd": "w:topup", "btn_label": "💳 شارژ کیف پول",
+             "on": True, "once": True},
+            {"id": 4, "name": "آموزشِ فقط در پشتیبان", "emoji": "🧰",
+             "chat": 100, "ids": [555], "when": "manual", "text": "",
+             "note": "", "btn_cmd": "", "btn_label": "", "on": True,
+             "once": True},
+        ]
+        zpath = M.BASE_DIR + "/jafj_backup_latest.zip"
+        with _zf.ZipFile(zpath, "w") as zf:
+            zf.writestr("data/manager_config.json",
+                        json.dumps(zrich, ensure_ascii=False))
+        got = M.cfg_from_backup_zip()
+        check(bool(got) and len(got[0].get("tut_sections") or []) == 4,
+              "کانفیگِ داخلِ فایلِ پشتیبان خوانده می‌شود")
+        check(any(sid == 4 for sid, (_s, _n) in
+                  M.cfg_lost_section_map(extra=True).items()),
+              "بخشِ داخلِ پشتیبان با extra=True گم‌شده حساب می‌شود")
+        check(not any(sid == 4 for sid, (_s, _n) in
+                      M.cfg_lost_section_map().items()),
+              "بدونِ extra فقط تاریخچه جست‌وجو می‌شود")
+        wall = next(s for s in m.tut_sections() if s["name"] == "آموزش کیف پول")
+        ids_before_zip = list(wall["ids"])
+        m.tut_update(wall["id"], ids=[], text="")
+        ev = await cb("a:secs_h")
+        zt, zkb = ev.edits[-1]
+        check("a:secs_h_zip" in btn_datas(zkb),
+              "وقتی تاریخچه جواب نمی‌دهد، دکمه‌ی «📦 بازیابی از پشتیبان» می‌آید")
+        check(len("a:secs_h_zip".encode()) <= 64, "داده‌ی دکمه زیر سقفِ تلگرام")
+        ev = await cb("a:secs_h_zip")
+        names = [s["name"] for s in m.tut_sections()]
+        check("آموزشِ فقط در پشتیبان" in names,
+              "بخشِ گم‌شده‌ی داخلِ پشتیبان برگشت")
+        check(555 in m.tut_find(next(s["id"] for s in m.tut_sections()
+                                 if s["name"] == "آموزشِ فقط در پشتیبان"))["ids"],
+              "ویدیوی همان بخش هم برگشت")
+        w3 = m.tut_find(wall["id"])
+        check(901 in w3["ids"] and 902 in w3["ids"],
+              "محتوای خالی‌شده‌ی بخشِ کیف پول از پشتیبان پُر شد")
+        check(ids_before_zip and set(w3["ids"]) == set([901, 902]),
+              "نسخه‌ی پُرترِ پشتیبان انتخاب شد، نه مخلوطی از همه‌ی نسخه‌ها")
+        check(any("پشتیبان" in (tt or "") for tt, _k in ev.edits),
+              "نتیجه‌ی بازیابی از پشتیبان در پنل اعلام می‌شود")
+        # حتی وقتی تاریخچه هم گم‌شده دارد، بخشِ «فقط در پشتیبان» دکمه می‌آورد
+        m.tut_remove(next(s["id"] for s in m.tut_sections()
+                          if s["name"] == "آموزشِ فقط در پشتیبان"))
+        ev = await cb("a:secs_h")
+        check("a:secs_h_zip" in btn_datas(ev.edits[-1][1]),
+              "با وجودِ تاریخچه هم اگر پشتیبان چیزی دارد، دکمه‌اش می‌آید")
+        ev = await cb("a:secs_h_zip")
+        check(any(s["name"] == "آموزشِ فقط در پشتیبان" for s in m.tut_sections()),
+              "از پشتیبان دوباره برگشت")
+
+        # پشتیبان نباید بخشِ پُرتری را که مدیر الان دارد عقب ببرد
+        m.tut_update(wall["id"], ids=[901, 902, 333])
+        M.cfg_restore_section_content(None, extra=True)
+        m.cfg = M.Config()
+        check(m.tut_find(wall["id"])["ids"] == [901, 902, 333],
+              "محتوای پُرترِ فعلی با نسخه‌ی پشتیبان جایگزین نشد")
+        os.remove(zpath)
+
+        # ---- 4c) محتوای یک بخشِ «موجود» می‌پرد (کیف پول/امتیاز/اشتراک) ----
         # سناریوی واقعیِ کاربر: بخش سرِ جایش است ولی ویدیو/متنش خالی شده، پس
         # «گم‌شده» نیست و فقط ترمیمِ محتوا نجاتش می‌دهد.
         wallet = next(s for s in m.tut_sections() if s["name"] == "آموزش کیف پول")
