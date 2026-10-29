@@ -66,8 +66,35 @@ def _start_health_server():
             def do_GET(self):
                 self._health(True)
 
+            def _payload(self, path):
+                """/version کدام بیلد/کامیت روی هاست اجرا می‌شود را می‌گوید.
+
+                چرا: بعد از مرج، تنها سؤالِ واقعی این است «دیپلوی شد یا نه؟».
+                بدونِ این، باید لاگ‌ها را گشت. مسیرهای / و /healthz عمداً
+                همان «JAFJ OK» می‌مانند (هلث‌چکِ Render و تست‌ها به همان
+                بایت‌ها وابسته‌اند).
+                """
+                if path in ("/version", "/build"):
+                    g = globals()
+                    ver = g.get("BUILD_VERSION") or "?"
+                    commit = g.get("GIT_COMMIT") or "?"
+                    try:
+                        boot = time.strftime("%Y-%m-%d %H:%M:%S %Z",
+                                             g.get("_BOOT_TIME_STRUCT")
+                                             or time.localtime())
+                    except Exception:
+                        boot = "?"
+                    txt = ("build: %s\ncommit: %s\nstarted: %s\n"
+                           % (ver, commit, boot))
+                    return txt.encode("utf-8")
+                return b"JAFJ OK\n"
+
             def _health(self, body):
-                payload = b"JAFJ OK\n"
+                try:
+                    path = (self.path or "/").split("?", 1)[0]
+                except Exception:
+                    path = "/"
+                payload = self._payload(path)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
@@ -2097,6 +2124,26 @@ API_ID = 28039994
 API_HASH = "00877cdcd706564a4de6abf7f7d64349"
 ADMIN_IDS = [8287266200]
 BUILD_VERSION = "v1028-nocode"
+# کدام کامیتِ گیت دارد اجرا می‌شود؟ (اول JAFJ_COMMIT که هاست/اسکریپتِ بوت
+# می‌تواند بدهد، بعد تلاشِ محلی برای git — داخلِ ایمیج معمولاً .git نیست)
+GIT_COMMIT = ""
+for _k in ("JAFJ_COMMIT", "RENDER_GIT_COMMIT", "RAILWAY_GIT_COMMIT",
+           "HEROKU_SLUG_COMMIT", "SOURCE_COMMIT"):
+    GIT_COMMIT = (os.environ.get(_k) or "").strip()[:12]
+    if GIT_COMMIT:
+        break
+if not GIT_COMMIT:
+    try:
+        import subprocess as _sp
+        GIT_COMMIT = _sp.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=os.path.dirname(os.path.abspath(__file__)),
+                             capture_output=True, text=True,
+                             timeout=5).stdout.strip()[:12]
+    except Exception:
+        GIT_COMMIT = ""
+if not GIT_COMMIT:
+    GIT_COMMIT = "?"
+_BOOT_TIME_STRUCT = time.localtime()
 BUILD_TAG = "JAFJ_MANAGER_82_v1028-nocode_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════

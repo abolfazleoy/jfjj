@@ -46,6 +46,13 @@ for _ in range(40):
     except Exception:
         time.sleep(0.25)
 print("HEALTH", repr(body), flush=True)
+ver = ""
+try:
+    ver = urllib.request.urlopen("http://0.0.0.0:%d/version" % port,
+                                 timeout=1).read().decode()
+except Exception as e:
+    ver = "ERR:%s" % e
+print("VERSION_BODY", repr(ver), flush=True)
 # An idle accepted connection must not monopolize the health server.
 slow = socket.create_connection(("127.0.0.1", port), timeout=2)
 slow.sendall(b"GET / HTTP/1.1\r\n")
@@ -56,6 +63,10 @@ try:
         assert response.status == 200 and response.read() == b""
     with urllib.request.urlopen("http://127.0.0.1:%d/healthz" % port, timeout=2) as response:
         assert response.read() == b"JAFJ OK\n"
+    with urllib.request.urlopen("http://127.0.0.1:%d/version" % port, timeout=2) as response:
+        vb = response.read().decode()
+    assert vb.startswith("build: ") and "\ncommit: " in vb, vb
+    print("VERSION_OK", vb.replace("\n", " | "), flush=True)
     print("HEALTH_CONCURRENT_OK", flush=True)
 finally:
     slow.close()
@@ -93,6 +104,10 @@ def check_blueprint():
               "env %s = %s" % (key, val))
     check(re.search(r"key:\s*BOT_TOKEN\s*\n\s*sync:\s*false", t),
           "BOT_TOKEN به‌صورت secret (sync: false)")
+    # پوش به main باید خودش دیپلوی شود؛ وگرنه بعد از مرج، هاست روی کدِ قبلی
+    # می‌ماند و «چرا به هاست نرسید؟».
+    check(re.search(r"autoDeploy:\s*true", t), "autoDeploy: true (دیپلویِ خودکار)")
+    check(re.search(r"branch:\s*main", t), "branch: main")
 
 
 def run_entry(image, app, data_mount, env_extra=None, make_code_copy=True,
@@ -124,6 +139,19 @@ def run_entry(image, app, data_mount, env_extra=None, make_code_copy=True,
     p = subprocess.run(["sh", str(image / "railway-start.sh")], env=env,
                        capture_output=True, text=True, timeout=120)
     return p.stdout + p.stderr, p.returncode
+
+
+def check_deploy_identity():
+    """اسکریپتِ بوت باید بگوید چه کامیتی دارد اجرا می‌شود (و صادرش کند)."""
+    sh = (REPO / "railway-start.sh").read_text(encoding="utf-8")
+    check("export JAFJ_COMMIT" in sh, "کامیت به manager صادر می‌شود")
+    check("RENDER_GIT_COMMIT" in sh and "RAILWAY_GIT_COMMIT" in sh,
+          "کامیت از متغیرهای خودِ میزبان خوانده می‌شود")
+    check(re.search(r'log "build=.*commit=\$JAFJ_COMMIT', sh),
+          "لاگِ بوت، بیلد و کامیت را می‌نویسد")
+    src = (REPO / "manager_82.py").read_text(encoding="utf-8")
+    check('"RENDER_GIT_COMMIT"' in src and 'GIT_COMMIT' in src,
+          "مدیر هم همان کامیت را برای /version دارد")
 
 
 def check_entrypoint():
@@ -201,6 +229,8 @@ def check_manager():
     check("SELFBOT_ISFILE True" in out, "SELFBOT پیدا شد و موجود است")
     check("HEALTH ''" not in out and "JAFJ OK" in out,
           "هلث‌سرویس روی 0.0.0.0:$PORT جواب می‌دهد")
+    check("VERSION_OK" in out and "build: v" in out,
+          "/version می‌گوید کدام بیلد و کامیت روی هاست اجرا می‌شود")
     check(p.returncode == 0 and "HEALTH_CONCURRENT_OK" in out,
           "GET و HEAD با اتصال معطل هم پاسخ می‌دهند")
     check("RENDER_SERVICE_NAME" in (REPO / "manager_82.py").read_text(
@@ -210,6 +240,7 @@ def check_manager():
 def main():
     print("--- Render support: blueprint + entrypoint guard + host detect ---")
     check_blueprint()
+    check_deploy_identity()
     check_entrypoint()
     check_manager()
     shutil.rmtree(ROOT, ignore_errors=True)

@@ -107,6 +107,23 @@ fi
 
 log "code=$IMAGE_DIR data=$DATA_DIR python=$PY self=$([ -s "$SELF" ] && echo ok || echo MISSING)"
 
+# چه چیزی دارد اجرا می‌شود؟ بعد از مرج، تنها سؤالِ واقعی این است که «دیپلوی شد
+# یا نه». کامیت را از متغیرهای خودِ میزبان (Render/Railway) یا از gitِ محلی
+# می‌خوانیم، صادر می‌کنیم (تا manager_82.py و /version همان را بگویند) و در
+# لاگِ بوت هم می‌نویسیم — دیگر لازم نیست برای فهمیدنِ نسخه، لاگ‌ها را بگردی.
+if [ -z "${JAFJ_COMMIT:-}" ]; then
+    for _k in RENDER_GIT_COMMIT RAILWAY_GIT_COMMIT HEROKU_SLUG_COMMIT SOURCE_COMMIT; do
+        eval "_v=\${$_k:-}"
+        if [ -n "$_v" ]; then JAFJ_COMMIT="$(printf '%s' "$_v" | cut -c1-12)"; break; fi
+    done
+fi
+if [ -z "${JAFJ_COMMIT:-}" ] && command -v git >/dev/null 2>&1; then
+    JAFJ_COMMIT="$(git -C "$IMAGE_DIR" rev-parse --short HEAD 2>/dev/null | cut -c1-12)"
+fi
+if [ -z "${JAFJ_COMMIT:-}" ]; then JAFJ_COMMIT="unknown"; fi
+export JAFJ_COMMIT
+log "build=$(grep -m1 '^BUILD_VERSION' "$MANAGER" 2>/dev/null | cut -d'"' -f2) commit=$JAFJ_COMMIT (GET /version on the service URL shows the same)"
+
 # ── 2.5) GitHub data sync: اطلاعات مشتری‌ها از/به گیت‌هاب ────────────────────
 # اگر DATA_GITHUB_TOKEN تنظیم نشده باشد، هیچ اتفاقی نمی‌افتد (اختیاری است).
 SYNC="$IMAGE_DIR/tools/gh_data_sync.py"

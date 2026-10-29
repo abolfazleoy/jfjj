@@ -11,6 +11,12 @@ services:
     dockerfilePath: ./Dockerfile
     dockerCommand: sh /opt/jafj/render-start.sh
     healthCheckPath: /healthz
+    # هر پوش به main خودش دیپلوی شود — وگرنه بعد از مرج، هاست روی کدِ قبلی
+    # می‌ماند و «چرا نرسید؟». نکته: تغییرِ این فایل به‌تنهایی سرویسِ <b>دستیِ</b>
+    # موجود را عوض نمی‌کند؛ یا Blueprint را Sync کن یا در داشبورد
+    # Settings → Auto-Deploy را روشن بگذار (و Manual Deploy را بزنی).
+    branch: main
+    autoDeploy: true
     region: frankfurt
     plan: starter
     envVars:
