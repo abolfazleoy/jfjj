@@ -10,6 +10,7 @@ The entrypoint must guarantee two things, whatever the Volume situation is:
      does not restart-loop.
 """
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -187,8 +188,13 @@ def scenario_config():
     railway = (REPO / "railway.json").read_text(encoding="utf-8")
     good = ("cp /app/manager_82.py /opt/jafj/manager_82.py" in docker
             and "cp /app/95.py /opt/jafj/95.py" in docker
-            and 'CMD ["sh", "/opt/jafj/railway-start.sh"]' in docker
-            and '"startCommand": "sh /opt/jafj/railway-start.sh"' in railway)
+            # CMD می‌تواند هر entrypointی باشد که در نهایت همان ناظر را اجرا
+            # می‌کند (blitz-start.sh خودش railway-start.sh را exec می‌کند).
+            and re.search(r'CMD\s*\[\s*"sh",\s*"/opt/jafj/'
+                          r'(railway|blitz|render)-start\.sh"\s*\]', docker)
+            and '"startCommand": "sh /opt/jafj/railway-start.sh"' in railway
+            and 'exec sh "$IMAGE_DIR/railway-start.sh"' in
+            (REPO / "blitz-start.sh").read_text(encoding="utf-8"))
     print("scenario7:", "PASS" if good else "FAIL")
     return good
 
