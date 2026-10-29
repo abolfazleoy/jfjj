@@ -903,6 +903,62 @@ class Shop:
         return self.x("SELECT referrer, COUNT(*) c FROM referrals"
                       " GROUP BY referrer ORDER BY c DESC LIMIT ?", (n,), "all")
 
+    def has_user_data(self, uid):
+        uid = int(uid or 0)
+        if uid <= 0:
+            return False
+        for sql, args in (
+            ("SELECT 1 FROM points WHERE uid=? LIMIT 1", (uid,)),
+            ("SELECT 1 FROM wallet WHERE uid=? LIMIT 1", (uid,)),
+            ("SELECT 1 FROM orders WHERE uid=? LIMIT 1", (uid,)),
+            ("SELECT 1 FROM tickets WHERE uid=? LIMIT 1", (uid,)),
+            ("SELECT 1 FROM referrals WHERE uid=? OR referrer=? LIMIT 1", (uid, uid)),
+            ("SELECT 1 FROM referral_point_rewards WHERE invitee_uid=? OR referrer=? LIMIT 1", (uid, uid)),
+        ):
+            if self.x(sql, args, "one"):
+                return True
+        return False
+
+    def delete_user(self, uid):
+        """پاک کردن کامل همه‌ی داده‌های فروشگاهی یک کاربر (کیف‌پول، امتیاز، سفارش، تیکت، زیرمجموعه)."""
+        uid = int(uid or 0)
+        counts = {"orders": 0, "wallet": 0, "points": 0, "tickets": 0, "referrals": 0}
+        if uid <= 0:
+            return counts
+        with self.lock:
+            try:
+                self.c.execute(
+                    "DELETE FROM ticket_msgs WHERE tid IN (SELECT id FROM tickets WHERE uid=?)",
+                    (uid,))
+                counts["tickets"] = max(0, self.c.execute(
+                    "DELETE FROM tickets WHERE uid=?", (uid,)).rowcount or 0)
+                self.c.execute(
+                    "DELETE FROM referral_rewards WHERE order_id IN (SELECT id FROM orders WHERE uid=?) OR referrer=?",
+                    (uid, uid))
+                counts["orders"] = max(0, self.c.execute(
+                    "DELETE FROM orders WHERE uid=?", (uid,)).rowcount or 0)
+                counts["wallet"] = max(0, self.c.execute(
+                    "DELETE FROM wallet WHERE uid=?", (uid,)).rowcount or 0)
+                self.c.execute("DELETE FROM wallet_log WHERE uid=?", (uid,))
+                counts["points"] = max(0, self.c.execute(
+                    "DELETE FROM points WHERE uid=?", (uid,)).rowcount or 0)
+                self.c.execute("DELETE FROM points_log WHERE uid=?", (uid,))
+                self.c.execute(
+                    "DELETE FROM referral_point_rewards WHERE invitee_uid=? OR referrer=?",
+                    (uid, uid))
+                counts["referrals"] = max(0, self.c.execute(
+                    "DELETE FROM referrals WHERE uid=? OR referrer=?",
+                    (uid, uid)).rowcount or 0)
+                self.c.commit()
+            except Exception:
+                self.c.rollback()
+                raise
+        try:
+            touch_data("shop_user_delete")
+        except Exception:
+            pass
+        return counts
+
 
 # ═══════════════════════════════════════════════════════════
 #   بخش ۲ — ربات، پنل و مدیریت سرویس‌ها
@@ -3202,6 +3258,75 @@ class DB:
         except Exception:
             return False
 
+    def find_users(self, query, limit=15):
+        """جستجوی کاربر با uid، tg_id، @username، شماره موبایل یا نام."""
+        raw = str(query or "").strip()
+        if not raw:
+            return []
+        uname = raw
+        if "t.me/" in uname.lower():
+            uname = uname.split("/")[-1].split("?")[0]
+        uname = uname.lstrip("@").strip()
+        num = digits(raw)
+        seen = set()
+        out = []
+
+        def _push(rows):
+            for r in (rows or []):
+                u = r.get("uid")
+                if u is not None and u not in seen:
+                    seen.add(u)
+                    out.append(r)
+
+        if num and raw.lstrip("+- ").replace(" ", "").isdigit() or (num and num == raw):
+            try:
+                iv = int(num)
+                _push(self.x("SELECT * FROM clients WHERE uid=? OR tg_id=?",
+                             (iv, iv), "all"))
+            except Exception:
+                pass
+        # نرمال‌سازی شماره موبایل (مثلاً 0912... یا +98912...)
+        if len(num) >= 7:
+            tail = num[-10:] if len(num) >= 10 else num
+            _push(self.x("SELECT * FROM clients WHERE REPLACE(REPLACE(COALESCE(phone,''),' ',''),'+','') LIKE ?"
+                         " ORDER BY created_at DESC LIMIT ?",
+                         (f"%{tail}%", int(limit)), "all"))
+        if uname:
+            _push(self.x("SELECT * FROM clients WHERE LOWER(COALESCE(username,''))=LOWER(?)"
+                         " ORDER BY created_at DESC LIMIT ?",
+                         (uname, int(limit)), "all"))
+            like = f"%{uname}%"
+            _push(self.x("SELECT * FROM clients WHERE LOWER(COALESCE(username,'')) LIKE LOWER(?)"
+                         " OR LOWER(COALESCE(name,'')) LIKE LOWER(?)"
+                         " ORDER BY created_at DESC LIMIT ?",
+                         (like, like, int(limit)), "all"))
+        return out[:int(limit)]
+
+    def delete_user(self, uid):
+        """پاک کردن کامل رکورد کاربر، سوابق آموزش و لاگ‌های او از manager.db."""
+        uid = int(uid or 0)
+        counts = {"client": 0, "tut_sent": 0, "log": 0}
+        if uid <= 0:
+            return counts
+        self._tut_table()
+        with self.lock:
+            try:
+                counts["client"] = max(0, self.c.execute(
+                    "DELETE FROM clients WHERE uid=?", (uid,)).rowcount or 0)
+                counts["tut_sent"] = max(0, self.c.execute(
+                    "DELETE FROM tut_sent WHERE uid=?", (uid,)).rowcount or 0)
+                counts["log"] = max(0, self.c.execute(
+                    "DELETE FROM log WHERE uid=?", (uid,)).rowcount or 0)
+                self.c.commit()
+            except Exception:
+                self.c.rollback()
+                raise
+        try:
+            touch_data("clients")
+        except Exception:
+            pass
+        return counts
+
 
 # ── اعتبارسنجیِ فایل سشن (بدون نیاز به telethon) ─────────────────────────
 # چرا: `TelegramClient.start(phone=...)` وقتی سشن معتبر نباشد **کد ورود
@@ -3855,8 +3980,11 @@ class Supervisor:
             except Exception:
                 pass
         p = self.procs.get(uid)
+        if (not p or p.poll() is not None) and self._adopt_orphan(uid):
+            p = self.procs.get(uid)
         if not p or p.poll() is not None:
             self.procs.pop(uid, None)
+            self._clear_pid(uid)
             return True, "خاموش بود"
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
@@ -3878,6 +4006,135 @@ class Supervisor:
         self._clear_pid(uid)
         self.db.log(uid, "stop")
         return True, "خاموش شد"
+
+    def jafj_summary(self, uid):
+        """خلاصه‌ی وضعیت تنظیمات جفج و تنظیمات/دیتابیس تبادل روی دیسک (بدون ساخت پوشه)."""
+        info = {
+            "folder_exists": False,
+            "files_count": 0,
+            "has_settings": False,
+            "has_db": False,
+            "channel_std": "",
+            "channel_vip": "",
+            "ex_enabled": False,
+            "ex_groups": 0,
+            "ex_custom_msgs": 0,
+            "ex_rows": 0,
+            "queue_rows": 0,
+        }
+        folder = os.path.join(CLIENTS_DIR, str(uid))
+        if not os.path.isdir(folder):
+            return info
+        info["folder_exists"] = True
+        try:
+            names = os.listdir(folder)
+        except Exception:
+            names = []
+        info["files_count"] = len(names)
+        st_path = os.path.join(folder, "jafj_settings.json")
+        db_path = os.path.join(folder, "jafj.db")
+        info["has_settings"] = any(n == "jafj_settings.json" or n.startswith("jafj_settings.json.bak") for n in names)
+        info["has_db"] = any(n == "jafj.db" or n.startswith("jafj.db.bak") for n in names)
+        if os.path.isfile(st_path):
+            try:
+                with open(st_path, encoding="utf-8") as f:
+                    d = json.load(f) or {}
+                info["channel_std"] = str((d.get("standard") or {}).get("channel") or "").strip()
+                info["channel_vip"] = str((d.get("vip") or {}).get("channel") or "").strip()
+                ex = d.get("exchange") or {}
+                if isinstance(ex, dict):
+                    info["ex_enabled"] = bool(ex.get("enabled"))
+                    grps = ex.get("groups") or []
+                    info["ex_groups"] = len(grps) if isinstance(grps, list) else 0
+                    c_msgs = 0
+                    for mk in ("msg_ok", "msg_no", "msg_claim_no", "msg_wait",
+                               "msg_nolink", "msg_come", "msg_first"):
+                        if str(ex.get(mk) or "").strip():
+                            c_msgs += 1
+                    info["ex_custom_msgs"] = c_msgs
+            except Exception:
+                pass
+        if os.path.isfile(db_path):
+            conn = None
+            try:
+                conn = sqlite3.connect(db_path, timeout=2.0)
+                try:
+                    r = conn.execute("SELECT COUNT(*) FROM exchange").fetchone()
+                    info["ex_rows"] = int(r[0] or 0) if r else 0
+                except Exception:
+                    pass
+                try:
+                    r = conn.execute("SELECT COUNT(*) FROM queue").fetchone()
+                    info["queue_rows"] = int(r[0] or 0) if r else 0
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return info
+
+    def wipe_jafj_settings(self, uid, max_accounts=1, recreate_defaults=True):
+        """پاک کردن کامل تنظیمات جفج + تنظیمات تبادل + دیتابیس تبادل/صف (با حفظ سشن و اشتراک)."""
+        was_running = self.is_running(uid)
+        self.stop(uid)
+        self.last_failure.pop(uid, None)
+        self._resume_fail.pop(uid, None)
+        folder = os.path.join(CLIENTS_DIR, str(uid))
+        removed = 0
+        if os.path.isdir(folder):
+            try:
+                names = list(os.listdir(folder))
+            except Exception:
+                names = []
+            for fn in names:
+                if (fn == "jafj_settings.json"
+                        or fn.startswith("jafj_settings.json.")
+                        or fn == "jafj.db"
+                        or fn.startswith("jafj.db-")
+                        or fn.startswith("jafj.db.")
+                        or fn == "jafj_status.json"
+                        or fn.startswith("jafj_status.json.")
+                        or fn in ("jafj.log", "run.log")):
+                    fp = os.path.join(folder, fn)
+                    try:
+                        if os.path.isdir(fp) and not os.path.islink(fp):
+                            shutil.rmtree(fp, ignore_errors=True)
+                        else:
+                            os.remove(fp)
+                        removed += 1
+                    except Exception:
+                        pass
+            if recreate_defaults:
+                self.write_defaults(uid, max_accounts=max_accounts)
+        try:
+            touch_data("wipe_jafj")
+        except Exception:
+            pass
+        return {"removed_files": removed, "was_running": was_running}
+
+    def wipe_folder(self, uid):
+        """توقف کامل سلف و حذف کل پوشه‌ی کاربر (سشن، تنظیمات جفج، تنظیمات و دیتابیس تبادل، بکاپ‌ها و لاگ‌ها)."""
+        self.is_running(uid)
+        self.stop(uid)
+        self.procs.pop(uid, None)
+        self.last_failure.pop(uid, None)
+        self._resume_fail.pop(uid, None)
+        folder = os.path.join(CLIENTS_DIR, str(uid))
+        removed = 0
+        if os.path.isdir(folder):
+            for _r, _d, files in os.walk(folder):
+                removed += len(files)
+            shutil.rmtree(folder, ignore_errors=True)
+        try:
+            touch_data("wipe_folder")
+        except Exception:
+            pass
+        return removed
 
     def restart(self, uid):
         self.stop(uid)
@@ -4105,11 +4362,12 @@ DEFAULT_TUTORIAL = """📚 <b>آموزش فعال‌سازی سلف</b>
 ADMIN_HELP = """🛠 <b>پنل مدیر</b>
 
 /users — لیست مشتری‌ها
-/user 123 — جزئیات یک مشتری
+/user 123 — جزئیات یک مشتری (uid / @username / شماره)
 /ok 123 30 — فعال‌سازی برای 30 روز
 /off_user 123 — غیرفعال کردن
 /ext 123 15 — تمدید 15 روز
-/del 123 — حذف کامل مشتری
+/del 123 — پاک کردن کامل اطلاعات کاربر (حساب + سشن + تنظیمات جفج/تبادل + فروشگاه)
+/resetjafj 123 — پاک کردن فقط تنظیمات جفج و تبادل کاربر (حفظ اشتراک و سشن)
 /pon 123 /poff 123 — روشن/خاموش کردن پروسه
 /plog 123 — لاگ پروسه
 /stats — آمار کلی
@@ -4282,6 +4540,8 @@ def admin_menu(pending=0, tickets=0, trial_on=True):
          B("💰 درآمد", "a:revenue", "success")],
         [B("👥 مشتری‌ها", "a:ulist:0", "primary"),
          B("📊 آمار", "a:stats", "primary")],
+        [B("🔍 جستجوی کاربر", "a:ufind", "primary"),
+         B("🗑 پاک کردن اطلاعات کاربر", "a:uwipe", "danger")],
         [B("💰 قیمت پلن‌ها", "a:prices", "success"),
          B("🎯 قیمت امتیاز", "a:pkprice", "success")],
         [B("🎟 کد تخفیف", "a:discs", "success"),
@@ -5937,28 +6197,55 @@ class Manager:
             t.append(f"\n🎧 پشتیبانی: {self.cfg['contact']}")
         return "\n".join(t)
 
+    def _jafj_summary_line(self, uid):
+        js = self.sup.jafj_summary(uid)
+        if not js["folder_exists"]:
+            return "ندارد (پوشه خالی)"
+        parts = []
+        ch = js["channel_std"] or js["channel_vip"]
+        if ch:
+            parts.append(f"کانال {self._esc(ch)}")
+        if js["ex_enabled"]:
+            parts.append("تبادل روشن")
+        if js["ex_groups"]:
+            parts.append(f"{_fa_digits(js['ex_groups'])} گروه تبادل")
+        if js["ex_custom_msgs"]:
+            parts.append(f"{_fa_digits(js['ex_custom_msgs'])} متن تبادل")
+        if js["ex_rows"]:
+            parts.append(f"{_fa_digits(js['ex_rows'])} رکورد تبادل")
+        if js["queue_rows"]:
+            parts.append(f"{_fa_digits(js['queue_rows'])} صف")
+        if parts:
+            return " · ".join(parts)
+        if js["has_settings"] or js["has_db"]:
+            return "پیش‌فرض (بدون کانال/گروه تبادل)"
+        return "ثبت نشده"
+
     def _admin_user_text(self, c):
         if not c:
             return "پیدا نشد."
         uid = c["uid"]
-        pts = self.shop.p_balance(uid) if self.shop else 0
+        pr = self.shop.x("SELECT balance FROM points WHERE uid=?", (uid,), "one") if self.shop else None
+        pts = pr["balance"] if pr else 0
         wal = self.shop.balance(uid) if self.shop else 0
         live = "🟢 روشن" if self.sup.is_running(uid) else "⚪ خاموش"
         return (
-            f"👤 <b>{c.get('name') or '—'}</b>\n{self.LINE}\n"
+            f"👤 <b>{self._esc(c.get('name') or '—')}</b>\n{self.LINE}\n"
             f"uid: <code>{uid}</code>\n"
+            f"یوزرنیم: @{self._esc(c.get('username') or '—')}\n"
             f"وضعیت: {self.client_state(c)}\n"
             f"پروسه: {live}\n"
             f"اعتبار: {human_left(c.get('expires_at') or 0)}\n"
             f"سشن: {'✅' if c.get('session') else '❌'}\n"
-            f"شماره: {c.get('phone') or '—'}\n"
+            f"شماره: {self._esc(c.get('phone') or '—')}\n"
             f"🎯 امتیاز: {_fa_digits(pts)}\n"
             f"💳 کیف پول: {money(wal)}\n"
+            f"⚙️ جفج/تبادل: {self._jafj_summary_line(uid)}\n"
             f"{self.LINE}")
 
     def _admin_user_kb(self, c):
         uid = c["uid"]
-        banned = c["status"] == "banned"
+        banned = c.get("status") == "banned"
         return [
             [B("⛔ بن" if not banned else "✅ آنبن",
                f"ab:{uid}:{'1' if not banned else '0'}",
@@ -5979,9 +6266,212 @@ class Manager:
                f"aproc:{uid}",
                "success" if not self.sup.is_running(uid) else "danger")],
             [B("♻️ ریست تست رایگان", f"aut:{uid}", "warning")],
+            [B("🧹 پاک کردن تنظیمات جفج/تبادل", f"auj:{uid}", "danger"),
+             B("🗑 پاک کردن کل اطلاعات", f"aud:{uid}", "danger")],
             [B("⬅️ لیست مشتری", "a:ulist:0", "primary"),
              B("🛠 پنل", "a:home", "danger")],
         ]
+
+    def _user_or_orphan(self, tid):
+        """رکورد کاربر را برمی‌گرداند؛ حتی اگر فقط پوشه‌ی جفج/تبادل یا داده‌ی فروشگاهش مانده باشد."""
+        tid = int(tid or 0)
+        if tid <= 0:
+            return None
+        c = self.db.get(tid)
+        if c:
+            return c
+        has_dir = os.path.isdir(os.path.join(CLIENTS_DIR, str(tid)))
+        has_shop = bool(self.shop and self.shop.has_user_data(tid))
+        if has_dir or has_shop:
+            return {
+                "uid": tid, "username": "", "name": f"کاربر {tid} (داده‌ی باقیمانده)",
+                "phone": "", "tg_id": tid, "session": "", "status": "new",
+                "expires_at": 0, "created_at": now(), "restarts": 0,
+            }
+        return None
+
+    def _resolve_admin_users(self, query):
+        """جستجوی کاربر (در clients + پوشه‌ی clients/ + فروشگاه)."""
+        raw = str(query or "").strip()
+        if not raw:
+            return []
+        rows = self.db.find_users(raw)
+        num = digits(raw)
+        if not rows and num and raw.lstrip("+- ").replace(" ", "").isdigit():
+            try:
+                orphan = self._user_or_orphan(int(num))
+                if orphan:
+                    rows = [orphan]
+            except Exception:
+                pass
+        return rows
+
+    def _admin_wipe_confirm_view(self, tid):
+        c = self._user_or_orphan(tid)
+        if not c:
+            return "کاربر پیدا نشد.", [back_btn("a:ulist:0")]
+        js = self.sup.jafj_summary(tid)
+        pr = self.shop.x("SELECT balance FROM points WHERE uid=?", (tid,), "one") if self.shop else None
+        pts = pr["balance"] if pr else 0
+        wal = self.shop.balance(tid) if self.shop else 0
+        txt = (
+            f"⚠️ <b>پاک کردن کامل اطلاعات کاربر</b>\n{self.LINE}\n"
+            f"👤 نام: <b>{self._esc(c.get('name') or '—')}</b>\n"
+            f"🆔 آیدی: <code>{tid}</code>\n"
+            f"📱 شماره: {self._esc(c.get('phone') or '—')}\n"
+            f"🎯 امتیاز: {_fa_digits(pts)}  ·  💳 کیف پول: {money(wal)}\n"
+            f"⚙️ جفج/تبادل: {self._jafj_summary_line(tid)}\n"
+            f"{self.LINE}\n"
+            "با زدن تأیید، همه‌ی موارد زیر <b>کاملاً و غیرقابل‌بازگشت</b> پاک می‌شوند:\n"
+            "• پروفایل، شماره، وضعیت تأیید، اشتراک و تست رایگان\n"
+            "• سشن تلگرام و توقف کامل پروسه‌ی سلف\n"
+            "• <b>تنظیمات جفج و تنظیمات تبادل</b> (کانال‌ها، گروه‌های تبادل، متن‌های تبادل، زمان‌بندی‌ها، اسکن و محافظ ریسک + بکاپ‌ها)\n"
+            f"• <b>دیتابیس تبادل و صف ارسال</b> ({_fa_digits(js['ex_rows'])} رکورد تبادل، {_fa_digits(js['queue_rows'])} آیتم صف)\n"
+            "• امتیازها، کیف پول، سفارش‌ها، تیکت‌ها و زیرمجموعه"
+        )
+        kb = [
+            [B("✅ بله، کل اطلاعات کاربر پاک شود", f"audx:{tid}", "danger")],
+            [B("🧹 فقط تنظیمات جفج و تبادل پاک شود", f"aujx:{tid}", "primary")],
+            [B("❌ انصراف و بازگشت", f"au:{tid}")],
+        ]
+        return txt, kb
+
+    def _admin_jafj_wipe_confirm_view(self, tid):
+        c = self._user_or_orphan(tid)
+        if not c:
+            return "کاربر پیدا نشد.", [back_btn("a:ulist:0")]
+        js = self.sup.jafj_summary(tid)
+        ch_std = self._esc(js["channel_std"] or "—")
+        ch_vip = self._esc(js["channel_vip"] or "—")
+        txt = (
+            f"🧹 <b>پاک کردن تنظیمات جفج و تبادل کاربر</b>\n{self.LINE}\n"
+            f"👤 نام: <b>{self._esc(c.get('name') or '—')}</b>  (<code>{tid}</code>)\n"
+            f"📢 کانال عادی: {ch_std}  ·  VIP: {ch_vip}\n"
+            f"🔄 وضعیت تبادل: {'روشن' if js['ex_enabled'] else 'خاموش'}  ·  "
+            f"{_fa_digits(js['ex_groups'])} گروه  ·  "
+            f"{_fa_digits(js['ex_custom_msgs'])} متن سفارشی\n"
+            f"🗄 دیتابیس سلف: {_fa_digits(js['ex_rows'])} رکورد تبادل  ·  "
+            f"{_fa_digits(js['queue_rows'])} آیتم صف\n"
+            f"{self.LINE}\n"
+            "با تأیید این گزینه:\n"
+            "• تمام <b>تنظیمات جفج</b> و <b>تنظیمات تبادل</b> (کانال‌ها، گروه‌ها، متن‌ها، زمان‌بندی‌ها و بکاپ‌های تنظیمات) پاک و به حالت خام اولیه برمی‌گردد.\n"
+            "• کل <b>دیتابیس تبادل و صف ارسال</b> (`jafj.db`) پاک می‌شود.\n"
+            "• ✅ اشتراک، امتیاز، کیف پول و سشن ورود کاربر <b>حفظ می‌شود</b>."
+        )
+        kb = [
+            [B("✅ بله، تنظیمات جفج و تبادل پاک شود", f"aujx:{tid}", "danger")],
+            [B("🗑 کل اطلاعات کاربر هم پاک شود", f"aud:{tid}", "danger")],
+            [B("❌ انصراف و بازگشت", f"au:{tid}")],
+        ]
+        return txt, kb
+
+    def _refresh_local_backups_after_wipe(self):
+        """همگام‌سازی فوری دیسک/پشتیبان محلی بعد از حذف اطلاعات تا در بازیابی برنگردد."""
+        for handle in (getattr(self, "db", None), getattr(self, "shop", None)):
+            if handle is not None:
+                try:
+                    handle.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+                try:
+                    handle.c.commit()
+                except Exception:
+                    pass
+        try:
+            cnt = self.db.x("SELECT COUNT(*) c FROM clients", (), "one")
+            if cnt and int(cnt.get("c") or 0) == 0:
+                self._allow_empty_backup_once = True
+        except Exception:
+            pass
+        latest = os.path.join(BASE_DIR, "jafj_backup_latest.zip")
+        has_local_bak = os.path.isfile(latest) or os.path.isdir(os.path.join(BASE_DIR, "backups"))
+        if has_local_bak:
+            tmp = os.path.join(tempfile.gettempdir(), f"jafj_wipe_bk_{os.getpid()}.zip")
+            try:
+                zc, sz, _om = self._write_backup_zip(tmp)
+                if zc > 0 and sz > 0 and os.path.isfile(tmp):
+                    self._save_local_backup_copy(tmp)
+            except Exception as e:
+                print("refresh_local_backups_after_wipe:", type(e).__name__, e)
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
+    async def wipe_user_jafj(self, tid, by_admin=0):
+        """پاک کردن کامل تنظیمات جفج + تنظیمات و دیتابیس تبادل یک کاربر (با حفظ حساب/سشن)."""
+        tid = int(tid or 0)
+        c = self._user_or_orphan(tid)
+        if not c:
+            return False, "کاربر پیدا نشد.", {}
+        plan = self.effective_plan(tid)
+        mx = 1
+        try:
+            ov = int(c.get("max_accounts") or 0)
+            mx = ov if ov > 0 else max(1, int((plan or {}).get("max_accounts", 1) or 1))
+        except Exception:
+            mx = 1
+        res = await asyncio.to_thread(
+            self.sup.wipe_jafj_settings, tid, mx, bool(self.db.get(tid)))
+        restarted = False
+        if res["was_running"] and (self.db.get(tid) or {}).get("session"):
+            allow, _why = self.can_run(tid)
+            if allow:
+                ok_st, _m = await asyncio.to_thread(self.sup.start, tid)
+                restarted = bool(ok_st)
+        if self.db.get(tid):
+            self.db.log(tid, "jafj_wiped", f"by={by_admin} files={res['removed_files']}")
+        await asyncio.to_thread(self._refresh_local_backups_after_wipe)
+        touch_data("wipe_jafj")
+        msg = (
+            f"🧹 <b>تنظیمات جفج و تبادل کاربر <code>{tid}</code> پاک شد.</b>\n"
+            f"{self.LINE}\n"
+            f"• فایل‌های پاک‌شده (تنظیمات/تبادل/صف/بکاپ): {_fa_digits(res['removed_files'])}\n"
+            f"• تنظیمات جفج و تبادل به حالت خام اولیه برگشت.\n"
+            + ("• 🟢 سلف با تنظیمات خام دوباره روشن شد." if restarted else
+               "• سشن و اشتراک/امتیاز کاربر بدون تغییر حفظ شد.")
+        )
+        return True, msg, res
+
+    async def wipe_user_data(self, tid, by_admin=0):
+        """پاک کردن کامل کل اطلاعات یک کاربر (حساب + سشن + تنظیمات جفج/تبادل + فروشگاه)."""
+        tid = int(tid or 0)
+        c = self._user_or_orphan(tid)
+        if not c:
+            return False, "کاربر پیدا نشد.", {}
+        name = c.get("name") or "—"
+        await self.cancel(tid)
+        self._receipts.pop(tid, None)
+        self._join_ok.pop(tid, None)
+        if getattr(self, "_login_notified", None):
+            self._login_notified.pop(tid, None)
+        js = self.sup.jafj_summary(tid)
+        removed_files = await asyncio.to_thread(self.sup.wipe_folder, tid)
+        db_counts = self.db.delete_user(tid)
+        shop_counts = self.shop.delete_user(tid) if self.shop else {
+            "orders": 0, "wallet": 0, "points": 0, "tickets": 0, "referrals": 0}
+        if by_admin and by_admin != tid:
+            self.db.log(by_admin, "user_wiped", f"uid={tid}")
+        await asyncio.to_thread(self._refresh_local_backups_after_wipe)
+        touch_data("wipe_user")
+        stats = {
+            "removed_files": removed_files,
+            "db": db_counts,
+            "shop": shop_counts,
+            "jafj": js,
+        }
+        msg = (
+            f"🗑 <b>کل اطلاعات کاربر کامل پاک شد</b>\n{self.LINE}\n"
+            f"👤 کاربر: <b>{self._esc(name)}</b>  (<code>{tid}</code>)\n"
+            f"• پروفایل، شماره، سشن و وضعیت تست/اشتراک: پاک شد\n"
+            f"• تنظیمات جفج، تنظیمات تبادل و دیتابیس تبادل/صف: پاک شد "
+            f"({_fa_digits(removed_files)} فایل)\n"
+            f"• فروشگاه (امتیاز، کیف‌پول، {_fa_digits(shop_counts['orders'])} سفارش، "
+            f"{_fa_digits(shop_counts['tickets'])} تیکت، زیرمجموعه): پاک شد"
+        )
+        return True, msg, stats
 
     def force_chans(self):
         return list(self.cfg.d.get("force_join") or [])
@@ -7785,9 +8275,12 @@ class Manager:
         page = max(0, int(page))
         chunk = rows[page * per:(page + 1) * per]
         if not rows:
-            return await self.edit(ev, "مشتری‌ای نیست.", [back_btn("a:home")])
+            return await self.edit(ev, "مشتری‌ای نیست.",
+                                   [[B("🗑 پاک کردن با آیدی", "a:uwipe", "danger")],
+                                    back_btn("a:home")])
         txt = [f"👥 <b>مشتری‌ها</b>  ({_fa_digits(len(rows))})", self.LINE]
-        kb = []
+        kb = [[B("🔍 جستجوی کاربر", "a:ufind", "primary"),
+               B("🗑 پاک کردن اطلاعات کاربر", "a:uwipe", "danger")]]
         for c in chunk:
             live = "🟢" if self.sup.is_running(c["uid"]) else "⚪"
             st = {"active": "✅", "banned": "⛔", "expired": "🔴",
@@ -7847,7 +8340,8 @@ class Manager:
                                              "sec_btn_label", "sec_text", "tut_wait",
                                              "rt_set",
                                              "cm_add", "cm_edit", "cm_intro",
-                                             "hub_intro", "rules_set", "rules_btn_set"):
+                                             "hub_intro", "rules_set", "rules_btn_set",
+                                             "ufind_q", "uwipe_pick"):
             # a:tut_add / a:sec_add / a:sec_set: خودشان حالتِ ثبت محتوا را
             # (از نو) باز می‌کنند؛ اگر اینجا پاکشان کنیم، سوییچ بین
             # «➕ افزودن» و «📤 جایگزینی» وسطِ کار حالت را از بین می‌برد.
@@ -8713,6 +9207,33 @@ class Manager:
                 return await self.edit(ev, "\n".join(txt), kb)
             if k.startswith("ulist:"):
                 return await self.admin_users_page(ev, int(digits(k.split(":")[-1]) or 0))
+            if k == "ufind":
+                self.fsm[uid] = {"step": "ufind_q"}
+                return await self.edit(ev,
+                    f"🔍 <b>جستجوی کاربر</b>\n{self.LINE}\n"
+                    "آیدی عددی (<code>uid</code>)، <code>@username</code>، شماره موبایل "
+                    "یا بخشی از نام کاربر را بفرست تا صفحه‌ی مدیریتش باز شود.\n\n"
+                    "<i>/cancel برای لغو</i>",
+                    [[B("👥 لیست مشتری‌ها", "a:ulist:0", "primary")],
+                     back_btn("a:home")])
+            if k == "uwipe":
+                self.fsm[uid] = {"step": "uwipe_pick"}
+                rows = self.db.all()[:6]
+                kb = []
+                for c in rows:
+                    lbl = f"🗑 {c.get('name') or c['uid']} ({c['uid']})"
+                    kb.append([B(lbl[:48], f"aud:{c['uid']}", "danger")])
+                kb.append([B("👥 لیست کامل مشتری‌ها", "a:ulist:0", "primary")])
+                kb.append(back_btn("a:home"))
+                return await self.edit(ev,
+                    f"🗑 <b>پاک کردن اطلاعات کاربر</b>\n{self.LINE}\n"
+                    "آیدی عددی (<code>uid</code>)، <code>@username</code> یا شماره‌ی کاربر را "
+                    "همینجا بفرست (یا از لیست زیر انتخاب کن).\n\n"
+                    "در مرحله‌ی بعد با تأیید تو، دو حالت داری:\n"
+                    "• <b>🗑 پاک کردن کل اطلاعات</b> (حساب، سشن، اشتراک، امتیاز/کیف‌پول + تمام تنظیمات جفج و تنظیمات و دیتابیس تبادل)\n"
+                    "• <b>🧹 فقط پاک کردن تنظیمات جفج و تبادل</b> (با حفظ سشن و اشتراک)\n\n"
+                    "<i>/cancel برای لغو</i>",
+                    kb)
             if k == "bcast":
                 self.fsm[uid] = {"step": "bcast"}
                 return await self.edit(ev,
@@ -9841,10 +10362,46 @@ class Manager:
 
         if data.startswith("au:") and adm:
             await ans()
-            c = self.db.get(int(digits(data[3:]) or 0))
+            c = self._user_or_orphan(int(digits(data[3:]) or 0))
             if not c:
                 return await self.edit(ev, "پیدا نشد.", [back_btn("a:ulist:0")])
             return await self.edit(ev, self._admin_user_text(c), self._admin_user_kb(c))
+
+        if data.startswith("aud:") and adm:
+            await ans()
+            tid = int(digits(data[4:]) or 0)
+            txt, kb = self._admin_wipe_confirm_view(tid)
+            return await self.edit(ev, txt, kb)
+
+        if data.startswith("audx:") and adm:
+            tid = int(digits(data[5:]) or 0)
+            await ans("در حال پاک کردن اطلاعات…")
+            ok, msg, _st = await self.wipe_user_data(tid, by_admin=uid)
+            kb = [
+                [B("🗑 پاک کردن کاربر دیگر", "a:uwipe", "danger")],
+                [B("👥 لیست مشتری‌ها", "a:ulist:0", "primary"),
+                 B("🛠 پنل مدیر", "a:home", "danger")],
+            ]
+            return await self.edit(ev, msg if ok else f"❌ {msg}", kb)
+
+        if data.startswith("auj:") and adm:
+            await ans()
+            tid = int(digits(data[4:]) or 0)
+            txt, kb = self._admin_jafj_wipe_confirm_view(tid)
+            return await self.edit(ev, txt, kb)
+
+        if data.startswith("aujx:") and adm:
+            tid = int(digits(data[5:]) or 0)
+            await ans("در حال پاک کردن تنظیمات جفج/تبادل…")
+            ok, msg, _st = await self.wipe_user_jafj(tid, by_admin=uid)
+            c = self._user_or_orphan(tid)
+            if ok and c:
+                return await self.edit(ev,
+                    self._admin_user_text(c) + "\n" + msg,
+                    self._admin_user_kb(c))
+            return await self.edit(ev, msg if ok else f"❌ {msg}",
+                                   [[B("👥 لیست مشتری‌ها", "a:ulist:0", "primary"),
+                                     B("🛠 پنل مدیر", "a:home", "danger")]])
 
         if data.startswith("aut:") and adm:
             # ریستِ تست رایگان برای یک کاربر (مدت و روشن‌بودنِ تست عوض نمی‌شود)
@@ -10938,10 +11495,11 @@ class Manager:
 
         if cmd == "user":
             if not p:
-                return await self.say(chat, "/user 123456")
-            c = self.db.get(int(digits(p[0]) or 0))
-            if not c:
+                return await self.say(chat, "/user 123456  (یا @username یا شماره)")
+            matches = self._resolve_admin_users(arg)
+            if not matches:
                 return await self.say(chat, "پیدا نشد.")
+            c = matches[0]
             st = self.sup.read_status(c["uid"])
             live = ""
             if st and st.get("age", 999) < 600:
@@ -10960,15 +11518,18 @@ class Manager:
                 if st.get("last_error"):
                     live += f"\n⚠️ {st['last_error'][:80]}"
             return await self.say(chat,
-                f"👤 <b>{c['name'] or '—'}</b>\n\n"
+                f"👤 <b>{self._esc(c.get('name') or '—')}</b>\n\n"
                 f"uid: <code>{c['uid']}</code>\n"
-                f"یوزرنیم: @{c['username'] or '—'}\n"
-                f"شماره: {c['phone'] or '—'}\n"
+                f"یوزرنیم: @{self._esc(c.get('username') or '—')}\n"
+                f"شماره: {self._esc(c.get('phone') or '—')}\n"
                 f"وضعیت: {self.client_state(c)}\n"
-                f"اعتبار: {human_left(c['expires_at'])}\n"
-                f"سشن: {'✅' if c['session'] else '❌'}\n"
-                f"ری‌استارت: {_fa_digits(c['restarts'] or 0)}\n"
-                f"عضویت: {local_dt(c['created_at']):%Y-%m-%d}" + live)
+                f"اعتبار: {human_left(c.get('expires_at') or 0)}\n"
+                f"سشن: {'✅' if c.get('session') else '❌'}\n"
+                f"جفج/تبادل: {self._jafj_summary_line(c['uid'])}\n"
+                f"ری‌استارت: {_fa_digits(c.get('restarts') or 0)}\n"
+                f"عضویت: {local_dt(c.get('created_at') or now()):%Y-%m-%d}" + live,
+                [[B("⚙️ پنل مدیریت کاربر", f"au:{c['uid']}", "primary"),
+                  B("🗑 پاک کردن اطلاعات", f"aud:{c['uid']}", "danger")]])
 
         if cmd in ("ok", "ext"):
             if not p:
@@ -10997,13 +11558,34 @@ class Manager:
             self.db.log(tid, "banned")
             return await self.say(chat, f"⛔ {tid} غیرفعال شد.")
 
-        if cmd == "del":
-            tid = int(digits(p[0]) or 0) if p else 0
-            self.sup.stop(tid)
-            self.db.x("DELETE FROM clients WHERE uid=?", (tid,))
-            import shutil
-            shutil.rmtree(os.path.join(CLIENTS_DIR, str(tid)), ignore_errors=True)
-            return await self.say(chat, f"🗑 {tid} کامل حذف شد.")
+        if cmd in ("del", "wipe", "deluser", "rmuser"):
+            if not arg.strip():
+                return await self.say(chat, "فرمت: <code>/del 123456</code>  (یا @username یا شماره)")
+            matches = self._resolve_admin_users(arg)
+            if not matches:
+                return await self.say(chat, "کاربر پیدا نشد.")
+            if len(matches) > 1 and not digits(arg.strip()) == arg.strip():
+                kb = [[B(f"🗑 {m.get('name') or m['uid']} ({m['uid']})", f"aud:{m['uid']}", "danger")]
+                      for m in matches[:6]]
+                return await self.say(chat, "چند کاربر پیدا شد؛ یکی را انتخاب کن:", kb)
+            tid = matches[0]["uid"]
+            ok, msg, _st = await self.wipe_user_data(tid, by_admin=uid)
+            return await self.say(chat, msg if ok else f"❌ {msg}")
+
+        if cmd in ("resetjafj", "deljafj", "wipejafj", "clearjafj"):
+            if not arg.strip():
+                return await self.say(chat, "فرمت: <code>/resetjafj 123456</code>  (یا @username یا شماره)")
+            matches = self._resolve_admin_users(arg)
+            if not matches:
+                return await self.say(chat, "کاربر پیدا نشد.")
+            if len(matches) > 1 and not digits(arg.strip()) == arg.strip():
+                kb = [[B(f"🧹 {m.get('name') or m['uid']} ({m['uid']})", f"auj:{m['uid']}", "danger")]
+                      for m in matches[:6]]
+                return await self.say(chat, "چند کاربر پیدا شد؛ یکی را انتخاب کن:", kb)
+            tid = matches[0]["uid"]
+            ok, msg, _st = await self.wipe_user_jafj(tid, by_admin=uid)
+            return await self.say(chat, msg if ok else f"❌ {msg}",
+                                  [[B("👤 مشتری", f"au:{tid}", "primary")]])
 
         if cmd in ("pon", "poff"):
             tid = int(digits(p[0]) or 0) if p else 0
@@ -13221,7 +13803,7 @@ class Manager:
                 n = r["c"] if r else 0
             except Exception:
                 n = 0
-            if n:
+            if n or getattr(self, "_allow_empty_backup_once", False):
                 await asyncio.wait_for(self.backup_once(force=True), timeout=20)
             else:
                 print("  ℹ️ دیتابیس خالی است — پشتیبان قبلی بازنویسی نشد", flush=True)
@@ -13243,6 +13825,9 @@ class Manager:
 
         پشتیبانِ قبلی ۰ مشتری داشته باشد، بازنویسی بی‌خطر است. اگر جست‌وجو هم
         شکست بخورد و نمی‌دانیم پشتیبانی هست یا نه، محتاطانه نفرست."""
+        if getattr(self, "_allow_empty_backup_once", False):
+            self._allow_empty_backup_once = False
+            return None
         try:
             prev = await self._find_last_backup_msg(target, limit=100)
         except Exception:
@@ -14943,6 +15528,43 @@ class Manager:
                         f"✅ مدت تست: <b>{trial_duration_label(mins)}</b>  ·  "
                         f"یادآوری: {_fa_digits(warn)} دقیقه آخر\n"
                         + self.LINE + "\n" + t, kb)
+
+                if stp == "ufind_q" and self.is_admin(uid):
+                    self.fsm.pop(uid, None)
+                    matches = self._resolve_admin_users(text)
+                    if not matches:
+                        return await self.say(ev.chat_id,
+                            "❌ کاربری با این مشخصات پیدا نشد.",
+                            [[B("🔍 جستجوی دوباره", "a:ufind", "primary")],
+                             back_btn("a:ulist:0")])
+                    if len(matches) == 1:
+                        c = matches[0]
+                        return await self.say(ev.chat_id,
+                            self._admin_user_text(c), self._admin_user_kb(c))
+                    kb = [[B(f"👤 {m.get('name') or m['uid']} ({m['uid']})",
+                             f"au:{m['uid']}", "primary")] for m in matches[:8]]
+                    kb.append([B("🔍 جستجوی دوباره", "a:ufind", "primary")])
+                    kb.append(back_btn("a:ulist:0"))
+                    return await self.say(ev.chat_id,
+                        f"🔍 <b>{_fa_digits(len(matches))} کاربر پیدا شد</b> — انتخاب کن:", kb)
+
+                if stp == "uwipe_pick" and self.is_admin(uid):
+                    self.fsm.pop(uid, None)
+                    matches = self._resolve_admin_users(text)
+                    if not matches:
+                        return await self.say(ev.chat_id,
+                            "❌ کاربری با این مشخصات پیدا نشد.",
+                            [[B("🗑 تلاش دوباره", "a:uwipe", "danger")],
+                             back_btn("a:home")])
+                    if len(matches) == 1:
+                        txt_c, kb_c = self._admin_wipe_confirm_view(matches[0]["uid"])
+                        return await self.say(ev.chat_id, txt_c, kb_c)
+                    kb = [[B(f"🗑 {m.get('name') or m['uid']} ({m['uid']})",
+                             f"aud:{m['uid']}", "danger")] for m in matches[:8]]
+                    kb.append([B("🔍 تلاش دوباره", "a:uwipe", "primary")])
+                    kb.append(back_btn("a:home"))
+                    return await self.say(ev.chat_id,
+                        f"🗑 <b>{_fa_digits(len(matches))} کاربر پیدا شد</b> — کدام پاک شود؟", kb)
 
                 if stp == "fjoin_add" and self.is_admin(uid):
                     self.fsm.pop(uid, None)
