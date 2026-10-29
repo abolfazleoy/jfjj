@@ -2295,13 +2295,21 @@ _load_deploy_id()
 
 
 def host_label():
-    """برچسب کوتاه محل اجرا (railway-us-east / local / …) برای پیام‌ها."""
-    for key in ("RAILWAY_SERVICE_NAME", "RAILWAY_SERVICE_ID",
+    """برچسب کوتاه محل اجرا (blitz / railway-us-east / local / …) برای پیام‌ها."""
+    # برچسبِ دستی همیشه اولویت دارد (VPS/blitz نامِ env نمی‌گذارند).
+    manual = (os.environ.get("JAFJ_HOST_LABEL") or "").strip()
+    if manual:
+        return re.sub(r"\s+", "-", manual)[:24]
+    for key in ("BLITZ_APP_NAME", "BLITZ_APP_ID",
+                "RAILWAY_SERVICE_NAME", "RAILWAY_SERVICE_ID",
                 "FLY_APP_NAME", "KOYEB_APP_NAME", "HEROKU_APP_NAME",
                 "RENDER_SERVICE_NAME"):
         v = (os.environ.get(key) or "").strip()
-        if v:
+        # "1"/"true" یعنی فقط «روی بلایتز هستیم»، نه نامِ اپ.
+        if v and v.lower() not in ("1", "true", "yes", "on"):
             return re.sub(r"\s+", "-", v)[:24]
+    if (os.environ.get("BLITZ") or "").strip():
+        return "blitz"
     try:
         import socket
         return "host-" + (socket.gethostname() or "local")[:12]
@@ -2437,6 +2445,7 @@ def build_stamp():
 
 HOSTED_ENV_KEYS = ("RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_PROJECT_ID",
                    "RENDER", "RENDER_SERVICE_NAME", "RENDER_SERVICE_ID",
+                   "BLITZ", "BLITZ_APP_NAME", "BLITZ_APP_ID",
                    "FLY_APP_NAME", "HEROKU_APP_NAME", "KOYEB_APP_NAME")
 
 
@@ -2487,10 +2496,33 @@ def is_dead_token_error(exc):
     return any(k in msg for k in _DEAD_TOKEN_MARKS)
 
 
+def _truthy_env(*keys):
+    for k in keys:
+        if (os.environ.get(k) or "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def host_may_sleep():
+    """آیا میزبان ممکن است با بی‌کاری بخوابد؟ (پلنِ رایگانِ blitz.cloud / Render)
+
+    روی چنین میزبانی، دیرشدنِ پشتیبان یعنی بیدارشدن با دادهٔ قدیمی‌تر — پس
+    فاصلهٔ پیش‌فرضِ پشتیبان کوتاه می‌شود. با JAFJ_APP_SLEEPS=0 می‌شود خاموشش
+    کرد (مثلاً روی VPS یا پلنِ always-on که هرگز نمی‌خوابد).
+    """
+    raw = (os.environ.get("JAFJ_APP_SLEEPS") or "").strip().lower()
+    if raw in ("0", "no", "false", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return _truthy_env("RENDER")
+
+
 def backup_interval():
     """فاصله پشتیبان خودکار (ثانیه): BACKUP_EVERY خودت را تعیین می‌کند، حداقل ۱۲۰.
 
-    روی Render رایگان (متغیر محیطی «RENDER» همیشه ست است) دیسک ماندگاری وجود
+    روی Render رایگان و پلن رایگانِ blitz.cloud (که برنامه را با ۳۰ دقیقه
+    بی‌بازدید خواب می‌کند؛ با JAFJ_APP_SLEEPS=1) دیسک ماندگاری وجود
     ندارد و محتوای /data با هر دیپلوی (مثلاً هر push به گیت‌هاب) و هر
     ری‌استارت/خواب پاک می‌شود. برای همین پیش‌فرض را در Render از ۹۰۰ به ۱۲۰
     ثانیه می‌آوریم تا پیش از دیپلوی بعدی نهایتاً ۲ دقیقهٔ آخرِ داده از دست
@@ -2500,8 +2532,7 @@ def backup_interval():
         v = int((os.environ.get("BACKUP_EVERY") or "").strip() or "900")
     except Exception:
         v = 900
-    if not (os.environ.get("BACKUP_EVERY") or "").strip() \
-            and (os.environ.get("RENDER") or "").strip():
+    if not (os.environ.get("BACKUP_EVERY") or "").strip() and host_may_sleep():
         v = 120
     return max(120, v)
 

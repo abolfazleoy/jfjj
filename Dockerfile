@@ -12,9 +12,30 @@ COPY 95.py ./
 RUN mkdir -p /opt/jafj \
     && cp /app/manager_82.py /opt/jafj/manager_82.py \
     && cp /app/95.py /opt/jafj/95.py
-COPY railway-start.sh render-start.sh /opt/jafj/
+COPY railway-start.sh render-start.sh blitz-start.sh /opt/jafj/
 COPY tools/ /opt/jafj/tools/
-RUN chmod 755 /opt/jafj/railway-start.sh /opt/jafj/render-start.sh
-# Railway boots this by default; Render's blueprint (render.yaml) overrides the
-# start command with `sh /opt/jafj/render-start.sh`.
-CMD ["sh", "/opt/jafj/railway-start.sh"]
+RUN chmod 755 /opt/jafj/railway-start.sh /opt/jafj/render-start.sh /opt/jafj/blitz-start.sh
+# ── persistent data on Docker PaaS (blitz.cloud, Render, Fly, a plain VPS) ────
+# A container's filesystem is thrown away when it restarts. blitz.cloud keeps
+# EXACTLY the folders the image declares with VOLUME (and reserves plan storage
+# for them), so /data must be declared here — otherwise shop.db, manager.db and
+# every clients/<uid>/ session are lost on each restart/deploy, which looks
+# exactly like "the bot forgets everything every few hours".
+#
+# DATA_DIR is deliberately NOT set here: railway-start.sh still owns that
+# decision (it picks the writable Volume and refuses a dir that shadows the
+# code), so an existing Railway/Render install keeps working unchanged.
+# blitz-start.sh sets DATA_DIR=/data for blitz.cloud.
+ENV JAFJ_IMAGE_DIR=/opt/jafj \
+    JAFJ_HOSTED=1
+RUN mkdir -p /data
+VOLUME ["/data"]
+
+# The manager's health server binds 0.0.0.0:$PORT. blitz.cloud and Render pass
+# PORT themselves; this default keeps a plain `docker run` working.
+ENV PORT=8080
+EXPOSE 8080
+
+# Railway boots this by default; Render's blueprint (render.yaml) and
+# blitz.cloud (blitz-start.sh) only add their own defaults on top of it.
+CMD ["sh", "/opt/jafj/blitz-start.sh"]
