@@ -884,6 +884,454 @@ DB_FILE = os.path.join(BASE_DIR, "manager.db")
 CLIENTS_DIR = os.path.join(BASE_DIR, "clients")
 
 # ═══════════════════════════════════════════════════════════════════════
+#  تاریخچه‌ی manager_config.json — تورِ نجاتِ «بخش‌های آموزش پرید»
+#
+#  چرا: کانفیگ تنها جایی است که بخش‌های آموزش (و محتوای ثبت‌شده‌یشان)
+#  نگه داشته می‌شود. اگر نسخه‌ی قدیمی‌اش از راه برسد — بازیابی از پشتیبانِ
+#  کهنه، pullِ سینکِ گیت‌هاب قبل از بوت، یا یک نمونه‌ی زامبی با کانفیگِ تهی
+#  که ذخیره می‌کند — همه‌ی بخش‌ها یک‌جا می‌پرند و مدیر می‌بیند «فقط آموزش
+#  فعال‌سازی مانده». پس قبل از هر تغییرِ بخش‌ها یک نسخه‌ی زمان‌دار همین‌جا
+#  می‌گذاریم (و چون داخلِ پوشه‌ی داده است، با سینکِ گیت‌هاب و پشتیبانِ
+#  تلگرام هم می‌رود و برمی‌گردد) تا با یک دکمه برگردد.
+# ═══════════════════════════════════════════════════════════════════════
+CFG_HISTORY_DIR = os.path.join(BASE_DIR, "config_history")
+CFG_HISTORY_MAX = 500   # سقفِ نسخه‌هایی که خوانده/جست‌وجو می‌شوند (چرخش هم همین را نگه می‌دارد)
+CFG_SNAPSHOT_MARK = os.path.join(CFG_HISTORY_DIR, ".last")
+
+
+def cfg_snapshot_throttled(reason="", mins=30):
+    """حداکثر یک نسخه در هر `mins` دقیقه (برای ذخیره‌های پیاپیِ پنل).
+
+    چرا لازم است: Config.save() بعدِ هر تغییر صدا زده می‌شود؛ بدونِ مهار،
+    یک نشستِ ویرایش صدها نسخه‌ی میانی می‌سازد و نسخه‌های مهمِ قدیمی‌تر
+    زودتر از سقف می‌چرخند. زمان از «نشانگرِ» خودِ پوشه خوانده می‌شود نه از
+    mtime فایل — چون mtime با کپی/بازیابی (pullِ سینک) عوض می‌شود.
+    """
+    try:
+        os.makedirs(CFG_HISTORY_DIR, exist_ok=True)
+        last = 0.0
+        try:
+            with open(CFG_SNAPSHOT_MARK, encoding="utf-8") as f:
+                last = float((f.read() or "0").strip() or 0)
+        except Exception:
+            last = 0.0
+        if time.time() - last < max(1, int(mins)) * 60:
+            return ""
+        name = cfg_snapshot(reason)
+        try:
+            with open(CFG_SNAPSHOT_MARK, "w", encoding="utf-8") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass
+        return name
+    except Exception:
+        return ""
+
+
+def cfg_snapshot(reason=""):
+    """یک نسخه‌ی زمان‌دار از manager_config.json می‌گذارد (ارزان و بی‌خطر).
+
+    اگر محتوا با آخرین نسخه یکی باشد فایلِ تازه نمی‌سازد. نامِ فایل
+    «زمان + شمارنده» است؛ چون چند تغییرِ پیاپی در یک ثانیه می‌افتند و با
+    نامِ فقط-زمانی، نسخه‌های همان ثانیه روی هم می‌افتادند و «تاریخچه»
+    عملاً یک فایل بیشتر نداشت (یعنی همان چیزی که باید نجات می‌داد گم
+    می‌شد). شمارنده ترتیبِ زمانی را هم در نام حفظ می‌کند.
+    """
+    try:
+        if not os.path.isfile(CONFIG_FILE):
+            return ""
+        with open(CONFIG_FILE, "rb") as f:
+            data = f.read()
+        if not data.strip():
+            return ""
+        os.makedirs(CFG_HISTORY_DIR, exist_ok=True)
+        names = sorted(n for n in os.listdir(CFG_HISTORY_DIR)
+                       if n.endswith(".json"))
+        if names:
+            last = os.path.join(CFG_HISTORY_DIR, names[-1])
+            try:
+                with open(last, "rb") as f:
+                    if f.read() == data:
+                        return ""
+            except OSError:
+                pass
+        ts = int(time.time())
+        name = f"config_{ts}.json"
+        seq = 1
+        while os.path.exists(os.path.join(CFG_HISTORY_DIR, name)):
+            name = f"config_{ts}_{seq}.json"
+            seq += 1
+        tmp = os.path.join(CFG_HISTORY_DIR, name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(CFG_HISTORY_DIR, name))
+        _cfg_history_rotate()
+        return name
+    except Exception as e:
+        print(f"cfg_snapshot: {type(e).__name__}: {e}", flush=True)
+        return ""
+
+
+def _cfg_history_rotate(keep_days=7, hard_cap=500):
+    """چرخشِ تاریخچه بر اساسِ سن: تازه‌ها کامل، قدیمی‌ترها نمایی.
+
+    چون قبلِ <b>هر</b> تغییرِ بخش‌ها یک نسخه می‌نشیند، یک نشستِ ویرایش می‌تواند
+    ده‌ها نسخه‌ی میانی بسازد. اگر فقط «آخرین N تا» را نگه داریم، حالتِ هفته‌ی
+    پیش همان روزِ اول می‌چرخد و می‌پرد؛ پس نسخه‌های هفت روزِ اخیر کامل
+    می‌مانند و بعد از آن یکی‌درمیان، چهاردَرمیان، … حذف می‌شوند تا هم عمقِ
+    تاریخ بماند هم سقفِ دیسک و حجمِ بسته‌ی سینک (هر نسخه یکی دو کیلوبایت).
+    """
+    try:
+        entries = []
+        for n in sorted(os.listdir(CFG_HISTORY_DIR)):
+            if not n.endswith(".json"):
+                continue
+            try:
+                age = time.time() - os.path.getmtime(
+                    os.path.join(CFG_HISTORY_DIR, n))
+            except OSError:
+                age = 0.0
+            entries.append((n, age))
+    except OSError:
+        return
+    if not entries:
+        return
+    keep = set()
+    for idx in range(len(entries) - 1, -1, -1):
+        n, age = entries[idx]
+        if age <= keep_days * 86400:
+            keep.add(n)
+            continue
+        step = 2
+        span = keep_days * 86400
+        while age > span * 2:
+            step *= 2
+            span *= 2
+        if step <= 1 or idx % step == 0:
+            keep.add(n)
+    for n, _age in entries:
+        if n in keep:
+            continue
+        try:
+            os.remove(os.path.join(CFG_HISTORY_DIR, n))
+        except OSError:
+            pass
+    left = [n for n, _a in entries if n in keep]
+    for n in left[:max(0, len(left) - hard_cap)]:
+        try:
+            os.remove(os.path.join(CFG_HISTORY_DIR, n))
+        except OSError:
+            pass
+
+
+def cfg_history_list():
+    """[(نامِ فایل, dictِ کانفیگ, mtime)] — از تازه به قدیم."""
+    out = []
+    try:
+        names = sorted((n for n in os.listdir(CFG_HISTORY_DIR)
+                        if n.endswith(".json")), reverse=True)
+    except OSError:
+        return out
+    for n in names[:CFG_HISTORY_MAX]:
+        path = os.path.join(CFG_HISTORY_DIR, n)
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                out.append((n, d, os.path.getmtime(path)))
+        except Exception:
+            continue
+    return out
+
+
+def _cfg_secs(d):
+    """بخش‌های آموزشِ یک dictِ کانفیگ (بدون هیچ وابستگی به کلاس‌ها)."""
+    raw = (d or {}).get("tut_sections") or []
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id") or i + 1)
+        except (TypeError, ValueError):
+            sid = i + 1
+        try:
+            n = len([x for x in (s.get("ids") or [])])
+        except Exception:
+            n = 0
+        out.append({"id": sid, "name": str(s.get("name") or f"بخش {sid}")[:60],
+                    "emoji": str(s.get("emoji") or "▫️")[:4], "n": n})
+    return out
+
+
+def _cfg_sec_registered(rec):
+    """آیا این رکوردِ بخش «واقعاً ثبت‌شده» است یا پیش‌نویسِ نیمه‌ساخته؟
+
+    پیش‌نویس یعنی بخشی که تازه با «➕ بخش جدید» ساخته شده و هنوز نه محتوا
+    دارد، نه اسمِ عوض‌شده، نه preset، نه دکمه/متنِ پایان. چنین رکوردی در
+    نسخه‌های تاریخچه هست (چون نسخه‌برداری قبلِ هر تغییر انجام می‌شود) و
+    اگر «گم‌شده» حساب می‌شد، موقعِ بازیابی یک‌جا بخشِ تکراریِ خالی
+    برمی‌گشت. معیارها دقیقاً همان‌هایی است که مدیر روی صفحه‌ی بخش می‌بیند.
+    """
+    try:
+        if len(rec.get("ids") or []):
+            return True
+    except Exception:
+        pass
+    if str(rec.get("text") or "").strip():
+        return True
+    if str(rec.get("preset") or "").strip():
+        return True
+    if str(rec.get("name") or "").strip() not in ("", "بخش جدید"):
+        return True
+    if str(rec.get("btn_cmd") or "").strip():
+        return True
+    if str(rec.get("note") or "").strip():
+        return True
+    return False
+
+
+def cfg_lost_section_map():
+    """بخش‌هایی که دیگر در کانفیگِ فعلی نیستند ولی در تاریخچه پیدا می‌شوند.
+
+    خروجی: ``{idِ بخش در آن نسخه: (dictِ بخش, نامِ نسخه)}`` — برای هر بخش
+    پُرترین نسخه‌اش (بیشترین پیامِ ثبت‌شده)، چون نسخه‌های تاریخچه مربوط به
+    زمان‌های مختلف‌اند.
+
+    معیارِ «گم‌شده» <b>نام</b>ِ بخش است، نه کد:
+      • ``tut_next_id`` کدهای آزاد را دوباره استفاده می‌کند؛ پس اگر بعد از
+        پریدنِ بخش‌ها بخشِ تازه‌ای ساخته باشند، کدِ بخشِ گم‌شده به آن می‌خورد
+        و با کد نمی‌شود فهمید که «این همان نیست» (و موقعِ برگرداندن هم به
+        بخشِ برگشتی کدِ تازه داده می‌شود).
+      • اگر کاربر نامِ بخشی را عوض کرده باشد، محتوا سر جایش است و نسخه‌ی
+        کهنه‌ی آن برنمی‌گردد (نامِ قدیم در لیستِ فعلی نیست ولی همان بخش است).
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cur = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(cur, dict):
+        return {}
+    have_names = set()
+    for x in (cur.get("tut_sections") or []):
+        if not isinstance(x, dict):
+            continue
+        nm = str(x.get("name") or "").strip()
+        if nm:
+            have_names.add(nm)
+    lost = {}
+    for name, d, _mt in cfg_history_list():
+        raw = d.get("tut_sections") or []
+        if not isinstance(raw, list):
+            continue
+        for s in raw:
+            if not isinstance(s, dict):
+                continue
+            if not _cfg_sec_registered(s):
+                continue          # پیش‌نویسِ نیمه‌ساخته «گم‌شده» نیست
+            try:
+                sid = int(s.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not sid:
+                continue
+            if str(s.get("name") or "").strip() in have_names:
+                continue          # همین بخش (با هر کدی) الان هست
+            try:
+                n = len(s.get("ids") or [])
+            except Exception:
+                n = 0
+            hit = lost.get(sid)
+            if hit is None or n > len(hit[0].get("ids") or []):
+                lost[sid] = (s, name)
+    return lost
+
+
+def cfg_lost_sections():
+    """خلاصه‌ی بخش‌های گم‌شده برای هشدارِ بوت و پنلِ بازیابی.
+
+    خروجی: ``(نامِ بهترین نسخه, dictِ همان نسخه, [id بخش‌های گم‌شده])``
+    یا ``None``. «بهترین» = نسخه‌ای که بیشترین بخشِ گم‌شده را دارد و در
+    تساوی، نسخه‌ای که <b>مجموعِ پیام‌های ثبت‌شده‌اش</b> بیشتر است (چیزی که
+    برای مدیر ارزش دارد خودِ ویدیوها/متن‌ها هستند، نه تعدادِ ردیف‌ها).
+    """
+    lost = cfg_lost_section_map()
+    if not lost:
+        return None
+    tally = {}
+    for sid, (_s, name) in lost.items():
+        tally[name] = tally.get(name, 0) + 1
+    top = max(tally.values())
+    cand = [n for n, c in tally.items() if c == top]
+    snaps = cfg_history_list()
+    if len(cand) > 1:
+        wanted = set(cand)
+        best_name, best_rich = None, -1
+        for name, d, _mt in snaps:
+            if name not in wanted:
+                continue
+            rich = 0
+            for s in (d.get("tut_sections") or []):
+                if isinstance(s, dict):
+                    try:
+                        rich += len(s.get("ids") or [])
+                    except Exception:
+                        pass
+            if rich > best_rich:
+                best_name, best_rich = name, rich
+        best = best_name or cand[0]
+    else:
+        best = cand[0]
+    snap = None
+    for name, d, _mt in snaps:
+        if name == best:
+            snap = d
+            break
+    return best, (snap or {}), sorted(lost.keys())
+
+
+def cfg_restore_sections(fname=None):
+    """بخش‌های گم‌شده را از تاریخچه برمی‌گرداند.
+
+    fname=None یعنی «از هر نسخه‌ای که داری» (پُرترین نسخه‌ی هر بخش)؛
+    در غیرِ این صورت فقط همان نسخه.
+
+    دو نکته که داده را خراب نکند:
+      • بخشی که مدیر <b>الان</b> دارد دست نمی‌خورد.
+      • اگر کدِ یک بخشِ گم‌شده در این فاصله به بخشِ دیگری خورده باشد
+        (tut_next_id کدهای آزاد را دوباره استفاده می‌کند)، بخشِ برگشتی
+        <b>کدِ تازه</b> می‌گیرد و سر جایش قرار می‌دهد — نه اینکه بی‌صدا
+        رد شود و نه اینکه بخشِ فعلی له شود.
+
+    خروجی: (تعدادِ برگردانده‌شده, تعدادِ کلِ بخش‌ها) یا (0, 0) اگر نشد.
+    """
+    if fname is None:
+        items = [(sid, s) for sid, (s, _n) in cfg_lost_section_map().items()]
+        if not items:
+            return 0, 0
+        items.sort(key=lambda kv: kv[0])
+    else:
+        hit = None
+        for n, d, _mt in cfg_history_list():
+            if n == fname:
+                hit = d
+                break
+        if hit is None:
+            return 0, 0
+        have_ids0 = set()
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cur0 = json.load(f)
+            for x in _cfg_secs(cur0 if isinstance(cur0, dict) else {}):
+                have_ids0.add(x["id"])
+        except Exception:
+            pass
+        have_names = set()
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cur1 = json.load(f)
+            for x in (cur1.get("tut_sections") or [] if isinstance(cur1, dict) else []):
+                if isinstance(x, dict):
+                    nm = str(x.get("name") or "").strip()
+                    if nm:
+                        have_names.add(nm)
+        except Exception:
+            pass
+        items = []
+        for s in (hit.get("tut_sections") or []):
+            if not isinstance(s, dict):
+                continue
+            if not _cfg_sec_registered(s):
+                continue          # پیش‌نویس را برنگردان
+            if str(s.get("name") or "").strip() in have_names:
+                continue          # همان بخش الان هم هست
+            try:
+                sid = int(s.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if sid and sid not in have_ids0:
+                items.append((sid, s))
+            elif sid:
+                # کدش به بخشِ دیگری خورده؛ با کدِ تازه برمی‌گردد
+                items.append((0, s))
+        items.sort(key=lambda kv: kv[0])
+        if not items:
+            return 0, 0
+    cfg_snapshot("before-restore-sections")
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            cur = {}
+    except Exception:
+        cur = {}
+    have = [s for s in (cur.get("tut_sections") or []) if isinstance(s, dict)]
+    used = {str(x.get("name") or "").strip() for x in have}
+    used.discard("")
+    used_ids = set()
+    for s in have:
+        try:
+            used_ids.add(int(s.get("id") or 0))
+        except (TypeError, ValueError):
+            continue
+    nxt = (max(used_ids) if used_ids else 0) + 1
+    added = 0
+    for _sid, sec in items:
+        sec = dict(sec)
+        nm = str(sec.get("name") or "").strip()
+        if nm and nm in used:
+            continue                      # همین بخش الان هم هست
+        try:
+            sid = int(sec.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        if not sid or sid in used_ids:
+            while nxt in used_ids:
+                nxt += 1
+            sec["id"] = nxt
+            used_ids.add(nxt)
+            nxt += 1
+        else:
+            used_ids.add(sid)
+        if nm:
+            used.add(nm)
+        have.append(sec)
+        added += 1
+    cur["tut_sections"] = have
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+    try:
+        touch_data("config-restore")
+    except Exception:
+        pass
+    return added, len(have)
+
+
+def cfg_restore_full(fname):
+    """کلِ کانفیگ را از یک نسخه‌ی تاریخچه برمی‌گرداند (اول یک نسخه‌ی نجات هم می‌گذارد)."""
+    path = os.path.join(CFG_HISTORY_DIR, fname)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            json.load(f)
+    except Exception:
+        return False
+    cfg_snapshot("before-full-restore")
+    try:
+        shutil.copyfile(path, CONFIG_FILE)
+        touch_data("config-restore-full")
+        return True
+    except Exception as e:
+        print(f"cfg_restore_full: {type(e).__name__}: {e}", flush=True)
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════
 #  کرش و پایداریِ داده
 #
 #  چرا این بخش لازم شد: روی میزبانی که دیسکِ ماندگار ندارد (یا Disk روی
@@ -2081,6 +2529,13 @@ class Config:
         # تنظیمات عوض شد → نسخه‌ی بیرونی هم باید تازه شود (کرش نباید ببردش)
         try:
             touch_data("config")
+        except Exception:
+            pass
+        # و یک نسخه‌ی زمان‌دار همین‌جا (مهاردار) تا «تازه‌ترین» حالتِ بخش‌ها
+        # همیشه در تاریخچه باشد — نسخه‌های «قبل از تغییر» به‌تنهایی همیشه
+        # یک قدم عقب‌اند.
+        try:
+            cfg_snapshot_throttled("config-save")
         except Exception:
             pass
 
@@ -3568,6 +4023,12 @@ class Manager:
                   f"{out[-300:]}", flush=True)
             if ok:
                 self._last_flush = time.time()
+                # همین لحظه یک نسخه‌ی تازه از کانفیگ بگیر: اگر بعداً نسخه‌ی
+                # قدیمی از راه برسد، تازه‌ترین حالتِ بخش‌ها در تاریخچه هست.
+                try:
+                    cfg_snapshot_throttled("gh-sync")
+                except Exception:
+                    pass
             return ok
         except Exception as e:
             print(f"  ⚠️ سینکِ گیت‌هاب ({why or 'دوره‌ای'}): "
@@ -5646,6 +6107,10 @@ class Manager:
         return None
 
     def tut_save(self, rows):
+        # قبل از هر تغییرِ بخش‌ها یک نسخه‌ی زمان‌دار از کانفیگ می‌گذاریم؛ اگر
+        # روزی نسخه‌ی قدیمیِ کانفیگ از راه رسید (پشتیبانِ کهنه / pullِ سینکِ
+        # گیت‌هاب / نمونه‌ی زامبی) و بخش‌ها پریدند، از همین‌ها برمی‌گردند.
+        cfg_snapshot("sections")
         self.cfg["tut_sections"] = [self.tut_norm(s, i) for i, s in enumerate(rows)]
         self.cfg.save()
         return self.cfg["tut_sections"]
@@ -6633,6 +7098,7 @@ class Manager:
             kb.append([B("📝 متن‌های آماده (کیف پول / امتیاز / اشتراک / بعد از فعال‌سازی)",
                          "a:sec_tpl", "success")])
         kb.append([B("⚙️ ارسال خودکار بعد از فعال‌سازی", "a:tut_auto", "primary")])
+        kb.append([B("🕘 بازیابی بخش‌ها (اگر پریدند)", "a:secs_h", "primary")])
         kb.append([B("📚 آموزش فعال‌سازی (اصلی)", "a:tut", "success")])
         kb.append(back_btn("a:home"))
         return await self.edit(ev, "\n".join(txt), kb)
@@ -6765,6 +7231,72 @@ class Manager:
         kb.append([B("📤 ثبت / تغییر محتوا (جایگزینی)", "a:tut_set", "primary"),
                    B("👁 پیش‌نمایش", "a:tut_view", "primary")])
         kb.append([B("⬅️ بازگشت", "a:tut")])
+        return await self.edit(ev, "\n".join(txt), kb)
+
+    async def tut_admin_history(self, ev):
+        """«🕘 بازیابی بخش‌ها» — نسخه‌های تاریخچه‌ی manager_config.json.
+
+        اگر بخش‌های آموزش (ویدیو/متنِ ثبت‌شده‌یشان) پریده باشند — معمولاً
+        چون نسخه‌ی قدیمیِ کانفیگ از پشتیبان/سینکِ گیت‌هاب برگشته — از این‌جا
+        با یک دکمه برمی‌گردند: «🧩 برگرداندن بخش‌ها» فقط بخش‌های گم‌شده را
+        اضافه می‌کند (بخش‌های تازه‌ی مدیر له نمی‌شوند)، «📥 کل تنظیمات»
+        همان نسخه را کامل می‌نشاند.
+        """
+        rows = cfg_history_list()
+        try:
+            lost_map = cfg_lost_section_map()
+        except Exception:
+            lost_map = {}
+        secs = self.tut_sections()
+        txt = [f"🕘 <b>بازیابی بخش‌های آموزش</b>", self.LINE,
+               f"📦 الان: {_fa_digits(len(secs))} بخش"
+               f" · {_fa_digits(sum(len(s['ids']) for s in secs))} پیامِ محتوا",
+               f"🗂 {CFG_HISTORY_DIR} — {_fa_digits(len(rows))} نسخه"]
+        if lost_map:
+            txt += ["", f"⚠️ <b>{_fa_digits(len(lost_map))} بخشِ گم‌شده "
+                    "در تاریخچه پیدا شد</b> — در کانفیگِ فعلی نیست:", ""]
+            for sid in sorted(lost_map):
+                sec, fname = lost_map[sid]
+                try:
+                    n = len(sec.get("ids") or [])
+                except Exception:
+                    n = 0
+                txt.append(f"• {str(sec.get('emoji') or '▫️')} "
+                           f"{self._esc(str(sec.get('name') or '')[:60])} "
+                           f"(کد {_fa_digits(sid)} · {_fa_digits(n)} پیام"
+                           f" · از <code>{fname}</code>)")
+            txt += ["", "<i>«🧩 برگرداندنِ همه» همین‌ها را برمی‌گرداند؛ "
+                    "بخش‌های تازه‌ات سر جایشان می‌مانند. از هر نسخه هم "
+                    "می‌توانی جدا انتخاب کنی.</i>"]
+        else:
+            txt += ["", "✅ بخشِ گم‌شده‌ای پیدا نشد."]
+        kb = []
+        if lost_map:
+            kb.append([B(f"🧩 برگرداندنِ هر {_fa_digits(len(lost_map))} بخشِ "
+                         "گم‌شده", "a:secs_h_all", "success")])
+        shown = 0
+        for name, d, mt in rows:
+            if shown >= 8:
+                break
+            cs = _cfg_secs(d)
+            try:
+                tut = len([int(x) for x in (d.get("tut_ids") or [])])
+            except Exception:
+                tut = 0
+            when = local_dt(mt).strftime("%m-%d %H:%M")
+            txt.append(f"🕘 <code>{name}</code> — "
+                       f"{_fa_digits(len(cs))} بخش / "
+                       f"{_fa_digits(sum(x['n'] for x in cs))} پیام / "
+                       f"آموزشِ اصلی {_fa_digits(tut)} پیام")
+            kb.append([B(f"🧩 بخش‌ها ← {when}", f"a:secs_h_rs:{name}", "success"),
+                       B(f"📥 کل تنظیمات ← {when}", f"a:secs_h_rf:{name}",
+                         "primary")])
+            shown += 1
+        if not rows:
+            txt.append("")
+            txt.append("<i>هنوز نسخه‌ای نیست؛ از اولین تغییرِ بخش‌ها به بعد "
+                       "خودکار ساخته می‌شود.</i>")
+        kb.append([B("⬅️ بازگشت", "a:secs")])
         return await self.edit(ev, "\n".join(txt), kb)
 
     async def tut_admin_when(self, ev, sid):
@@ -8148,6 +8680,75 @@ class Manager:
             # ── بخش‌بندی آموزش (تگ‌ها) ──
             if k == "secs":
                 return await self.tut_admin_list(ev)
+            if k == "secs_h":
+                return await self.tut_admin_history(ev)
+            if k == "secs_h_all":
+                added, total = cfg_restore_sections(None)
+                self.db.log(uid, "cfg_restore_all", f"+{added}")
+                self.cfg = Config()
+                self.sup.cfg = self.cfg
+                secs = self.tut_sections()
+                return await self.edit(ev,
+                    (f"✅ <b>{_fa_digits(added)} بخشِ گم‌شده برگشت</b>\n"
+                     if added else
+                     "ℹ️ بخشِ گم‌شده‌ای پیدا نشد.\n")
+                    + f"🧩 حالا {_fa_digits(total)} بخش داری · "
+                    f"{_fa_digits(sum(len(s['ids']) for s in secs))} پیامِ محتوا\n\n"
+                    "<i>محتوای هر بخش به پیام‌های چتِ خودت با ربات اشاره دارد؛ "
+                    "اگر آن پیام‌ها را در تلگرام پاک کرده باشی، باید دوباره "
+                    "ثبتشان کنی (با «➕ افزودن به محتوا»).</i>",
+                    [[B("🧩 بخش‌های آموزش", "a:secs", "success")],
+                     [B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                     back_btn("a:home")])
+            if k.startswith("secs_h_rs:") or k.startswith("secs_h_rf:"):
+                full = k.startswith("secs_h_rf:")
+                fname = k.split(":", 1)[1]
+                if not os.path.isfile(os.path.join(CFG_HISTORY_DIR, fname)):
+                    return await self.edit(ev,
+                        "❌ آن نسخه‌ی تاریخچه پیدا نشد (شاید چرخش خورده).",
+                        [[B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                         [B("⬅️ بازگشت", "a:secs")]])
+                if full:
+                    ok = cfg_restore_full(fname)
+                    if not ok:
+                        return await self.edit(ev,
+                            "❌ بازیابیِ آن نسخه نشد (فایل سالم نیست).",
+                            [[B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                             [B("⬅️ بازگشت", "a:secs")]])
+                    # کانفیگ از بیرون عوض شد → کلاس Config باید دوباره بخواند
+                    self.cfg = Config()
+                    self.sup.cfg = self.cfg
+                    self.db.log(uid, "cfg_restore_full", fname)
+                    secs = self.tut_sections()
+                    return await self.edit(ev,
+                        f"📥 <b>کل تنظیمات از <code>{fname}</code> برگشت</b>\n"
+                        f"🧩 {_fa_digits(len(secs))} بخش · "
+                        f"{_fa_digits(sum(len(s['ids']) for s in secs))} پیامِ محتوا\n\n"
+                        "<i>اگر نتیجه درست نیست، همین‌جا نسخه‌ی دیگری را انتخاب کن "
+                        "(قبل از بازیابی هم یک نسخه‌ی نجات گذاشته شد).</i>",
+                        [[B("🧩 بخش‌های آموزش", "a:secs", "success")],
+                         [B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                         back_btn("a:home")])
+                added, total = cfg_restore_sections(fname)
+                self.db.log(uid, "cfg_restore_secs", f"{fname} +{added}")
+                # بخش‌های گم‌شده‌ی نسخه‌های دیگر هم با دکمه‌ی «برگرداندنِ همه»
+                # قابل برگرداندن‌اند؛ این دکمه فقط همان نسخه را می‌نشاند.
+                self.cfg = Config()
+                self.sup.cfg = self.cfg
+                secs = self.tut_sections()
+                return await self.edit(ev,
+                    (f"✅ <b>{_fa_digits(added)} بخشِ گم‌شده برگشت</b>\n"
+                     if added else
+                     "ℹ️ بخشِ تازه‌ای برای برگرداندن نبود (همه هست یا آن نسخه "
+                     "بخشی ندارد).\n")
+                    + f"🧩 حالا {_fa_digits(total)} بخش داری · "
+                    f"{_fa_digits(sum(len(s['ids']) for s in secs))} پیامِ محتوا\n\n"
+                    "<i>محتوای هر بخش به پیام‌های چتِ خودت با ربات اشاره دارد؛ "
+                    "اگر آن پیام‌ها را در تلگرام پاک کرده باشی، باید دوباره "
+                    "ثبتشان کنی.</i>",
+                    [[B("🧩 بخش‌های آموزش", "a:secs", "success")],
+                     [B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                     back_btn("a:home")])
 
             # ── 🗂 توضیحات: فهرستِ تپ‌کردنیِ مشتری ──
             if k == "hub":
@@ -13055,6 +13656,18 @@ class Manager:
             up = int(ex.get("uptime") or 0)
             out.append(f"💥 آخرین خروج با کد {ex.get('code')} بعد از "
                        f"{up}s ({ex.get('build') or '?'})")
+        # بخش‌های آموزش پریده؟ (کانفیگِ قدیمی جایِ تازه را گرفته)
+        try:
+            lost = cfg_lost_sections()
+            if lost:
+                _fn, _d, _ids = lost
+                out.append(f"🧩 <b>{_fa_digits(len(_ids))} بخشِ آموزش در کانفیگِ "
+                           "فعلی نیست</b> ولی در تاریخچه‌ی کانفیگ هست — احتمالاً "
+                           "نسخه‌ی قدیمیِ manager_config.json برگشته. از "
+                           "«🛠 پنل مدیر → 🧩 بخش‌های آموزش → 🕘 بازیابی "
+                           "بخش‌ها» با یک دکمه برگردانشان کن.")
+        except Exception:
+            pass
         blocks = crash_blocks(within_secs=6 * 3600)
         if blocks:
             last_ts, reason, body = blocks[-1]
