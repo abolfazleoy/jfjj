@@ -1193,6 +1193,194 @@ def cfg_lost_sections():
     return best, (snap or {}), sorted(lost.keys())
 
 
+def _cfg_sec_best_versions():
+    """پُرترین نسخه‌ی هر بخشِ تاریخچه، هم با کلیدِ «نام» هم با کلیدِ «کد».
+
+    برای بخش‌هایی که <b>هستند</b> ولی محتوایشان خالی شده (ویدیو/متنِ
+    ثبت‌شده پریده) — مثلاً «💳 شارژ کیف پول»، «🎯 خرید امتیاز»، «💎 اشتراک
+    ماهانه» — چون نامِ بخش سرِ جایش است، «گم‌شده» حساب نمی‌شود؛ پس جدا
+    پُرترین نسخه‌ی تاریخیِ هر بخش را پیدا می‌کنیم تا محتوایش برگردد.
+    """
+    by_name, by_id = {}, {}
+    for name, d, _mt in cfg_history_list():
+        raw = d.get("tut_sections") or []
+        if not isinstance(raw, list):
+            continue
+        for rec in raw:
+            if not isinstance(rec, dict) or not _cfg_sec_registered(rec):
+                continue
+            try:
+                n = len(rec.get("ids") or []) + (1 if str(rec.get("text") or "").strip() else 0)
+            except Exception:
+                n = 0
+            nm = str(rec.get("name") or "").strip()
+            if nm:
+                hit = by_name.get(nm)
+                if hit is None or n > hit[0]:
+                    by_name[nm] = (n, rec, name)
+            try:
+                sid = int(rec.get("id") or 0)
+            except (TypeError, ValueError):
+                sid = 0
+            if sid:
+                hit = by_id.get(sid)
+                if hit is None or n > hit[0]:
+                    by_id[sid] = (n, rec, name)
+    return by_name, by_id
+
+
+def cfg_poor_sections():
+    """بخش‌هایی که الان هستند ولی از نسخه‌ی تاریخیِ خودشان خالی‌ترند.
+
+    خروجی: ``[(sid, name, [توضیحِ چه‌چیزی کم است], dictِ نسخه‌ی پُر)]``
+    — مرتب بر اساسِ «چقدر محتوا کم شده» (بیشترین اول) تا در پنل همان‌هایی که
+    بیشتر به چشم می‌آیند بالا باشند.
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cur = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(cur, dict):
+        return []
+    by_name, by_id = _cfg_sec_best_versions()
+    out = []
+    for s in (cur.get("tut_sections") or []):
+        if not isinstance(s, dict):
+            continue
+        try:
+            sid = int(s.get("id") or 0)
+        except (TypeError, ValueError):
+            sid = 0
+        nm = str(s.get("name") or "").strip()
+        best = None
+        for key, table in ((nm, by_name), (sid, by_id)):
+            hit = table.get(key) if key else None
+            if hit and (best is None or hit[0] > best[0]):
+                best = hit
+        if not best:
+            continue
+        _n, hist, _src = best
+        miss = []
+        try:
+            cur_ids = [int(x) for x in (s.get("ids") or [])]
+        except Exception:
+            cur_ids = []
+        try:
+            hist_ids = [int(x) for x in (hist.get("ids") or [])]
+        except Exception:
+            hist_ids = []
+        if len(hist_ids) > len(cur_ids):
+            miss.append(("ids", "%d پیامِ محتوا" % (len(hist_ids) - len(cur_ids))))
+        cur_txt = str(s.get("text") or "").strip()
+        hist_txt = str(hist.get("text") or "").strip()
+        if len(hist_txt) > len(cur_txt):
+            miss.append(("text", "متنِ بخش"))
+        for key, label in (("note", "متنِ پایان"), ("btn_label", "برچسبِ دکمه"),
+                           ("btn_cmd", "دستورِ دکمه")):
+            if len(str(hist.get(key) or "").strip()) > len(str(s.get(key) or "").strip()):
+                miss.append((key, label))
+        if cur_ids and not int(s.get("chat") or 0) and int(hist.get("chat") or 0):
+            miss.append(("chat", "چتِ منبعِ محتوا"))
+        if not bool(s.get("on", True)) and bool(hist.get("on", True)):
+            miss.append(("on", "روشن بودنِ بخش"))
+        if miss:
+            out.append((sid, nm, miss, hist))
+    out.sort(key=lambda r: -sum(1 for k, _v in r[2] if k == "ids"))
+    return out
+
+
+def cfg_restore_section_content(only_sid=None):
+    """محتوای پریده‌ی بخش‌های <b>موجود</b> را از پُرترین نسخه‌ی تاریخی برمی‌گرداند.
+
+    فقط چیزی را برمی‌گرداند که الان خالی/کمتر است؛ آنچه مدیر امروز دارد
+    (متنِ تازه‌تر، پیام‌های بیشتر، تنظیمِ دستیِ دکمه) دست نمی‌خورد. اگر هم
+    الان کمتر است، نسخه‌ی تاریخیِ پُرتر جایگزین نمی‌شود بلکه **ادغام** می‌شود
+    (پیام‌های تکراری اضافه نمی‌شوند).
+
+    خروجی: ``(تعدادِ بخشِ ترمیم‌شده, [(نامِ بخش, [برچسبِ چه‌چیزی برگشت])])``
+    """
+    poor = cfg_poor_sections()
+    if only_sid is not None:
+        try:
+            only_sid = int(only_sid)
+        except (TypeError, ValueError):
+            only_sid = None
+        poor = [r for r in poor if r[0] == only_sid]
+    if not poor:
+        return 0, []
+    cfg_snapshot("before-restore-content")
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cur = json.load(f)
+        if not isinstance(cur, dict):
+            return 0, []
+        rows = cur.get("tut_sections") or []
+    except Exception as e:
+        print(f"cfg_restore_section_content: {type(e).__name__}: {e}", flush=True)
+        return 0, []
+    fixed = []
+    for sid, nm, miss, hist in poor:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                if int(row.get("id") or 0) != sid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            labels = []
+            for key, label in miss:
+                if key == "ids":
+                    try:
+                        have = [int(x) for x in (row.get("ids") or [])]
+                    except Exception:
+                        have = []
+                    try:
+                        add = [int(x) for x in (hist.get("ids") or [])]
+                    except Exception:
+                        add = []
+                    merged = list(have)
+                    for x in add:
+                        if x not in merged:
+                            merged.append(x)
+                    if len(merged) > len(have):
+                        row["ids"] = merged
+                        if not int(row.get("chat") or 0) and int(hist.get("chat") or 0):
+                            row["chat"] = int(hist["chat"])
+                        labels.append(label)
+                    continue
+                hv = str(row.get(key) or "")
+                nv = str(hist.get(key) or "")
+                if key == "on":
+                    if not bool(row.get("on", True)) and bool(hist.get("on", True)):
+                        row["on"] = True
+                        labels.append(label)
+                    continue
+                if len(nv.strip()) > len(hv.strip()):
+                    row[key] = nv
+                    labels.append(label)
+            if labels:
+                fixed.append((nm, labels))
+            break
+    if not fixed:
+        return 0, []
+    try:
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_FILE)
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
+        touch_data("config-restore-content")
+    except Exception as e:
+        print(f"cfg_restore_section_content: {type(e).__name__}: {e}", flush=True)
+        return 0, []
+    return len(fixed), fixed
+
+
 def cfg_restore_sections(fname=None):
     """بخش‌های گم‌شده را از تاریخچه برمی‌گرداند.
 
@@ -7270,10 +7458,28 @@ class Manager:
                     "می‌توانی جدا انتخاب کنی.</i>"]
         else:
             txt += ["", "✅ بخشِ گم‌شده‌ای پیدا نشد."]
+        try:
+            poor = cfg_poor_sections()
+        except Exception:
+            poor = []
+        if poor:
+            tot = sum(len(m) for _s, _n, m, _h in poor)
+            txt += ["", f"🧩 <b>{_fa_digits(len(poor))} بخش هست ولی محتوایش "
+                    f"خالی شده</b> ({_fa_digits(tot)} مورد کم دارد):", ""]
+            for sid, nm, miss, _hist in poor[:10]:
+                txt.append(f"• {self._esc(nm[:60])} — "
+                           + "، ".join(lbl for _k, lbl in miss))
+            txt += ["", "<i>«📚 برگرداندنِ محتوا» فقط جاهای خالی را از "
+                    "پُرترین نسخه‌ی تاریخچه پُر می‌کند؛ آنچه الان داری (متنِ "
+                    "تازه‌تر/پیام‌های بیشتر) دست نمی‌خورد و پیامِ تکراری هم "
+                    "اضافه نمی‌شود.</i>"]
         kb = []
         if lost_map:
             kb.append([B(f"🧩 برگرداندنِ هر {_fa_digits(len(lost_map))} بخشِ "
                          "گم‌شده", "a:secs_h_all", "success")])
+        if poor:
+            kb.append([B(f"📚 برگرداندنِ محتوای {_fa_digits(len(poor))} بخش",
+                         "a:secs_h_c", "success")])
         shown = 0
         for name, d, mt in rows:
             if shown >= 8:
@@ -7292,6 +7498,8 @@ class Manager:
                        B(f"📥 کل تنظیمات ← {when}", f"a:secs_h_rf:{name}",
                          "primary")])
             shown += 1
+        for sid, nm, _miss, _h in poor[:3]:
+            kb.append([B(f"📚 محتوای {self._esc(nm[:24])}", f"a:secs_h_c:{sid}")])
         if not rows:
             txt.append("")
             txt.append("<i>هنوز نسخه‌ای نیست؛ از اولین تغییرِ بخش‌ها به بعد "
@@ -8697,6 +8905,31 @@ class Manager:
                     "<i>محتوای هر بخش به پیام‌های چتِ خودت با ربات اشاره دارد؛ "
                     "اگر آن پیام‌ها را در تلگرام پاک کرده باشی، باید دوباره "
                     "ثبتشان کنی (با «➕ افزودن به محتوا»).</i>",
+                    [[B("🧩 بخش‌های آموزش", "a:secs", "success")],
+                     [B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+                     back_btn("a:home")])
+            if k == "secs_h_c" or k.startswith("secs_h_c:"):
+                only = k.split(":", 1)[1] if ":" in k else None
+                n, fixed = cfg_restore_section_content(only)
+                if n:
+                    self.db.log(uid, "cfg_restore_content",
+                                f"+{n}" + (f" sid={only}" if only else ""))
+                self.cfg = Config()
+                self.sup.cfg = self.cfg
+                secs = self.tut_sections()
+                if n:
+                    body = (f"✅ <b>محتوای {_fa_digits(n)} بخش برگشت</b>\n"
+                            + "".join(f"• {self._esc(nm[:50])}: "
+                                      + "، ".join(lbl for lbl in labels) + "\n"
+                                      for nm, labels in fixed[:8]))
+                else:
+                    body = ("ℹ️ چیزی برای برگرداندن نبود — هر چه در تاریخچه "
+                            "پُرتر است الان هم در بخش هست.\n")
+                return await self.edit(ev,
+                    body + f"\n🧩 {_fa_digits(len(secs))} بخش · "
+                    f"{_fa_digits(sum(len(s['ids']) for s in secs))} پیامِ محتوا\n\n"
+                    "<i>اگر پیامی برنگشت، یعنی در تلگرام پاک شده؛ همان را "
+                    "دوباره با «➕ افزودن به محتوا» بفرست.</i>",
                     [[B("🧩 بخش‌های آموزش", "a:secs", "success")],
                      [B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
                      back_btn("a:home")])
@@ -13666,6 +13899,18 @@ class Manager:
                            "نسخه‌ی قدیمیِ manager_config.json برگشته. از "
                            "«🛠 پنل مدیر → 🧩 بخش‌های آموزش → 🕘 بازیابی "
                            "بخش‌ها» با یک دکمه برگردانشان کن.")
+        except Exception:
+            pass
+        # محتوای بخش‌ها خالی شده؟ (بخش هست، ویدیو/متنش نه)
+        try:
+            poor = cfg_poor_sections()
+            if poor:
+                names = "، ".join(str(nm)[:24] for _sid, nm, _m, _h in poor[:3])
+                out.append(f"📚 <b>محتوای {_fa_digits(len(poor))} بخش خالی شده "
+                           f"است</b> ({self._esc(names)}) ولی نسخه‌ی پُرترشان در "
+                           "تاریخچه‌ی کانفیگ هست — از «🛠 پنل مدیر → 🧩 بخش‌های "
+                           "آموزش → 🕘 بازیابی بخش‌ها → 📚 برگرداندنِ محتوا» "
+                           "برگردانشان کن.")
         except Exception:
             pass
         blocks = crash_blocks(within_secs=6 * 3600)

@@ -153,6 +153,15 @@ RICH = {
     "bot_token": "t",
     "tut_chat": 100,
     "tut_ids": [11, 12],
+    # بقیه‌ی «قابلیت‌ها»ی دستیِ مدیر — همان‌هایی که کاربر می‌گوید پریده:
+    "cmd_items": [
+        {"title": "🚀 راه‌اندازی سلف", "cmd": "اول 95.py را بفرست…", "note": "مرحله ۱"},
+        {"title": "🤝 تبادل", "cmd": "کانال را به @me بده…", "note": ""},
+    ],
+    "rules_text": "قوانینِ کاملِ ربات که مدیر دستی نوشته است.",
+    "welcome": "سلام! به ربات خوش آمدی — متنِ خوش‌آمدِ دستی.",
+    "card_number": "6037-9911-2233-4455",
+    "card_name": "به نامِ علی",
     "tut_sections": [
         {"id": 1, "name": "آموزش بعد از فعال‌سازی", "emoji": "🚀", "chat": 100,
          "ids": [601, 701], "when": "after_run", "delay": 0, "on": True,
@@ -171,7 +180,10 @@ RICH = {
          "preset": "wallet"},
     ],
 }
-STALE = {"bot_token": "t", "tut_chat": 100, "tut_ids": [11], "tut_sections": []}
+STALE = {"bot_token": "t", "tut_chat": 100, "tut_ids": [11], "tut_sections": [],
+         # نسخه‌ی کهنه/زامبی: دستورات آماده فقط یک مورد، متن‌ها خالی
+         "cmd_items": [{"title": "🚀 راه‌اندازی سلف", "cmd": "قدیمی", "note": ""}],
+         "rules_text": "", "welcome": "", "card_number": "", "card_name": ""}
 
 
 def write_cfg(data, obj, mtime=None):
@@ -225,6 +237,15 @@ def scenario_sync():
               "ویدیوهای ثبت‌شده‌ی هر بخش (ids) سر جایشان")
         check(cfg.get("tut_ids") == [11, 12],
               "محتوای آموزشِ اصلی هم پُرتر ماند")
+        check(len(cfg.get("cmd_items") or []) == 2,
+              "«📋 دستورات آماده»ی مدیر با بسته‌ی کهنه یکی‌درمیان نشد")
+        check(cfg.get("rules_text") == RICH["rules_text"],
+              "متنِ قوانینِ پُرتر ماند")
+        check(cfg.get("welcome") == RICH["welcome"],
+              "متنِ خوش‌آمدِ پُرتر ماند")
+        check(cfg.get("card_number") == RICH["card_number"]
+              and cfg.get("card_name") == RICH["card_name"],
+              "شماره‌کارت و نامِ صاحبِ کارت (تنظیماتِ دستی) نپرید")
 
         # پ) کانفیگِ محلیِ تازه‌تر از بسته → دست نمی‌خورد (حذفِ عمدی له نشود)
         data2 = minimal_data(ROOT / "s_newer")
@@ -237,6 +258,9 @@ def scenario_sync():
               "کانفیگِ محلیِ تازه‌تر دست نخورد (حذفِ عمدیِ مدیر برنگشت)")
         check("تازه‌تر" in (r.stdout + r.stderr),
               "pull در لاگ می‌گوید چرا دست نزده")
+        check(cfg2.get("cmd_items") == pruned.get("cmd_items")
+              or len(cfg2.get("cmd_items") or []) == 2,
+              "در حالتِ «محلی تازه‌تر» هم دستورات آماده دست نخورد")
 
         # ت) بعد از pullِ ادغامی، push همان نسخه‌ی پُرتر را ذخیره می‌کند
         check(run_cli(data, srv.port, "push").returncode == 0,
@@ -591,6 +615,58 @@ INNER = textwrap.dedent('''
         await cb(f"a:sec_done:{sub['id']}")
         check(m.tut_find(sub["id"])["ids"] == [600 + ids[1], 777],
               "ویدیوی دوم پشتِ ویدیوی برگشتی نشست (آیدیِ اصلیِ پیام حفظ شد)")
+
+        # ---- 4b) محتوای یک بخشِ «موجود» می‌پرد (کیف پول/امتیاز/اشتراک) ----
+        # سناریوی واقعیِ کاربر: بخش سرِ جایش است ولی ویدیو/متنش خالی شده، پس
+        # «گم‌شده» نیست و فقط ترمیمِ محتوا نجاتش می‌دهد.
+        wallet = next(s for s in m.tut_sections() if s["name"] == "آموزش کیف پول")
+        orig_ids = list(wallet["ids"])
+        m.tut_update(wallet["id"], ids=[], text="", note="", chat=0)
+        poor = M.cfg_poor_sections()
+        check(any(sid == wallet["id"] for sid, _n, _m, _h in poor),
+              "خالی‌شدنِ محتوای بخشِ موجود تشخیص داده شد")
+        ev = await cb("a:secs_h")
+        txt, kb = ev.edits[-1]
+        check("محتوایش خالی شده" in txt and "آموزش کیف پول" in txt,
+              "پنل می‌گوید کدام بخش هست ولی محتوایش خالی شده")
+        check("a:secs_h_c" in btn_datas(kb),
+              "دکمه‌ی «📚 برگرداندنِ محتوا» هست")
+        check(any(len(d.encode()) <= 64 for d in btn_datas(kb)),
+              "داده‌ی دکمه‌ها زیر سقفِ تلگرام")
+        ev = await cb("a:secs_h_c")
+        w2 = m.tut_find(wallet["id"])
+        check(orig_ids and w2["ids"] == orig_ids,
+              "دقیقاً همان ویدیوهای ثبت‌شده برگشتند")
+        check(w2["chat"] == ADMIN, "چتِ منبعِ محتوا هم برگشت")
+        check(all(sid != wallet["id"] for sid, _n, _m, _h in M.cfg_poor_sections()),
+              "بعد از ترمیم، دیگر «خالی» گزارش نمی‌شود")
+        check(any("برگشت" in (t2 or "") for t2, _k in ev.edits),
+              "نتیجه‌ی ترمیم در پنل اعلام می‌شود")
+
+        # آنچه مدیر الان دارد له نمی‌شود: متنِ تازه‌تر می‌ماند
+        m.tut_update(wallet["id"], text="متنِ تازه‌ی خودم")
+        M.cfg_snapshot("test-fresh-text")
+        m.tut_update(wallet["id"], text="")
+        n_fixed, _detail = M.cfg_restore_section_content(wallet["id"])
+        check(n_fixed == 1, "ترمیمِ تک‌بخش کار می‌کند")
+        m.cfg = M.Config()
+        check(m.tut_find(wallet["id"])["text"] == "متنِ تازه‌ی خودم",
+              "پُرترین نسخه‌ی تاریخیِ متن برگشت، نه نسخه‌ی کهنه")
+
+        # پیامِ تکراری اضافه نمی‌شود
+        n_before = len(m.tut_find(wallet["id"])["ids"])
+        M.cfg_restore_section_content(None)
+        m.cfg = M.Config()
+        check(len(m.tut_find(wallet["id"])["ids"]) == n_before,
+              "دوباره‌کاری نکرد: پیامِ تکراری اضافه نشد")
+
+        # هشدارِ بوت + ترمیمِ یک‌دکمه بعد از آن
+        m.tut_update(wallet["id"], ids=[])
+        check(any("محتوای" in n2 and "خالی شده" in n2 for n2 in m._startup_notices()),
+              "هشدارِ بوت هم برای محتوای خالی‌شده می‌آید")
+        ev = await cb("a:secs_h_c:" + str(wallet["id"]))
+        check(m.tut_find(wallet["id"])["ids"] == orig_ids,
+              "با دکمه‌ی تک‌بخش هم ویدیوها برگشتند")
 
         # ---------- 5) بازیابیِ کلِ تنظیمات ----------
         fake_now[0] += 90

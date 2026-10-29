@@ -318,9 +318,17 @@ def put_remote(c, blob, sha, message):
 #      کلیدهای محتوایی، هر طرف <b>پُرتر</b> است می‌ماند — هیچ‌وقت داده‌ی
 #      بیشتر با داده‌ی کمترِ کهنه جایگزین نمی‌شود.
 CONFIG_REL = "manager_config.json"
-# کلیدهایی که «هر طرف بلندتر/پُرتر بود، همان بماند»
+# کلیدهایی که «هر طرف بلندتر/پُرتر بود، همان بماند» — یعنی هیچ‌وقت متن/لیستِ
+# پُرترِ محلی با نسخه‌ی کهنه‌ی بسته جایگزین نمی‌شود (قابلیت‌های دستیِ مدیر:
+# «📋 دستورات آماده»، متن‌های ربات، شماره‌کارت، سلام‌ها و…).
 LONGER_LIST_KEYS = ("tut_ids", "sample_ids", "admin_ids", "cmd_items")
-LONGER_TEXT_KEYS = ("rules_text", "welcome", "hub_intro", "rt_text")
+# هر «متنِ» که مدیر دستی ثبت کرده: اگر یک طرف پُرتر بود، همان بماند.
+LONGER_TEXT_KEYS = (
+    "rules_text", "welcome", "hub_intro", "rt_text",
+    "cmd_intro", "sold_text", "expired_text", "help_text", "support_text",
+    "contact", "pay_note", "card_number", "card_name",
+    "greet_morning", "greet_noon", "greet_evening", "greet_night",
+)
 # کلیدهای paired: لیست + چتِ منبعش از <b>یک</b> طرف می‌آیند تا قاطی نشوند
 PAIRED_KEYS = {"tut_ids": "tut_chat", "sample_ids": "sample_chat"}
 # شماره‌چینه‌ی بسته برای مقایسه با mtime محلی
