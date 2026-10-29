@@ -84,8 +84,10 @@ def _start_health_server():
                                              or time.localtime())
                     except Exception:
                         boot = "?"
-                    txt = ("build: %s\ncommit: %s\nstarted: %s\n"
-                           % (ver, commit, boot))
+                    txt = ("build: %s\ncommit: %s\ncode: %s\n"
+                           "manager: %s\nstarted: %s\n"
+                           % (ver, commit, g.get("CODE_ID") or "?",
+                              g.get("MANAGER_PATH") or "?", boot))
                     return txt.encode("utf-8")
                 return b"JAFJ OK\n"
 
@@ -2144,6 +2146,51 @@ if not GIT_COMMIT:
 if not GIT_COMMIT:
     GIT_COMMIT = "?"
 _BOOT_TIME_STRUCT = time.localtime()
+
+def code_fingerprint(path=None):
+    """اثرانگشتِ کوتاهِ کدی که <b>واقعاً</b> اجرا می‌شود.
+
+    چرا: بعد از دیپلوی، سؤال این است «رسید یا نه؟». کامیتِ گیت فقط وقتی هست
+    که میزبان متغیرش را بدهد یا .git داخلِ ایمیج باشد؛ ولی محتوای فایل‌ها
+    همیشه هست. پس هشِ manager_82.py و 95.py را می‌گیریم: با <b>هر</b> تغییرِ
+    کد عوض می‌شود و اگر دیپلوی بی‌اثر مانده باشد (ایمیجِ قدیمی، یا دیسکی که
+    روی مسیرِ کد مانت شده) همان مقدارِ قبلی می‌ماند.
+    """
+    import hashlib
+    d = path or image_dir()
+    h = hashlib.sha256()
+    for name in ("manager_82.py", "95.py"):
+        fp = os.path.join(d, name)
+        try:
+            with open(fp, "rb") as f:
+                h.update(f.read())
+        except OSError:
+            h.update(b"<missing:%s>" % name.encode())
+    return h.hexdigest()[:8]
+
+
+# اگر اسکریپتِ بوت خودش اثرانگشت را حساب کرده باشد، همان را نشان می‌دهیم تا
+# لاگ و /version و پنلِ تلگرام یک عدد را بگویند.
+CODE_ID = (os.environ.get("JAFJ_CODE_ID") or "").strip()[:12] \
+    or code_fingerprint()
+MANAGER_PATH = os.path.abspath(__file__)
+_BOOT_AT = time.time()
+
+
+def uptime_text():
+    """چقدر است که این نسخه بالا آمده (برای «آیا دیپلوی شد؟»)."""
+    secs = max(0, int(time.time() - _BOOT_AT))
+    d, rem = divmod(secs, 86400)
+    hrs, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d} روز")
+    if hrs:
+        parts.append(f"{hrs} ساعت")
+    parts.append(f"{mins} دقیقه")
+    return " و ".join(parts)
+CODE_IS_STALE = (os.path.dirname(MANAGER_PATH) != os.path.abspath(image_dir()))
 BUILD_TAG = "JAFJ_MANAGER_82_v1028-nocode_2026_10_28"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -7538,6 +7585,51 @@ class Manager:
         kb.append([B("⬅️ بازگشت", "a:tut")])
         return await self.edit(ev, "\n".join(txt), kb)
 
+    async def version_status(self, ev):
+        """«🧬 نسخه‌ی کد» — کدام کد <b>الان</b> روی هاست اجرا می‌شود.
+
+        تنها سؤالی که بعد از هر مرج می‌ماند «رسید یا نه؟» است. همین‌جا
+        بیلد/کامیت/اثرانگشتِ کد، مسیرِ فایلِ در حالِ اجرا، آپ‌تایم و خلاصه‌ی
+        وضعیتِ بازیابیِ بخش‌ها یک‌جا می‌آید تا بدونِ بازکردنِ داشبورد و لاگ
+        معلوم شود دیپلوی نشسته یا نه.
+        """
+        fresh = os.path.join(image_dir(), "manager_82.py")
+        lines = [f"🧬 <b>نسخه‌ی در حالِ اجرا</b>", self.LINE,
+                 f"🏷 بیلد: <code>{BUILD_VERSION}</code>",
+                 f"🔖 کامیت: <code>{GIT_COMMIT}</code>",
+                 f"🧬 اثرانگشتِ کد: <code>{CODE_ID}</code>",
+                 f"⏱ آپ‌تایم: {uptime_text()}",
+                 f"📄 فایل: <code>{self._esc(MANAGER_PATH)}</code>",
+                 f"🖼 نسخه‌ی ایمیج: <code>{self._esc(fresh)}</code>"]
+        same = os.path.abspath(MANAGER_PATH) == os.path.abspath(fresh)
+        if same:
+            lines.append("✅ همین فایلِ ایمیج اجرا می‌شود (دیپلوی نشسته).")
+        elif CODE_IS_STALE:
+            lines.append("⚠️ <b>کد از ایمیج اجرا نمی‌شود</b> — دیپلویِ تازه "
+                         "بی‌اثر می‌ماند. مسیرِ دیسک باید <code>/data</code> "
+                         "باشد، نه <code>/app</code> یا <code>/opt/jafj</code>.")
+        lines += [self.LINE,
+                  "🌐 همین اطلاعات در مرورگر: "
+                  "<code>https://YOUR-SERVICE.onrender.com/version</code>",
+                  "🔺 اگر کامیت/اثرانگشت قدیمی است: داشبورد Render → "
+                  "<b>Manual Deploy → Deploy latest commit</b>."]
+        try:
+            lost = cfg_lost_sections(extra=True)
+            poor = cfg_poor_sections(extra=True)
+            if lost:
+                lines.append(f"🧩 {_fa_digits(len(lost[2]))} بخشِ گم‌شده در "
+                             "تاریخچه/پشتیبان پیدا شد.")
+            if poor:
+                lines.append(f"📚 محتوای {_fa_digits(len(poor))} بخش خالی شده.")
+            if not lost and not poor:
+                lines.append("✅ بخشِ گم‌شده یا خالی‌شده‌ای دیده نمی‌شود.")
+        except Exception:
+            pass
+        kb = [[B("🕘 بازیابی بخش‌ها", "a:secs_h", "primary")],
+              [B("🔄 تازه‌سازی", "a:ver")],
+              back_btn("a:home")]
+        return await self.edit(ev, "\n".join(lines), kb)
+
     async def tut_admin_history(self, ev):
         """«🕘 بازیابی بخش‌ها» — نسخه‌های تاریخچه‌ی manager_config.json.
 
@@ -8595,7 +8687,10 @@ class Manager:
                     f"🟢  سرویس روشن      {_fa_digits(self.sup.running_count())}\n"
                     f"📤  منتظر تأیید      {_fa_digits(st['orders'].get('paid', 0))}\n"
                     f"💰  فروش امروز      {money(st['day'][1])}\n"
-                    f"{self.LINE}",
+                    f"{self.LINE}\n"
+                    f"🧬 نسخه‌ی کد: <code>{BUILD_VERSION}</code> · کامیت "
+                    f"<code>{GIT_COMMIT}</code> · <code>{CODE_ID}</code> · "
+                    f"⏱ {uptime_text()}",
                     admin_menu(st['orders'].get('paid', 0),
                                len(sh.open_tickets()) if sh else 0,
                                trial_on=bool(self.cfg.get("trial_on", True))))
@@ -9032,6 +9127,8 @@ class Manager:
             # ── بخش‌بندی آموزش (تگ‌ها) ──
             if k == "secs":
                 return await self.tut_admin_list(ev)
+            if k == "ver":
+                return await self.version_status(ev)
             if k == "secs_h":
                 return await self.tut_admin_history(ev)
             if k == "secs_h_all":
@@ -14065,6 +14162,16 @@ class Manager:
             up = int(ex.get("uptime") or 0)
             out.append(f"💥 آخرین خروج با کد {ex.get('code')} بعد از "
                        f"{up}s ({ex.get('build') or '?'})")
+        # کدام کد بالا آمده؟ تنها سؤالِ بعد از هر مرج: «دیپلوی شد یا نه؟»
+        out.append(f"🧬 نسخه‌ی در حالِ اجرا: <code>{BUILD_VERSION}</code> · "
+                   f"کامیت <code>{GIT_COMMIT}</code> · کد "
+                   f"<code>{CODE_ID}</code> — برای دیدنِ جزئیات و راهنمای "
+                   "دیپلوی: «🛠 پنل مدیر → 🧬 نسخه‌ی کد» یا <code>/version</code>")
+        if CODE_IS_STALE:
+            out.append("⚠️ <b>کد از پوشه‌ی ایمیج اجرا نمی‌شود</b> "
+                       f"(<code>{self._esc(MANAGER_PATH)}</code>) — یعنی دیپلویِ "
+                       "تازه احتمالاً بی‌اثر است. دیسک باید روی <code>/data</code> "
+                       "باشد، نه <code>/app</code> یا <code>/opt/jafj</code>.")
         # بخش‌های آموزش پریده؟ (کانفیگِ قدیمی جایِ تازه را گرفته)
         try:
             lost = cfg_lost_sections(extra=True)

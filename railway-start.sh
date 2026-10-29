@@ -122,7 +122,16 @@ if [ -z "${JAFJ_COMMIT:-}" ] && command -v git >/dev/null 2>&1; then
 fi
 if [ -z "${JAFJ_COMMIT:-}" ]; then JAFJ_COMMIT="unknown"; fi
 export JAFJ_COMMIT
-log "build=$(grep -m1 '^BUILD_VERSION' "$MANAGER" 2>/dev/null | cut -d'"' -f2) commit=$JAFJ_COMMIT (GET /version on the service URL shows the same)"
+# اثرانگشتِ محتوای کد (بدونِ نیاز به git): با هر تغییرِ کد عوض می‌شود، پس اگر
+# دیپلوی بی‌اثر مانده باشد همان عددِ قبلی می‌ماند و فوراً دیده می‌شود.
+if command -v sha256sum >/dev/null 2>&1; then
+    JAFJ_CODE_ID="$(cat "$MANAGER" "$SELF" 2>/dev/null | sha256sum | cut -c1-8)"
+elif command -v shasum >/dev/null 2>&1; then
+    JAFJ_CODE_ID="$(cat "$MANAGER" "$SELF" 2>/dev/null | shasum -a 256 | cut -c1-8)"
+fi
+if [ -z "${JAFJ_CODE_ID:-}" ]; then JAFJ_CODE_ID="unknown"; fi
+export JAFJ_CODE_ID
+log "build=$(grep -m1 '^BUILD_VERSION' "$MANAGER" 2>/dev/null | cut -d'"' -f2) commit=$JAFJ_COMMIT code=$JAFJ_CODE_ID manager=$MANAGER (GET /version on the service URL shows the same)"
 
 # ── 2.5) GitHub data sync: اطلاعات مشتری‌ها از/به گیت‌هاب ────────────────────
 # اگر DATA_GITHUB_TOKEN تنظیم نشده باشد، هیچ اتفاقی نمی‌افتد (اختیاری است).
