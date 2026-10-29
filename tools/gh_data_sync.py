@@ -61,7 +61,12 @@ TOP_FILES = (
     # انجام می‌شود — یعنی داده حتی بدون دیسک هم از دست نمی‌رود.
     "jafj_backup_latest.zip",
 )
-TOP_DIRS = ("clients",)
+TOP_DIRS = (
+    "clients",
+    # تاریخچه‌ی خودِ کانفیگ (manager_82.py قبل از هر تغییرِ بخش‌ها یک نسخه
+    # می‌گذارد) — اگر روزی بخش‌ها پریدند، از همین‌ها برمی‌گردند.
+    "config_history",
+)
 
 # فایل‌هایی که هرگز به بسته نمی‌روند (لاگ و فایل‌های موقت sqlite/telethon).
 EXCLUDE_NAMES = {"run.log"}
@@ -299,6 +304,106 @@ def put_remote(c, blob, sha, message):
     raise RuntimeError("PUT contents بعد از چند تلاش: %s" % last)
 
 
+# ── ادغامِ manager_config.json هنگامِ بازیابی ─────────────────────────────────
+# چرا: pull قبل از هر بوت، فایل‌ها را «کور» جایگزین می‌کند. اگر آخرین pushِ
+# موفق برای چند ساعت/چند روز پیش باشد (خطای شبکه، توکن، کشتنِ سختِ کانتینر،
+# یا دو نمونه‌ی همزمان که یکی‌شان کانفیگِ تهی دارد) و در این فاصله مدیر
+# بخش‌های آموزش را ثبت کرده باشد، همان دیپلوی/ری‌استارت همه‌ی بخش‌ها را
+# برمی‌گرداند به نسخه‌ی قدیمی — یعنی «همه‌ی آموزش‌ها پرید».
+#
+# دو قاعده:
+#   1) اگر کانفیگِ محلی از بسته <b>تازه‌تر</b> است (mtime > created_atِ بسته)،
+#      دست نمی‌خورد؛ پس تغییرِ عمدیِ مدیر (حتی پاک‌کردنِ یک بخش) له نمی‌شود.
+#   2) وگرنه (محلی قدیمی یا اصلاً نیست) کلیدبه‌کلید ادغام می‌شود و برای
+#      کلیدهای محتوایی، هر طرف <b>پُرتر</b> است می‌ماند — هیچ‌وقت داده‌ی
+#      بیشتر با داده‌ی کمترِ کهنه جایگزین نمی‌شود.
+CONFIG_REL = "manager_config.json"
+# کلیدهایی که «هر طرف بلندتر/پُرتر بود، همان بماند» — یعنی هیچ‌وقت متن/لیستِ
+# پُرترِ محلی با نسخه‌ی کهنه‌ی بسته جایگزین نمی‌شود (قابلیت‌های دستیِ مدیر:
+# «📋 دستورات آماده»، متن‌های ربات، شماره‌کارت، سلام‌ها و…).
+LONGER_LIST_KEYS = ("tut_ids", "sample_ids", "admin_ids", "cmd_items")
+# هر «متنِ» که مدیر دستی ثبت کرده: اگر یک طرف پُرتر بود، همان بماند.
+LONGER_TEXT_KEYS = (
+    "rules_text", "welcome", "hub_intro", "rt_text",
+    "cmd_intro", "sold_text", "expired_text", "help_text", "support_text",
+    "contact", "pay_note", "card_number", "card_name",
+    "greet_morning", "greet_noon", "greet_evening", "greet_night",
+)
+# کلیدهای paired: لیست + چتِ منبعش از <b>یک</b> طرف می‌آیند تا قاطی نشوند
+PAIRED_KEYS = {"tut_ids": "tut_chat", "sample_ids": "sample_chat"}
+# شماره‌چینه‌ی بسته برای مقایسه با mtime محلی
+_TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _days_from_civil(y, m, d):
+    """شمارِ روزها از ۱۹۷۰/۱/۱ برای تاریخِ میلادی (بدونِ نیاز به datetime)."""
+    y -= m <= 2
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _parse_bundle_time(value):
+    """«زمانِ ساختِ بسته» (ISO/UTC) را به ثانیه‌ی epoch برمی‌گرداند.
+
+    عمداً بدون ``calendar``/``datetime`` نوشته شده تا وابستگی‌های این ابزار
+    همان لیستِ کوچکِ stdlib بماند (تستِ test_gh_data_sync این را می‌پاید).
+    خروجی‌اش با ``calendar.timegm`` یکی است؛ اگر نشود پارس کرد صفر
+    برمی‌گرداند تا مقایسه با mtime محلی به‌سمتِ «محلی تازه‌تر است» نرود
+    (صفر یعنی بسته خیلی قدیمی فرض می‌شود ⇒ merge انجام می‌شود که رفتارِ
+    امنِ قبلی است).
+    """
+    try:
+        st = time.strptime(str(value).strip(), _TIME_FMT)
+    except Exception:
+        return 0
+    try:
+        return (_days_from_civil(st.tm_year, st.tm_mon, st.tm_mday) * 86400
+                + st.tm_hour * 3600 + st.tm_min * 60 + st.tm_sec)
+    except Exception:
+        return 0
+
+
+def _richness(key, val):
+    if isinstance(val, list):
+        return len(val)
+    if isinstance(val, str):
+        return len(val.strip())
+    if isinstance(val, dict):
+        return len(val)
+    return 0 if val in (None, "", 0, False) else 1
+
+
+def merge_config(bundle_cfg, local_cfg):
+    """(کانفیگِ ادغام‌شده, فهرستِ کلیدهایی که از نسخه‌ی محلیِ پُرتر نگه داشتیم)."""
+    kept = []
+    if not isinstance(bundle_cfg, dict) or not isinstance(local_cfg, dict):
+        return (local_cfg if isinstance(local_cfg, dict) else bundle_cfg), kept
+    out = dict(bundle_cfg)
+    out.update(local_cfg)          # پایه: محلی (تازه‌تر) برنده است
+    for key in ("tut_sections",) + LONGER_LIST_KEYS + LONGER_TEXT_KEYS:
+        b, l = bundle_cfg.get(key), local_cfg.get(key)
+        if key not in bundle_cfg or key not in local_cfg:
+            continue
+        if _richness(key, b) > _richness(key, l):
+            out[key] = b
+            kept.append(key)
+            pair = PAIRED_KEYS.get(key)
+            if pair and pair in bundle_cfg:
+                out[pair] = bundle_cfg[pair]
+    return out, kept
+
+
+def _write_config(path, data):
+    tmp = path + ".ghnew"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    _chmod_private(path)
+
+
 def _manifest_of(blob):
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
@@ -372,6 +477,7 @@ def cmd_pull():
             log("قالب ناشناخته‌ی بسته (%r) — با داده‌ی فعلی ادامه می‌دهیم"
                 % manifest.get("format"))
             return 1
+        created = _parse_bundle_time(manifest.get("created_at"))
         n = 0
         for rec in manifest.get("files", []):
             rel = rec.get("path", "")
@@ -382,6 +488,34 @@ def cmd_pull():
                 continue
             dst = os.path.join(root, rel)
             os.makedirs(os.path.dirname(dst) or root, exist_ok=True)
+            if rel == CONFIG_REL and os.path.isfile(dst):
+                # کانفیگِ محلی تازه‌تر از بسته → دست نمی‌خورد (تغییرِ عمدیِ
+                # مدیر، از جمله پاک‌کردنِ یک بخش، له نمی‌شود).
+                try:
+                    if created and os.path.getmtime(dst) > created:
+                        log("%s: نسخه‌ی محلی تازه‌تر است — دست نخورد" % rel)
+                        n += 1
+                        continue
+                except OSError:
+                    pass
+                try:
+                    with open(src, encoding="utf-8") as fh:
+                        bundle_cfg = json.load(fh)
+                    with open(dst, encoding="utf-8") as fh:
+                        local_cfg = json.load(fh)
+                    merged, kept = merge_config(bundle_cfg, local_cfg)
+                    if kept:
+                        log("%s: ادغام شد — کلیدهای پُرترِ محلی نگه داشته شد: %s"
+                            % (rel, ", ".join(kept)))
+                    if merged == local_cfg:
+                        n += 1
+                        continue
+                    _write_config(dst, merged)
+                    n += 1
+                    continue
+                except Exception as e:
+                    log("%s: ادغام نشد (%s) — همان نسخه‌ی بسته می‌نشیند"
+                        % (rel, e))
             tmp = dst + ".ghnew"
             shutil.copy2(src, tmp)          # اول به فایل موقت کنار مقصد
             os.replace(tmp, dst)            # بعد جایگزینی اتمیک

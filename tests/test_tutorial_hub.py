@@ -385,6 +385,9 @@ INNER = textwrap.dedent('''
         check(len(hubs) == 1, "hub:list opens the list again")
 
         # ---------- 6) ارسال همه ----------
+        # توضیحاتِ پیش‌فرض خاموش تا «ارسال همه» فقط بخش‌های همین سناریو را
+        # بفرستد (بخشِ ۱۱ دوباره روشنشان می‌کند).
+        m.cfg["hub_defaults"] = False
         m.db.tut_reset_user(USER)
         fake_now[0] += 5
         bot.msg_sends, bot.text_sends = [], []
@@ -399,6 +402,9 @@ INNER = textwrap.dedent('''
               "each bulk tutorial keeps the back-to-list button")
 
         # ---------- 7) صفحه‌بندی ----------
+        # توضیحاتِ پیش‌فرض برای این سناریو خاموش می‌شوند تا عددِ صفحه‌ها فقط
+        # به بخش‌های خودِ سناریو بستگی داشته باشد (بعداً دوباره روشن می‌شوند).
+        m.cfg["hub_defaults"] = False
         m.cfg["hub_page_size"] = 4
         ids = []
         for i in range(9):
@@ -580,6 +586,7 @@ INNER = textwrap.dedent('''
               "each default text describes its own capability")
 
         # خالی‌کردنِ فهرست از بخش‌ها → پیش‌فرض‌ها می‌آیند
+        m.cfg["hub_defaults"] = True      # پیش‌فرض‌ها دوباره روشن
         for sec in m.tut_sections():
             m.tut_update(sec["id"], in_hub=False)
         check(not m.hub_sections(), "list emptied of admin sections (test setup)")
@@ -651,10 +658,27 @@ INNER = textwrap.dedent('''
         await m.on_callback(ev)
         check(m.hub_defaults_on() is True, "a:hub_def turns them back on")
 
-        # یکی از بخش‌ها را برمی‌گردانیم → پیش‌فرض‌ها کنار می‌روند
-        m.tut_update(m.tut_sections()[0]["id"], in_hub=True)
-        check(not m.hub_default_items(),
-              "as soon as one section is listed, defaults step aside")
+        # یکی از بخش‌ها را برمی‌گردانیم → پیش‌فرض‌ها <b>می‌مانند</b>
+        # (قبلاً به‌محضِ یک بخشِ دست‌ساز همه‌ی توضیحاتِ آماده غیب می‌شدند و
+        # فهرستِ مشتری عملاً خالی می‌ماند؛ رگرسیونِ «همه‌چی پریده»).
+        sec0 = m.tut_sections()[0]["id"]
+        m.tut_update(sec0, in_hub=True)
+        check(len(m.hub_default_items()) == len(m.HUB_DEFAULTS),
+              "adding an admin section does NOT wipe the built-in explanations")
+        all_datas, all_texts = [], []
+        for pg in range(m.hub_pages()):
+            t2, kb2 = m.hub_view(pg)
+            all_datas += btn_datas(kb2)
+            all_texts += btn_texts(kb2)
+        check(f"hub:s:{sec0}" in all_datas,
+              "admin's own section is listed first")
+        check("hub:d:start" in all_datas and "hub:d:trial" in all_datas
+              and "hub:d:wallet" in all_datas,
+              "capability explanations are still tappable next to it")
+        check(m.hub_pages() > 1,
+              "section + defaults are paginated together")
+        check(all(len(d.encode()) <= 64 for d in all_datas),
+              "list callback data within Telegram's 64-byte limit")
 
         # ---------- 12) تبدیلِ پیش‌فرض‌ها به بخشِ قابل‌ویرایش ----------
         for sec in m.tut_sections():

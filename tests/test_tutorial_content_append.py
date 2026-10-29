@@ -575,6 +575,74 @@ INNER = textwrap.dedent('''
         check([x[1].id for x in bot.msg_sends if x[0] == USER] == [601, 701],
               "delivery follows the edited list")
 
+        # ---------- 12) رگرسیونِ «همه‌چی پریده»: فهرستِ 🗂 توضیحات ----------
+        # سناریوی واقعیِ مدیر: یک بخشِ «بعد از فعال‌سازی» می‌سازد و ویدیو
+        # ثبت می‌کند؛ قبلاً به‌محضِ همین یک بخش، همه‌ی توضیحاتِ آماده‌ی
+        # قابلیت‌ها از فهرستِ مشتری غیب می‌شد و فقط «🚀 راه‌اندازی سلف»
+        # می‌ماند. حالا بخشِ خودش اول می‌آید و توضیحاتِ آماده سرِ جایشان
+        # می‌مانند؛ تنها راهِ برداشتنشان سوئیچِ «📦 توضیحات پیش‌فرض» است.
+        m.cfg["hub_defaults"] = True
+        m.cfg["hub_on"] = True
+        sec2 = m.tut_new("آموزش بعد از فعال‌سازی")
+        m.tut_update(sec2["id"], emoji="🚀", when="after_run",
+                     btn_cmd="s:setup",
+                     btn_label="🚀 راه‌اندازی سلف روی اکانتم",
+                     chat=ADMIN, ids=[601])
+        datas, texts = [], []
+        for pg in range(m.hub_pages()):
+            _t, kb = m.hub_view(pg)
+            datas += btn_datas(kb)
+            texts += btn_texts(kb)
+        check(f"hub:s:{sec2['id']}" in datas,
+              "admin's own section is in the customer list")
+        check(sum(1 for d in datas if d.startswith("hub:d:")) >= len(m.HUB_DEFAULTS),
+              "built-in capability explanations are still listed next to it")
+        check(any("آموزش بعد از فعال‌سازی" in t for t in texts),
+              "the section itself is a tappable row in the list")
+        check(any("سلف چیست" in t for t in texts)
+              and any("تست رایگان" in t for t in texts)
+              and any("کیف پول" in t for t in texts),
+              "feature topics (سلف/تست رایگان/کیف پول) did not disappear")
+        check("m:tut" in datas, "main tutorial entry still on the first page")
+
+        # افزودنِ ویدیوی دوم به همان بخش، فهرست را خراب نمی‌کند
+        await cb(f"a:sec_add:{sec2['id']}")
+        await send(701, "ویدیو دوم", video=("doc", "v2"))
+        await cb(f"a:sec_done:{sec2['id']}")
+        check(m.tut_find(sec2["id"])["ids"] == [601, 701],
+              "second video appended to the after-activation section")
+        datas2 = []
+        for pg in range(m.hub_pages()):
+            datas2 += btn_datas(m.hub_view(pg)[1])
+        check(f"hub:s:{sec2['id']}" in datas2
+              and sum(1 for d in datas2 if d.startswith("hub:d:")) >= len(m.HUB_DEFAULTS),
+              "list intact after appending content to a section")
+
+        # تپِ همان بخش در فهرست: هر دو ویدیو + دکمه‌ی «🚀 راه‌اندازی سلف»
+        fake_now[0] += 5
+        bot.msg_sends, bot.text_sends = [], []
+        ev = FakeCbEv(USER, f"hub:s:{sec2['id']}")
+        await m.on_callback(ev)
+        vids = [x[1].id for x in bot.msg_sends if x[0] == USER]
+        foots = [btn_datas(x[2].get("buttons")) for x in bot.msg_sends
+                 if x[0] == USER and x[2].get("buttons")]
+        foots += [btn_datas(x[2].get("buttons")) for x in bot.text_sends
+                  if x[0] == USER and x[2].get("buttons")]
+        check(vids == [601, 701],
+              "tapping the list item sends both videos in order")
+        check(any("s:setup" in d for d in foots) and any("hub:list" in d for d in foots),
+              "section carries its setup button + back to the list")
+
+        # سوئیچِ خاموش‌کردنِ پیش‌فرض‌ها هنوز کار می‌کند (تنها راهِ حذف)
+        await cb("a:hub_def")
+        check(m.hub_defaults_on() is False and not m.hub_default_items(),
+              "📦 توضیحات پیش‌فرض switch is the only way to drop them")
+        datas3 = btn_datas(m.hub_view(0)[1])
+        check(not [d for d in datas3 if d.startswith("hub:d:")],
+              "defaults hidden while the switch is off")
+        await cb("a:hub_def")
+        check(m.hub_defaults_on() is True, "switch turns them back on")
+
         time.time = real_time
 
     asyncio.run(main())
