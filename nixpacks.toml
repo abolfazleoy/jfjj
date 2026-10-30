@@ -1,0 +1,6 @@
+# Nixpacks detects Python from requirements.txt, but cannot infer the app's
+# entrypoint because this service is a long-running Telegram bot rather than a
+# conventional web module. Use the same host-aware launcher as a Python build
+# on Hostless so it also binds the health server to $PORT and supervises exits.
+[start]
+cmd = "sh hostless-start.sh"

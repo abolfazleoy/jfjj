@@ -61,7 +61,9 @@ Hostless هم Dockerfile می‌سازد و هم بیلدِ پایتونیِ خ�
 
 اگر به‌جای Docker، بیلدِ پایتونی را انتخاب کردی، start command را
 `sh hostless-start.sh` بگذار (همین فایل از ریشه‌ی ریپو، کد را از همان‌جا و داده
-را از `/data` یا اولین مسیرِ قابل‌نوشتن اجرا می‌کند).
+را از `/data` یا اولین مسیرِ قابل‌نوشتن اجرا می‌کند). فایل `nixpacks.toml` این
+فرمان را برای بیلدهای Nixpacks تنظیم می‌کند تا خطای «No start command could be
+found» رخ ندهد.
 
 **اگر Hostless گفت «The process stopped soon after it started — Exit code 0»:**
 
