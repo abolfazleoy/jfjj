@@ -1852,8 +1852,96 @@ def write_last_exit(code, uptime=0, note=""):
         return False
 
 
+def _cgroup_memory_available_mb(cgroup_root="/sys/fs/cgroup",
+                                proc_cgroup="/proc/self/cgroup"):
+    """حافظه‌ی باقی‌مانده تا سقفِ cgroup، در صورتِ وجود.
+
+    /proc/meminfo در کانتینرها معمولاً حافظه‌ی کلِ میزبان را نشان می‌دهد؛
+    در نتیجه محافظِ بک‌آپ ممکن است خیال کند چند گیگابایت آزاد است، درحالی‌که
+    خودِ کانتینر مثلاً فقط ۲۵۶ مگابایت دارد. هر دو قالبِ cgroup v1 و v2 را
+    می‌خوانیم و مقدارِ «نامحدود» را نادیده می‌گیریم.
+    """
+    candidates = [cgroup_root]
+    try:
+        with open(proc_cgroup, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                _hierarchy, controllers, group_path = parts
+                group_path = group_path.lstrip("/")
+                if not group_path:
+                    continue
+                if not controllers:  # cgroup v2
+                    candidates.append(os.path.join(cgroup_root, group_path))
+                elif "memory" in controllers.split(","):  # cgroup v1
+                    candidates.append(os.path.join(cgroup_root, "memory", group_path))
+                    candidates.append(os.path.join(cgroup_root, group_path))
+    except Exception:
+        pass
+
+    seen = set()
+    headroom = []
+    for directory in candidates:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        for usage_name, limit_name in (
+                ("memory.current", "memory.max"),
+                ("memory.usage_in_bytes", "memory.limit_in_bytes")):
+            try:
+                with open(os.path.join(directory, limit_name), encoding="ascii") as f:
+                    raw_limit = f.read().strip()
+                if not raw_limit or raw_limit.lower() == "max":
+                    continue
+                limit = int(raw_limit)
+                # cgroup v1 uses a very large sentinel for an unlimited limit.
+                if limit <= 0 or limit >= (1 << 60):
+                    continue
+                with open(os.path.join(directory, usage_name), encoding="ascii") as f:
+                    usage = int(f.read().strip())
+                headroom.append(max(0, limit - max(0, usage)))
+            except Exception:
+                continue
+    # محدودیتِ گروه‌های والد هم برای پروسه معتبر است؛ کمترین فضای باقی‌مانده
+    # همان سقفِ مؤثر است، حتی اگر سطحِ والد فضای بیشتری گزارش کند.
+    return min(headroom) // (1024 * 1024) if headroom else None
+
+
+def _extract_zip_member_streaming(zf, arc, dest, chunk_size=64 * 1024):
+    """یک عضو ZIP را تکه‌تکه و اتمیک استخراج کن، بدون zf.read() در RAM.
+
+    فایل‌های دیتابیس/سشن ممکن است از RAM پلن رایگان بزرگ‌تر باشند. zf.read()
+    کلِ عضوِ فشرده‌نشده را یکجا می‌سازد و می‌تواند کانتینر را با کد ۱۳۷ بکشد.
+    """
+    directory = os.path.dirname(dest)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = dest + ".restore_tmp"
+    try:
+        with zf.open(arc, "r") as src, open(tmp, "wb") as out:
+            shutil.copyfileobj(src, out, length=max(4096, int(chunk_size or 0)))
+        size = os.path.getsize(tmp)
+        os.replace(tmp, dest)
+        try:
+            os.chmod(dest, 0o600)
+        except Exception:
+            pass
+        return size
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def mem_available_mb():
-    """حافظه‌ی آزاد (MB) یا None اگر معلوم نبود."""
+    """حافظه‌ی آزادِ واقعیِ پروسه (MB) یا None اگر معلوم نبود."""
+    limited = _cgroup_memory_available_mb()
+    if limited is not None:
+        return limited
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
@@ -1861,12 +1949,9 @@ def mem_available_mb():
                     return int(line.split()[1]) // 1024
     except Exception:
         pass
-    try:
-        import resource
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return max(0, int(rss) // 1024)
-    except Exception:
-        return None
+    # ru_maxrss حافظه‌ی مصرف‌شده را می‌دهد، نه حافظه‌ی آزاد؛ برای تصمیمِ OOM
+    # استفاده از آن اشتباه است، پس اگر meminfo/cgroup نبود عددِ جعلی نمی‌دهیم.
+    return None
 
 # سلف فقط 95.py است - 77/78 پاک میشوند
 SELF_NAMES = ("95.py",)
@@ -13045,8 +13130,13 @@ class Manager:
                 return h.hexdigest()[:16]
             except Exception:
                 try:
+                    # Fallback هم فایل را chunk به chunk می‌خواند؛ f.read()
+                    # کاملِ دیتابیس را در RAM نگه می‌داشت و در حافظه‌ی کم خطرناک بود.
+                    h = hashlib.md5()
                     with open(path, "rb") as f:
-                        return hashlib.md5(f.read()).hexdigest()[:16]
+                        for chunk in iter(lambda: f.read(64 * 1024), b""):
+                            h.update(chunk)
+                    return h.hexdigest()[:16]
                 except Exception:
                     return None
             finally:
@@ -14308,20 +14398,9 @@ class Manager:
                                     else:
                                         continue
                                     try:
-                                        data = z.read(arc)
+                                        _extract_zip_member_streaming(z, arc, dest)
                                     except Exception:
                                         continue
-                                    ddir = os.path.dirname(dest)
-                                    if ddir and not os.path.isdir(ddir):
-                                        os.makedirs(ddir, exist_ok=True)
-                                    tmp = dest + ".restore_tmp"
-                                    with open(tmp, "wb") as f:
-                                        f.write(data)
-                                    os.replace(tmp, dest)
-                                    try:
-                                        os.chmod(dest, 0o600)
-                                    except Exception:
-                                        pass
                         except Exception as e:
                             try:
                                 self.db = DB()
@@ -14533,26 +14612,12 @@ class Manager:
                                 print(f"  ⚠️ فایل ناشناخته در پشتیبان: {arc} — رد شد", flush=True)
                                 continue
                         try:
-                            data = z.read(arc)
+                            # جریانِ ZIP را مستقیم به دیسک می‌ریزیم؛ z.read عضوِ
+                            # کامل را در RAM می‌ساخت و روی پلن‌های 256MB باعث OOM می‌شد.
+                            size = _extract_zip_member_streaming(z, arc, dest)
+                            print(f"  ♻️ بازیابی {arc_norm} ({size} بایت)", flush=True)
                         except Exception as e:
-                            print(f"  ⚠️ خواندن {arc} از پشتیبان: {e}", flush=True)
-                            continue
-                        try:
-                            # پوشه مقصد را بساز (برای clients/123/...)
-                            ddir = os.path.dirname(dest)
-                            if ddir and not os.path.isdir(ddir):
-                                os.makedirs(ddir, exist_ok=True)
-                            tmp = dest + ".restore_tmp"
-                            with open(tmp, "wb") as f:
-                                f.write(data)
-                            os.replace(tmp, dest)
-                            try:
-                                os.chmod(dest, 0o600)
-                            except Exception:
-                                pass
-                            print(f"  ♻️ بازیابی {arc_norm} ({len(data)} بایت)", flush=True)
-                        except Exception as e:
-                            print(f"  ⚠️ نوشتن {bn}: {e}", flush=True)
+                            print(f"  ⚠️ استخراج/نوشتن {bn}: {e}", flush=True)
             except Exception as e:
                 try:
                     self.db = DB()
