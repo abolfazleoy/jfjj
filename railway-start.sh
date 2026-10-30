@@ -196,6 +196,21 @@ crashes=0
 MAX_CRASHES="${JAFJ_MAX_CRASHES:-5}"      # پشت‌سرهم → تحویل به Railway
 NAP_BASE="${JAFJ_NAP_BASE:-5}"            # ثانیه، هر کرش ۵ تا بیشتر
 CRASH_WINDOW="${JAFJ_CRASH_WINDOW:-20}"   # کمتر از این = کرش سریع
+
+# ── keep-alive: «خروجِ تمیز» هم نباید سرویس را بخواباند ────────────────────
+# روی میزبان، مردنِ پروسه = سرویسِ مرده. اگر مدیر با کد ۰ تمام شود (مثلاً
+# اتصالِ تلگرام قطع شود و نسخه‌ی قدیمیِ کد مستقیم return 0 کند)، میزبان پیامِ
+# گمراه‌کننده‌ی «The process stopped soon after it started · Exit code 0»
+# را نشان می‌دهد و ربات خاموش می‌مانَد. پس روی میزبان (JAFJ_HOSTED=1 که در
+# Dockerfile ست شده) خروجِ ۰ هم مثل کرش شمرده و ری‌استارت می‌شود.
+# روی اجرای دستی می‌شود با JAFJ_KEEP_ALIVE=0 به رفتارِ قبلی برگشت.
+KEEP_ALIVE="${JAFJ_KEEP_ALIVE:-}"
+if [ -z "$KEEP_ALIVE" ]; then
+    case "$(printf '%s' "${JAFJ_HOSTED:-0}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) KEEP_ALIVE=1 ;;
+        *)             KEEP_ALIVE=0 ;;
+    esac
+fi
 while :; do
     cd "$DATA_DIR" 2>/dev/null || true
     "$PY" "$MANAGER" &
@@ -217,9 +232,16 @@ while :; do
         exit "$code"
     fi
     if [ "$code" = 0 ]; then
-        log "manager exited cleanly"
-        stop_sync
-        exit 0
+        if [ "$KEEP_ALIVE" != "1" ]; then
+            log "manager exited cleanly"
+            stop_sync
+            exit 0
+        fi
+        # روی میزبان: خروجِ ۰ هم یعنی سرویس مرده. متغیر را برای مسیرِ کرش
+        # نگه می‌داریم تا لاگ بگوید «۰ بود، به‌عنوان کرش شمرده شد».
+        clean_code=0
+        log "manager exited with code 0 — a bot service must keep running, so this counts as a crash (JAFJ_KEEP_ALIVE=0 to allow a clean stop)"
+        code=75
     fi
 
     # ── خروجِ غیرصفر = کرش ────────────────────────────────────────────
@@ -229,17 +251,22 @@ while :; do
     #    تلاش می‌کند، ولی اگر OOM/SIGKILL بوده هیچ کدی اجرا نمی‌شود و این
     #    تنها شانسِ نجاتِ داده است.
     ran=$(( $(date +%s) - started ))
+    # کدِ واقعیِ مدیر را ثبت کن؛ اگر خروجِ ۰ «کرش» شمرده شد، همان ۰ ثبت شود
+    # تا /diag و پیامِ «بالا آمد» چیزِ گمراه‌کننده‌ای (۷۵) نشان ندهند.
+    noted_code="$code"
+    if [ -n "${clean_code:-}" ]; then noted_code="$clean_code"; fi
     {
         printf '{"code": %s, "uptime": %s, "ts": %s, "note": "supervisor", "build": "shell"}\n' \
-            "$code" "$ran" "$(date +%s)" > "$DATA_DIR/.jafj_last_exit.tmp" 2>/dev/null \
+            "$noted_code" "$ran" "$(date +%s)" > "$DATA_DIR/.jafj_last_exit.tmp" 2>/dev/null \
             && mv "$DATA_DIR/.jafj_last_exit.tmp" "$DATA_DIR/.jafj_last_exit" 2>/dev/null
     } || true
     {
         printf '\n===== %s [supervisor] exit=%s after %ss =====\n' \
-            "$(date '+%Y-%m-%d %H:%M:%S')" "$code" "$ran" \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$noted_code" "$ran" \
             >> "$DATA_DIR/crash.log"
     } 2>/dev/null || true
 
+    clean_code=
     if [ -n "${DATA_GITHUB_TOKEN:-}" ] && [ -f "$SYNC" ]; then
         log "کرش — ذخیره‌ی نجاتِ داده در گیت‌هاب…"
         # ناظرِ سینک را متوقف کن تا با push تداخل نکند (قفل فایل ندارد).

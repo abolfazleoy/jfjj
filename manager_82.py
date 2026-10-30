@@ -51,10 +51,40 @@ import traceback
 import zipfile
 
 # --- فیکس آف شدن بعد 30 دقیقه بدون فعالیت (Railway) - وب سرور سالم ---
+def _health_port():
+    """پورتی که وب‌سرور سلامت باید رویش گوش بدهد.
+
+    چرا این‌قدر وسواسی: هر میزبانِ کانتینری (Hostless/Render/Railway/blitz)
+    می‌گوید «روی $PORT گوش بده وگرنه سرویس را سالم نمی‌شناسم». اگر PORT
+    ناخوانا باشد و int() خطا بدهد، وب‌سرور بالا نمی‌آید، هیچ پورتی باز
+    نمی‌شود و میزبان پروسه را می‌کُشد — که دقیقاً شبیه «پروسه خیلی زود
+    تمام شد» دیده می‌شود. پس هر شکلِ رایج را می‌خوانیم و آخرین راه 8080 است.
+    """
+    raw = (os.environ.get("PORT") or "").strip()
+    for cand in (raw, raw.rsplit(":", 1)[-1] if ":" in raw else ""):
+        try:
+            p = int(str(cand).strip().strip("/").split("/")[0] or "8080")
+            if 1 <= p <= 65535:
+                return p
+        except Exception:
+            continue
+    try:
+        m = re.search(r"(\d{2,5})", raw)
+        if m:
+            p = int(m.group(1))
+            if 1 <= p <= 65535:
+                return p
+    except Exception:
+        pass
+    if raw:
+        print(f"  ⚠️ PORT={raw!r} قابلِ خواندن نبود — 8080 استفاده می‌شود", flush=True)
+    return 8080
+
+
 def _start_health_server():
     try:
         import http.server, socketserver
-        port = int(os.environ.get("PORT", "8080"))
+        port = _health_port()
         class Handler(http.server.BaseHTTPRequestHandler):
             def setup(self):
                 super().setup()
@@ -111,11 +141,26 @@ def _start_health_server():
             allow_reuse_address = True
             daemon_threads = True
             request_queue_size = 64
-        with ReusableTCPServer(("0.0.0.0", port), Handler) as httpd:
-            print(f"  🌐 Health server on 0.0.0.0:{port} - برای جلوگیری از Sleep رایگان")
-            httpd.serve_forever()
+        # حلقه: اگر bind شکست بخورد یا سرویس بعداً بمیرد، دوباره بالا بیاید.
+        # قبلاً یک شکستِ موقت (پورت هنوز آزاد نشده) برای همیشه وب‌سرور را
+        # خاموش می‌کرد؛ آن‌وقت میزبان «پورت باز نیست» می‌دید و کانتینر را
+        # می‌کشت — همان «پروسه خیلی زود تمام شد».
+        _tries = 0
+        while True:
+            _tries += 1
+            try:
+                with ReusableTCPServer(("0.0.0.0", port), Handler) as httpd:
+                    print(f"  🌐 LISTENING on 0.0.0.0:{port} — health: / و /healthz "
+                          f"(نسخه: /version)", flush=True)
+                    httpd.serve_forever()
+                return          # shutdown خواسته شده
+            except Exception as e:
+                if _tries <= 3 or _tries % 30 == 0:
+                    print(f"  ⚠️ health server failed (try {_tries}, port {port}): "
+                          f"{type(e).__name__}: {e}", flush=True)
+                time.sleep(2)
     except Exception as e:
-        print(f"health server failed: {e}")
+        print(f"health server failed: {e}", flush=True)
 
 threading.Thread(target=_start_health_server, daemon=True).start()
 # --- پایان فیکس ---
@@ -2301,6 +2346,7 @@ def host_label():
     if manual:
         return re.sub(r"\s+", "-", manual)[:24]
     for key in ("BLITZ_APP_NAME", "BLITZ_APP_ID",
+                "HOSTLESS_APP_NAME", "HOSTLESS_APP_ID", "HOSTLESS_PROJECT",
                 "RAILWAY_SERVICE_NAME", "RAILWAY_SERVICE_ID",
                 "FLY_APP_NAME", "KOYEB_APP_NAME", "HEROKU_APP_NAME",
                 "RENDER_SERVICE_NAME"):
@@ -2446,6 +2492,7 @@ def build_stamp():
 HOSTED_ENV_KEYS = ("RAILWAY_ENVIRONMENT", "RAILWAY_SERVICE_ID", "RAILWAY_PROJECT_ID",
                    "RENDER", "RENDER_SERVICE_NAME", "RENDER_SERVICE_ID",
                    "BLITZ", "BLITZ_APP_NAME", "BLITZ_APP_ID",
+                   "HOSTLESS", "HOSTLESS_APP_NAME", "HOSTLESS_APP_ID",
                    "FLY_APP_NAME", "HEROKU_APP_NAME", "KOYEB_APP_NAME")
 
 
@@ -2477,6 +2524,27 @@ def login_retry_wait(round_no, base=20, cap=300):
     except Exception:
         n = 1
     return max(5, min(base * n, cap))
+
+
+def reconnect_limit():
+    """چند بار بعد از قطع‌شدنِ اتصال، در همین پروسه دوباره وصل شویم؟ (۰ = بی‌نهایت)
+
+    چرا محدود: اتصالِ دوباره با «همان نمونهٔ کلاینت» انجام می‌شود تا هندلرها
+    گم نشوند. اگر نشست واقعاً مرده باشد (توکن عوض شده، AuthKey باطل) این
+    تلاش‌ها هیچ‌وقت جواب نمی‌دهند؛ آن‌وقت بهتر است پروسه با کدِ غیرصفر خارج
+    شود تا ناظر (railway-start.sh) آن را از صفر و با هندلرهای تازه بالا
+    بیاورد — و اگر تکرار شد، میزبان خطا را ببیند، نه «Exit code 0».
+    مقدارِ صریح با JAFJ_RECONNECT_TRIES قابل تغییر است (inf = بی‌نهایت).
+    """
+    raw = (os.environ.get("JAFJ_RECONNECT_TRIES") or "").strip().lower()
+    if raw in ("inf", "forever", "always", "unlimited", "-1"):
+        return 0
+    try:
+        if raw:
+            return max(0, int(raw))
+    except Exception:
+        pass
+    return 3
 
 
 # خطاهایی که یعنی «توکن مرده/باطل‌شده» است، نه مشکل شبکه. در این حالت به‌جای
@@ -15789,8 +15857,104 @@ class Manager:
         if not c["admin_ids"]:
             print("  ⏳ منتظر اولین /start …\n", flush=True)
 
-        await self.bot.run_until_disconnected()
-        return 0
+        return await self.serve_forever()
+
+    async def serve_forever(self):
+        """ربات را تا وقتی میزبان/مدیر نگفته «خاموش شو» زنده نگه می‌دارد.
+
+        باگی که روی میزبان‌ها (Hostless، Render، Railway، blitz) به‌شکل
+        «The process stopped soon after it started — Exit code 0» دیده
+        می‌شد: `run_until_disconnected()` تمام می‌شد، `run()` مقدار ۰
+        برمی‌گرداند و پروسه با کد ۰ می‌مرد. میزبان هم (به‌حق) می‌گفت
+        «سرویس باید بالا بماند ولی پروسه تمام شد».
+
+        چرا اتصال قطع می‌شود (و هیچ‌کدام دلیلِ مردنِ ربات نیست):
+
+          * نمونه‌ی دوم با همان توکن روشن شده → تلگرام نشستِ یکی را
+            می‌بندد (بیشتر وقت‌ها یک سرویسِ قدیمیِ جا‌مانده)؛
+          * پرشِ شبکه یا ری‌استارتِ سرورهای تلگرام؛
+          * خطای موقت (FloodWait/Timeout).
+
+        پس اینجا، مثل یک رباتِ همیشه-روشن، دوباره وصل می‌شویم؛ فقط
+        درخواستِ خاموشی (SIGTERM/دیپلوی) پروسه را با موفقیت می‌بندد.
+        """
+        tries = 0
+        # وقتی اتصال «به‌اندازه‌ی کافی پایدار» ماند تازه شمارنده صفر می‌شود؛
+        # وگرنه اتصالی که هر چند ثانیه قطع می‌شود (نمونه‌ی دوم با همان
+        # توکن) تا ابد «موفق» حساب می‌شد و هیچ‌وقت به سقفِ تلاش نمی‌رسید.
+        stable_since = 0.0
+        try:
+            stable_seconds = max(15, int(os.environ.get("JAFJ_STABLE_SECONDS") or 60))
+        except Exception:
+            stable_seconds = 60
+        while True:
+            reason = "اتصال قطع شد"
+            try:
+                await self.bot.run_until_disconnected()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+
+            if getattr(self, "_stopping", False):
+                print("  ✅ خاموشیِ درخواستی — خروجِ تمیز", flush=True)
+                return 0
+
+            if stable_since and (time.time() - stable_since) >= stable_seconds:
+                tries = 0            # اتصال واقعاً پایدار بود
+            stable_since = 0.0
+            tries += 1
+            limit = reconnect_limit()
+            lim = "" if limit <= 0 else f"/{limit}"
+            print(f"  ⚠️ ربات قطع شد ({reason}) — پروسه زنده می‌ماند؛ "
+                  f"تلاشِ {tries}{lim} برای اتصالِ دوباره", flush=True)
+            if limit > 0 and tries > limit:
+                print("  ⛔ اتصالِ دوباره ممکن نشد. علتِ رایج: نمونه‌ی دیگری "
+                      "با همین توکن روشن است (سرویسِ قدیمی را خاموش کن) یا "
+                      "توکن باطل شده. — پروسه با کد ۱ خارج می‌شود تا میزبان "
+                      "متوجهِ خطا شود.", flush=True)
+                try:
+                    log_crash("reconnect", f"{reason}\n{limit} tries failed")
+                except Exception:
+                    pass
+                return 1
+            wait = login_retry_wait(tries, base=5, cap=60)
+            try:
+                await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                raise
+            if getattr(self, "_stopping", False):
+                return 0
+            try:
+                # مهم: همین نمونهٔ کلاینت را دوباره وصل می‌کنیم، نه یک
+                # TelegramClient تازه. هندلرهای /start و دکمه‌ها به همین
+                # آبجکت بسته شده‌اند؛ اگر کلاینت عوض شود، ربات «بالا» می‌آید
+                # ولی به هیچ پیامی جواب نمی‌دهد. اگر نشست واقعاً مرده باشد،
+                # تلاش‌ها شکست می‌خورند و پروسه با کدِ غیرصفر خارج می‌شود تا
+                # ناظر آن را از صفر (با هندلرهای تازه) بالا بیاورد.
+                if not self.bot.is_connected():
+                    await self.bot.connect()
+                try:
+                    authorized = await self.bot.is_user_authorized()
+                except Exception:
+                    authorized = True
+                if not authorized:
+                    await self.bot.start(bot_token=self.cfg.get("bot_token") or None)
+                stable_since = time.time()
+                print("  🔄 اتصال دوباره برقرار شد (همان نمونه — هندلرها حفظ شدند)",
+                      flush=True)
+                for a in (self.cfg.get("admin_ids") or []):
+                    try:
+                        await self.say(
+                            a, "🔄 <b>اتصال ربات دوباره برقرار شد</b>\n"
+                               f"<i>علتِ قطع: {reason}</i>")
+                    except Exception:
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"  ⚠️ اتصالِ دوباره برقرار نشد: {type(e).__name__}: {e}",
+                      flush=True)
 
 
 def main():
@@ -15899,4 +16063,11 @@ def _boot_guard():
 
 if __name__ == "__main__":
     _boot_guard()
-    sys.exit(main())
+    _rc = main()
+    # روی میزبان، دیدنِ این خط یعنی سرویس مرده است. دلیلش چند خط بالاتر
+    # نوشته شده؛ بدونِ این خط، لاگ با یک «Exit code 0» بی‌توضیح تمام می‌شد
+    # و معلوم نبود پروسه چرا پایین آمد.
+    print(f"  ⏹ خروجِ پروسه با کد {_rc}"
+          + (" (خاموشیِ درخواستی)" if _rc == 0 else " — دلیلش چند خط بالاتر است"),
+          flush=True)
+    sys.exit(_rc)
