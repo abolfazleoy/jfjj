@@ -1,0 +1,58 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Keep-alive / مانیتورِ ساده برای میزبانِ «خواب‌دار» (پلن رایگانِ Render،
+#  blitz.cloud، Hostless و هر میزبانی که با بی‌بازدید می‌خوابد).
+#
+#  هر ۱۰ دقیقه یک GET به /healthz می‌زند تا نمونه بیدار بماند و ربات قطع نشود.
+#  اگر سرویس واقعاً خوابیده باشد، اولین درخواست ممکن است با cold start
+#  (تا ~۶۰ ثانیه) جواب ندهد؛ برای همین سه بار تلاش می‌شود.
+#
+#  لازمه‌اش فقط یک چیز است:
+#     Settings → Secrets and variables → Actions → New secret
+#       نام:  HEALTH_URL
+#       مقدار: https://YOUR-SERVICE.onrender.com/healthz
+#
+#  این ریپو public است ⇒ دقیقه‌های Actions رایگان‌اند. اگر روزی private شد،
+#  همین کار را با cron-job.org (رایگان، هر ۱ دقیقه، بدون کارت) انجام بده و
+#  این فایل را خاموش نگه دار. جزئیات: FREE_HOSTING_FA.md
+# ─────────────────────────────────────────────────────────────────────────────
+name: keepalive
+
+on:
+  schedule:
+    # کمترین فاصله‌ای که GitHub قبول می‌کند **۵** دقیقه است؛ ۱۰ دقیقه امن‌تر
+    # است چون اجرای زمان‌بندی‌شده معمولاً چند دقیقه تأخیر دارد.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /healthz
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          url="${HEALTH_URL:-}"
+          if [ -z "$url" ]; then
+            echo "::warning::secret HEALTH_URL تنظیم نشده — کاری انجام نشد."
+            echo "Settings → Secrets and variables → Actions → New secret"
+            exit 0
+          fi
+          # «بیدارباش» واقعاً می‌خواهیم: اگر جواب نیامد، خطا نکنیم که
+          # اعلانِ قرمز برای هر قطعیِ میزبان نفرستد؛ فقط لاگ بگذاریم.
+          for i in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -m 60 "$url" || echo 000)
+            echo "attempt $i → HTTP $code"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::سرویس جواب نداد — Render → Events/Logs را ببین."
