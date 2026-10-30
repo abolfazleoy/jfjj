@@ -83,6 +83,7 @@
 | پنل و سیستم آموزش | `menu_tutorials`، `tutorial`، `tutorial_presets`، `tutorial_sections`، `tutorial_hub` | عمیق |
 | تنظیمات/env/تایمرها | `config_env`، `round2_update`، `timers` | عمیق |
 | بوت استقرار (Render/Railway) | `render_host`، `railway_container_layout`، `railway_selfbot_bootstrap`، `crashloop_hardening`، `duplicate_instances`، `shutdown_cancel` | عمیق (با ابزارهای shim) |
+| هاستِ رایگان (Render Free + keepalive) | `free_hosting` | فایل‌محور: `render-free.yaml` (plan free، بدون disk، sync اجباری)، workflowِ بیدارنگه‌دار، و راهنمای `FREE_HOSTING_FA.md` |
 
 ---
 

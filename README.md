@@ -2,6 +2,24 @@
 
 ربات مدیر (`manager_82.py`) + سلف مشتری‌ها (`95.py`).
 
+## 🆓 سرور نداری / سرویس آفلاین شده؟ → `FREE_HOSTING_FA.md`
+
+اگر پلنِ رایگانت خوابید یا بسته شد، **مشکل کد نیست**. راهنمای کاملِ «رایگان و
+بدون کارت بانکی» اینجاست: **[`FREE_HOSTING_FA.md`](FREE_HOSTING_FA.md)**
+
+خلاصه:
+
+1. **Render Free** (Docker، ۵۱۲MB، بدون کارت) — ۵ فیلد در `FREE_HOSTING_FA.md` §۳.
+   تنظیماتِ آمادهٔ پلنِ رایگان هم در `render-free.yaml` هست (پلنِ Free دیسک ندارد،
+   پس `DATA_GITHUB_TOKEN` اجباری است).
+2. **بیدارنگه‌دار**: `.github/workflows/keepalive.yml` هر ۱۰ دقیقه
+   `/healthz` را می‌زند تا نمونه نخوابد — فقط Secretِ `HEALTH_URL` را بگذار
+   (§۴). جایگزین: cron-job.org هر ۵ دقیقه.
+3. **داده**: روی رایگان، دیسک نیست؛ با `DATA_GITHUB_TOKEN` +
+   `DATA_GITHUB_INTERVAL_MIN=5` قبل از بوت برمی‌گردد و پشتیبانِ تلگرامی هر ۱۲۰
+   ثانیه است.
+4. اگر «همیشه روشنِ رایگانِ واقعی» می‌خواهی: **Oracle Cloud Always Free** (§۷).
+
 ## اجرا روی blitz.cloud
 
 میزبانِ فعلی **blitz.cloud** است؛ Render/Railway فقط جایگزین‌اند.

@@ -1,0 +1,56 @@
+# Render **Free plan** Blueprint — نسخه‌ی «بدون سرور و بدون پول».
+#
+# تفاوتش با render.yaml فقط دو چیز است:
+#   ۱) plan: free  (پلنِ رایگانِ Render — بدون کارت بانکی)
+#   ۲) دیسک ندارد — پلنِ رایگانِ Render اصلاً Disk نمی‌دهد. پس داده‌ی مشتری‌ها
+#      فقط روی گیت‌هاب می‌ماند: DATA_GITHUB_TOKEN الزامی است، نه اختیاری.
+#      (بدونِ آن هر خواب/دیپلوی = manager.db و سشن‌ها پاک.)
+#
+# کد همیشه از داخلِ ایمیج اجرا می‌شود (/opt/jafj) و داده در /data کانتینر
+# است؛ چیزی روی مسیرِ کد مانت نمی‌شود.
+#
+# طریقه‌ی استفاده (یکی را انتخاب کن):
+#   الف) سریع‌ترین راه: همین فایل را کپی نکن — در Render دستی یک **Web
+#        Service → Docker** بساز (README / FREE_HOSTING_FA.md، ۵ فیلد).
+#   ب) Blueprint: این فایل را به render.yaml تغییرِ نام بده (یا محتوایش را
+#        جای render.yaml بگذار) و بعد در Render: New → Blueprint.
+services:
+  - type: web
+    name: jafj-free
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: sh /opt/jafj/render-start.sh
+    healthCheckPath: /healthz
+    branch: main
+    autoDeploy: true
+    region: frankfurt
+    plan: free
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: JAFJ_IMAGE_DIR
+        value: /opt/jafj
+      - key: JAFJ_APP_DIR
+        value: /data
+      # پلنِ رایگان بعد از ۱۵ دقیقه بی‌بازدید می‌خوابد ⇒ پشتیبانِ کوتاه‌تر
+      # (هر ۱۲۰ ثانیه) تا با خواب/ری‌استارت حداکثر دو دقیقه داده بپرد.
+      - key: JAFJ_APP_SLEEPS
+        value: "1"
+      - key: BACKUP_EVERY
+        value: "120"
+      # سینکِ گیت‌هاب هم کوتاه باشد: با خوابِ ناگهانی حداکثر ۵ دقیقه عقب باشیم.
+      - key: DATA_GITHUB_INTERVAL_MIN
+        value: "5"
+      - key: PORT
+        value: 10000
+      - key: JAFJ_MAX_CRASHES
+        value: 5
+      - key: BOT_TOKEN
+        sync: false
+      - key: BACKUP_CHAT
+        sync: false
+      # ⚠️ روی پلنِ رایگان این دو اجباری‌اند (دیسک وجود ندارد).
+      - key: DATA_GITHUB_TOKEN
+        sync: false
+      - key: DATA_GITHUB_REPO
+        value: djskkskw/jfjj-data
