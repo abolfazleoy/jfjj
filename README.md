@@ -101,9 +101,12 @@ Codespaces آماده است: پوشهٔ `.devcontainer/` دارد، پس codesp
 1. [github.com/codespaces](https://github.com/codespaces) → **New codespace** →
    همین ریپو → شاخهٔ `main` → **Create codespace**. (یا از خطِ فرمان:)
    ```sh
-   gh codespace create -R abolfazleoy/jfjj -b main -m standardLinux \
-       --display-name jafj --idle-timeout 4h
+   sh codespaces-up.sh
    ```
+   این اسکریپت codespace را می‌سازد/روشن می‌کند، پورت را public می‌کند و
+   آدرسِ آنلاین را چاپ می‌کند (اگر خواستی دستی‌تر: `gh codespace create -R
+   abolfazleoy/jfjj -b main -m standardLinux --display-name jafj
+   --idle-timeout 4h`).
    در صفحهٔ «Create with options…» می‌توانی توکن‌ها را همان‌جا وارد کنی
    (پوشهٔ `.devcontainer/devcontainer.json` آن‌ها را اعلام کرده: `BOT_TOKEN`،
    `API_ID`، `API_HASH`، `DATA_GITHUB_TOKEN`، `BACKUP_CHAT`).
