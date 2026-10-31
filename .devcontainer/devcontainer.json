@@ -1,0 +1,70 @@
+{
+  "name": "JAFJ — Telegram manager (GitHub Codespaces)",
+
+  "image": "mcr.microsoft.com/devcontainers/python:3.11-bookworm",
+
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "secrets": {
+    "BOT_TOKEN": {
+      "description": "توکن ربات مدیر از @BotFather (اگر خالی بماند، توکنِ داخلِ کد استفاده می‌شود)"
+    },
+    "API_ID": {
+      "description": "api_id از my.telegram.org — برای سلفِ مشتری‌ها لازم است"
+    },
+    "API_HASH": {
+      "description": "api_hash از my.telegram.org — برای سلفِ مشتری‌ها لازم است"
+    },
+    "DATA_GITHUB_TOKEN": {
+      "description": "توکن گیت‌هاب برای پشتیبان/بازیابیِ اطلاعات مشتری‌ها (پیشنهاد می‌شود)"
+    },
+    "BACKUP_CHAT": {
+      "description": "شناسه یا یوزرِ چتِ پشتیبان (اختیاری)"
+    }
+  },
+
+  "containerEnv": {
+    "PORT": "8080",
+    "JAFJ_HOSTED": "1",
+    "JAFJ_HOST_LABEL": "codespaces",
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+
+  "remoteEnv": {
+    "PORT": "8080",
+    "JAFJ_HOSTED": "1",
+    "JAFJ_HOST_LABEL": "codespaces"
+  },
+
+  "forwardPorts": [8080],
+
+  "portsAttributes": {
+    "8080": {
+      "label": "JAFJ health (/healthz)",
+      "onAutoForward": "notify",
+      "protocol": "http"
+    }
+  },
+
+  "postCreateCommand": "sh .devcontainer/setup.sh",
+
+  "postStartCommand": "sh codespaces-start.sh --daemon",
+
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "2gb",
+    "storage": "8gb"
+  },
+
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["README.md"]
+    },
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
+  }
+}
