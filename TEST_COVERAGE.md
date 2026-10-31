@@ -66,6 +66,7 @@
 | `test_join_leave_report.py` | بلوکِ «چک دوره‌ای نگهبانی»، بلوکِ «یادآوری عضو‌نشده» و بلوکِ «لفت‌های دستی» از سورس واقعی استخراج و با Engine/DB واقعی و telethon جعلی اجرا می‌شوند: عضو بودن → بی‌صدا، دو منفیِ تأییدشده → لفت + وضعیت `left` + پیام «👋 لفت انجام شد»، نفرِ نرسیده → دور «نیومدی» به‌جای لفتِ فوری، شکستِ لفت → وضعیت `joined` + عقب‌نشینی + پیام «⚠️ لفت انجام نشد»، لفتِ دستی → وضعیت/آمار/گزارش، `ex_live_leave_text` واقعاً برای دلیل‌های left/nojoin/manual و حالت خطا اجرا می‌شود، و دو محافظِ تازه: وضعیتِ تازه از DB قبل از لفت (ضد لفت/گزارش تکراری وقتی مسیر دیگری زودتر left کرده) و کانالِ تکراری (دو رکورد با یک `chat_id`) | ۴: وجود `ex_same_channel_left` + جدا بودن `ex_left` از `ex_leave_fail` + خواندنِ تازه‌ی وضعیت در هر دو مسیر + کوئریِ کانالِ تکراری |
 | `test_exchange_reply_timing.py` | `wait_for_allow` با جیتر GAP در [۳–۱۵]s؛ جیتر پیش‌فرض بررسی دسترسی [۸–۲۵]s | ۱: مهاجرت interval 20→30 + نام‌های رزروشدهٔ ExCooldown |
 | `test_claim_text.py` | `ex_render` واقعی روی موتور: متن ادعای ناموفق (بدون لینکِ طرف)، fallback «سفارشیِ ناموفق»، جریان ذخیره/نمایش/حذف متن سفارشی از config | ۱ |
+| `test_codespaces_host.py` | **بوتِ Codespaces:** اجرای واقعیِ `codespaces-start.sh --daemon` با یک مدیرِ قلابی که مثلِ مدیرِ واقعی وب‌سرورِ سلامت باز می‌کند → پاسخِ **۲۰۰** روی `$PORT`، متنِ «JAFJ OK»، نوشتنِ pidfile و لاگ، اجرای ناظرِ مشترک (`railway-start.sh`)، **قفلِ «نمونهٔ دوم»** (بار دوم چیزی نمی‌سازد) و خاموشیِ کنترل‌شده؛ `sh -n` روی هر سه اسکریپت | ۱۱: پیکربندیِ `devcontainer.json` (forwardPorts/portsAttributes/`PORT`/`secrets`/postStart) + قراردادِ اسکریپت‌ها (`JAFJ_HOSTED`، `JAFJ_SELFBOT_REF`، مسیرِ داده، `exec railway-start.sh`، نبودِ `/opt/jafj`) |
 
 ---
 
@@ -83,6 +84,7 @@
 | پنل و سیستم آموزش | `menu_tutorials`، `tutorial`، `tutorial_presets`، `tutorial_sections`، `tutorial_hub` | عمیق |
 | تنظیمات/env/تایمرها | `config_env`، `round2_update`، `timers` | عمیق |
 | بوت استقرار (Render/Railway) | `render_host`، `railway_container_layout`، `railway_selfbot_bootstrap`، `crashloop_hardening`، `duplicate_instances`، `shutdown_cancel` | عمیق (با ابزارهای shim) |
+| بوت استقرار (GitHub Codespaces) | `codespaces_host` | عمیق (اجرای واقعیِ اسکریپت + وب‌سرورِ سلامتِ واقعی روی `$PORT`) |
 
 ---
 
