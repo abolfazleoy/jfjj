@@ -150,6 +150,15 @@ def check_script():
     check("/opt/jafj" not in code_only,
           "به /opt/jafj (پوشهٔ ایمیجِ داکر) وابسته نیست — در codespaces کد، خودِ گیت‌چک‌اوت است")
 
+    up = REPO / "codespaces-up.sh"
+    if check(up.exists(), "codespaces-up.sh (ساخت/روشن‌کردنِ codespace) در ریپو هست"):
+        sh = subprocess.run(["sh", "-n", str(up)], capture_output=True, text=True)
+        check(sh.returncode == 0, "سینتکس sh سالم است (%s)" % sh.stderr.strip()[:80])
+        u = up.read_text(encoding="utf-8")
+        check("codespace create" in u, "codespace را می‌سازد")
+        check("ports visibility" in u and "public" in u, "پورتِ سلامت را public می‌کند")
+        check("app.github.dev" in u, "آدرسِ آنلاین را چاپ می‌کند")
+
 
 # ── ۳) اجرای واقعی: مدیرِ قلابی بالا می‌آید ────────────────────────────────
 def build_image_dir():
