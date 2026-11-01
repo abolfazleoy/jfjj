@@ -3612,7 +3612,20 @@ class _AdoptedProc:
 SESSION_FAIL_RE = re.compile(
     r"سشنِ این اکانت معتبر نیست|needs[_ ]relogin|از تلگرام خارج|"
     r"SESSION_REVOKED|AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|"
+    r"AuthKeyDuplicated|AuthKeyUnregistered|SessionRevoked|"
     r"Client is not authorized|not authorized", re.I)
+
+# «کلیدِ سشن سوخته» — دقیقاً همان چیزی که در پیامِ واقعیِ کاربر بود:
+# AuthKeyDuplicatedError: ... used under two different IP addresses
+# simultaneously, and can no longer be used.
+# قبلاً الگو فقط AUTH_KEY_DUPLICATED (با آندرلاین) را می‌شناخت و متنِ
+# Telethon نمی‌خواند → علت «شبکه» گزارش می‌شد و درمان (لاگینِ دوبارهٔ
+# اجباری) هرگز انجام نمی‌شد؛ یعنی اکانت تا ابد «بالا نمی‌آمد».
+KEY_BURNED_RE = re.compile(
+    r"AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|AuthKeyDuplicated|"
+    r"AuthKeyUnregistered|SessionRevoked|SESSION_REVOKED|"
+    r"two different IP addresses|can no longer be used|"
+    r"کلیدِ این سشن را تلگرام", re.I)
 NET_FAIL_RE = re.compile(
     r"اتصال برای بررسیِ سشن|اتصال قطع شد|اتصال دوباره|ConnectionError|"
     r"Cannot connect|Connection to Telegram failed|timed out|TimeoutError|"
@@ -3633,20 +3646,31 @@ def _h(text, limit=1600):
     return s2[-limit:] if limit and len(s2) > limit else s2
 
 
+# فقط نشانه‌های «نسخه‌ی محلیِ دوم». AUTH_KEY_DUPLICATED عمداً این‌جا نیست:
+# آن یعنی کلید را تلگرام سوزانده و درمانش لاگینِ دوباره است، نه «سشن سالم».
 DUP_FAIL_RE = re.compile(
-    r"نسخه‌ی دیگری از همین اکانت|AUTH_KEY_DUPLICATED|"
-    r"jafj\.run\.lock|duplicate(d)? (key|session)|"
+    r"نسخه‌ی دیگری از همین اکانت|jafj\.run\.lock|"
+    r"duplicate(d)? (key|session)|"
     r"two (?:clients|processes|instances)", re.I)
 
 
 def classify_selfbot_log(tail, rc=None):
     """علتِ توقفِ سلف از آخرین خطوطِ run.log → (نوع, توضیحِ فارسی)."""
     t = tail or ""
-    # «نسخه‌ی تکراری» اول چک می‌شود: پیامش («اتصال قطع شد») با شبکه و سشن
+    # «کلیدِ سوخته» اول از همه: متنش («اتصال قطع شد»، «وصل نمی‌شود») با شبکه
+    # قاطی می‌شود و درمانش هم دقیقاً برعکسِ شبکه است (سشنِ تازه، نه ری‌استارت).
+    if rc == 77 or KEY_BURNED_RE.search(t):
+        return "keydup", ("کلیدِ این سشن را تلگرام برای همیشه باطل کرده "
+                          "(یک سشن از دو IPِ مختلف) — با ری‌استارت درست "
+                          "نمی‌شود؛ لاگینِ تازه لازم است")
+    # «نسخه‌ی تکراری» بعد از آن: پیامش («اتصال قطع شد») با شبکه و سشن
     # قاطی می‌شود، ولی درمانش کاملاً متفاوت است.
     if rc == 76 or DUP_FAIL_RE.search(t):
         return "dup", ("نسخه‌ی دیگری از همین اکانت هم‌زمان در حال اجرا بود "
                        "(یک سشن، چند پروسه → تلگرام هر دو را قطع می‌کند)")
+    if rc == 79:
+        return "network", ("شبکه/MTProto از این میزبان باز نمی‌شود "
+                           "(هر تلاشِ اتصال شکست خورد)")
     if rc == 78 or SESSION_FAIL_RE.search(t):
         return "session", "سشنِ این اکانت باطل/خارج شده است"
     if DEPS_FAIL_RE.search(t):
@@ -3680,6 +3704,14 @@ def selfbot_failure_notice(nm, uid, kind, hint, tail=""):
     if kind == "dup":
         body += ("\n💡 دو نسخه هم‌زمان روی همین اکانت اجرا شده بود؛ "
                  "نسخه‌ی اضافه بسته شد و سشن سالم است.\n")
+    if kind == "keydup":
+        body += ("\n💡 تلگرام این سشن را **سوزانده** (AuthKeyDuplicated): "
+                 "یک سشن هم‌زمان از دو IPِ مختلف استفاده شده — معمولاً دو "
+                 "نسخه‌ی ربات، دو سرویس، یا ری‌استارتِ هم‌زمانِ دو کانتینر. "
+                 "این سشن دیگر هیچ‌وقت وصل نمی‌شود؛ یک‌بار از "
+                 "«🚀 راه‌اندازی سلف روی اکانتم» دوباره لاگین کن (کد می‌آید) "
+                 "و قبلش مطمئن شو سرویس/نسخه‌ی دیگری روی همین اکانت بالاست "
+                 "نیست.\n")
     body += "\n👉 «⚙️ سرویس من» → «📜 گزارش» همه‌ی لاگ را نشان می‌دهد."
     return body
 
@@ -4126,6 +4158,28 @@ class Supervisor:
             why = why or "سشن ندارد"
         return False, why
 
+    def _burned_session(self, uid, reason="کلیدِ سشن توسط تلگرام باطل شد"):
+        """سشنِ سوخته را یک‌سره کنار بگذار (فایل → .bad، رشته‌ی DB پاک).
+
+        چرا رشته‌ی DB هم پاک می‌شود: همین رشته منبعِ «بازسازیِ خودکارِ سشن»
+        است؛ اگر بمانَد، هر بوت/بازیابی دوباره همان کلیدِ مرده را می‌سازد و
+        حلقه‌ی «بالا نمی‌آید» تکرار می‌شود — با یک کدِ ورودِ اضافی روی
+        گوشیِ مشتری. کلیدِ سوخته ارزشِ نگه‌داشتن ندارد.
+        """
+        try:
+            self.mark_needs_login(uid, reason)      # فایل → jafj.session.bad
+        except Exception:
+            pass
+        try:
+            self.db.set(uid, session="")
+        except Exception:
+            pass
+        try:
+            self.db.log(uid, "session_burned", str(reason)[:300])
+        except Exception:
+            pass
+        return True
+
     def _session_ok_or_mark(self, uid):
         """(آماده؟, پیام) — قبل از هر start صدا زده می‌شود."""
         ok, why = self.verify_session(uid)
@@ -4226,7 +4280,14 @@ class Supervisor:
                 return
             self.procs.pop(uid, None)
             self._clear_pid(uid)
-            if kind == "session":
+            if kind == "keydup":
+                self.last_failure[uid] = "session"
+                self.last_detail[uid] = hint[:300]
+                try:
+                    self._burned_session(uid, hint)
+                except Exception:
+                    pass
+            elif kind == "session":
                 self.last_failure[uid] = "session"
                 self.last_detail[uid] = hint[:300]
                 try:
@@ -4446,6 +4507,20 @@ class Supervisor:
                     "بسته شد تا سشن خراب نشود. اگر بیرون از این سرویس هم یک "
                     "ربات روی همین اکانت بالا است، همان را ببند.",
                     hint=hint or "نسخه‌ی تکراری")
+            if rc == 77 or kind == "keydup":
+                # کلیدِ سوخته: تنها درمان، لاگینِ تازه است. سشنِ مرده را
+                # کنار می‌گذاریم تا دیگر هیچ بوت/بازیابی‌ای از آن بالا نیاید.
+                self._burned_session(
+                    uid, hint or "کلیدِ سشن توسط تلگرام باطل شده "
+                                 "(AuthKeyDuplicated)")
+                return self._why(
+                    uid, "session",
+                    "کلیدِ این سشن را تلگرام برای همیشه باطل کرده "
+                    "(یک سشن از دو IPِ مختلف — AuthKeyDuplicated). با "
+                    "ری‌استارت درست نمی‌شود: باید یک‌بار از «🚀 راه‌اندازی "
+                    "سلف روی اکانتم» دوباره لاگین کنی (کد می‌آید). قبلش "
+                    "مطمئن شو نسخه/سرویسِ دیگری روی همین اکانت بالاست نیست.",
+                    hint=hint or "کلیدِ سشن باطل شده", tail_n=14)
             if rc == 78 or kind == "session" or _LOGIN_CODE_RE.search(tail or ""):
                 # سشن باطل (یا بدتر: یک جایی کد ورود رفته) → دیگر تلاش نکن
                 try:

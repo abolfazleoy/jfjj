@@ -566,6 +566,27 @@ def self_diagnostic(env, folder):
             f"need_login={row.get('need_login')}")
     for ln in last_log_lines(folder):
         log(f"   | {ln}")
+    # سه نشانه‌ای که «چرا بالا نمی‌آید» را در یک نگاه جواب می‌دهند:
+    bad = folder / "jafj.session.bad"
+    if bad.exists():
+        log("   ⛔ سشنِ قبلی قرنطینه شده (jafj.session.bad): تلگرام کلیدش را "
+            "باطل کرده یا لاگین باطل شده — این فایل به کار نمی‌آید و باید "
+            "یک‌بار از پنل دوباره لاگین شود.")
+    lock = folder / "jafj.run.lock"
+    if lock.exists():
+        try:
+            lp = (lock.read_text(encoding="utf-8") or "").strip() or "?"
+        except Exception:
+            lp = "?"
+        log(f"   🔒 قفلِ اجرا موجود است (pid={lp}) — اگر پروسه‌ای با این PID "
+            f"زنده نیست، فایل را پاک کن تا نسخه‌ی بعدی اجرا شود.")
+    ipf = folder / "jafj_ip.txt"
+    if ipf.exists():
+        try:
+            log(f"   🌐 آخرین IPِ خروجیِ سلف: "
+                f"{(ipf.read_text(encoding='utf-8') or '').strip()}")
+        except Exception:
+            pass
     if not (folder / "jafj.session").exists():
         log("   👉 لاگین هنوز کامل نشده: از پنلِ مدیر «🚀 راه‌اندازی سلف روی اکانتم».")
     elif row.get("need_login"):
