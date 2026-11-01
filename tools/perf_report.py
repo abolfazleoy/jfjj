@@ -89,6 +89,8 @@ def db_section(DB, rows, caches):
             "ex_counts": lambda: db.ex_counts(),
             "ex_due": lambda: db.ex_due(now, 15),
             "ex_by_peer": lambda: db.ex_by_peer(100000 + rows // 2),
+            # بدترین حالت: طرفی که هیچ رکوردی ندارد → کلِ جدول پیمایش می‌شد
+            "ex_by_peer (ناشناس)": lambda: db.ex_by_peer(10 ** 12),
             "ex_set (write)": lambda: db.ex_set(1, next_check=now + 60),
             "next_pending (داغ)": lambda: db.next_pending("vip"),
             "list_pending": lambda: db.list_pending(10),
