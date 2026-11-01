@@ -74,6 +74,30 @@ def build_fake_repo(root):
     return repo
 
 
+def run_for(env, cwd, until, limit=60):
+    """main.py را اجرا کن تا شرطِ until در خروجی دیده شود (یا مهلت تمام شود)."""
+    proc = subprocess.Popen([sys.executable, "main.py"], cwd=str(cwd), env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    out = ""
+    deadline = time.time() + limit
+    try:
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            out += line
+            if until(out):
+                break
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+    return out
+
+
 def main():
     here = os.getcwd()
     saved = {k: os.environ.get(k) for k in
@@ -185,37 +209,29 @@ def main():
         check("e2e --check: boot.log ساخته شد",
               (app / "data" / "boot.log").is_file())
 
-        # حالتِ both: مدیر + سلفِ همان اکانت
+        # حالتِ both (پیش‌فرض = فقط نظارت): هیچ پروسه‌ی سلفِ دومی ساخته نمی‌شود
         acc = app / "data" / "clients" / "888"
         acc.mkdir(parents=True, exist_ok=True)
         (acc / "jafj_creds.json").write_text("{}", encoding="utf-8")
         (acc / "jafj.session").write_bytes(b"x")
-        env_e2e.update({"JAFJ_ONLY": "both", "JAFJ_SELF_UID": "888"})
-        proc = subprocess.Popen([sys.executable, "main.py"], cwd=str(app),
-                                env=env_e2e, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
-        out = ""
-        deadline = time.time() + 90
-        try:
-            while time.time() < deadline:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                out += line
-                if "FAKE-SELF start" in out and "FAKE-MANAGER start" in out:
-                    break
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                proc.kill()
-        check("e2e both: مدیر بالا آمد", "FAKE-MANAGER start" in out, out[-400:])
-        check("e2e both: سلف هم بالا آمد", "FAKE-SELF start" in out, out[-400:])
-        check("e2e both: سلف در پوشه‌ی اکانت اجرا شد",
-              f"cwd={acc}" in out or "creds=True session=True" in out, out[-400:])
-        check("e2e both: هر دو در یک لاگ آمدند",
-              out.count("JAFJ-BOOT:") > 3)
+        env_e2e.update({"JAFJ_ONLY": "both", "JAFJ_SELF_UID": "888",
+                        "JAFJ_SELF_WARN": "2"})
+        out = run_for(env_e2e, app, until=lambda o: "FAKE-MANAGER start" in o
+                      and "مدیر سلف را روشن نکرد" in o, limit=60)
+        check("e2e both: مدیر بالا آمد", "FAKE-MANAGER start" in out, out[-300:])
+        check("e2e both(نظارتی): سلفِ دوم اجرا نمی‌شود",
+              "FAKE-SELF start" not in out and "selfbot pid=" not in out,
+              out[-400:])
+        check("e2e both(نظارتی): گزارشِ وضعیت می‌دهد",
+              "وضعیتِ سلفِ" in out and "creds=" in out, out[-400:])
+
+        # با takeover: بعد از مهلت، خودش اجرا می‌کند
+        env_e2e.update({"JAFJ_SELF_TAKEOVER": "1", "JAFJ_SELF_WARN": "1"})
+        out2 = run_for(env_e2e, app, until=lambda o: "creds=" in o, limit=60)
+        check("e2e both(takeover): سلف اجرا شد", "FAKE-SELF start" in out2,
+              out2[-400:])
+        check("e2e both(takeover): در پوشه‌ی اکانت اجرا شد",
+              "creds=True session=True" in out2, out2[-300:])
     finally:
         os.chdir(here)
         for k, v in saved.items():

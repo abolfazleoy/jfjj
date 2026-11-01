@@ -5720,6 +5720,85 @@ def ask(prompt):
         return None
 
 
+# ─────────────────────────────────────────────
+#  قفلِ «یک نسخه روی یک اکانت»
+# ─────────────────────────────────────────────
+#  چرا: اگر دو 95.py روی یک سشن اجرا شوند، تلگرام هر دو اتصال را می‌بندد و
+#  نتیجه دقیقاً همان چیزی است که کاربر می‌بیند: «🔄 اتصال قطع شد» بی‌پایان و
+#  «پنل نمی‌آید». این قفل جلوی تولدِ نسخه‌ی دوم را می‌گیرد.
+RUN_LOCK = "jafj.run.lock"
+
+
+def _num_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _is_our_selfbot(pid):
+    """آیا آن PID واقعاً یک 95.py در همین پوشه است؟"""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+    except Exception:
+        return True                      # نمی‌دانیم → محافظه‌کارانه «بله»
+    if "95.py" not in cmd:
+        return False
+    try:
+        cwd = os.readlink(f"/proc/{int(pid)}/cwd")
+    except Exception:
+        return True
+    try:
+        return os.path.abspath(cwd) == os.path.abspath(os.getcwd())
+    except Exception:
+        return True
+
+
+def acquire_run_lock():
+    """(گرفتم؟, pidِ نسخه‌ی دیگر) — قفلِ فایلیِ ساده و مقاوم."""
+    for _ in range(3):
+        try:
+            fd = os.open(RUN_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True, ""
+        except FileExistsError:
+            pid = 0
+            try:
+                with open(RUN_LOCK, encoding="utf-8") as f:
+                    pid = int((f.read() or "0").strip() or 0)
+            except Exception:
+                pid = 0
+            if pid and pid != os.getpid() and _num_alive(pid) and _is_our_selfbot(pid):
+                return False, str(pid)
+            try:
+                os.remove(RUN_LOCK)          # قفلِ مرده (PID بازاستفاده‌شده)
+            except Exception:
+                return True, ""
+        except Exception:
+            return True, ""                  # اگر نشد، مانعِ اجرا نشو
+    return True, ""
+
+
+def release_run_lock():
+    try:
+        with open(RUN_LOCK, encoding="utf-8") as f:
+            if int((f.read() or "0").strip() or 0) != os.getpid():
+                return
+    except Exception:
+        pass
+    try:
+        os.remove(RUN_LOCK)
+    except Exception:
+        pass
+
+
 def ensure_creds():
     """تا وقتی api_id و api_hash درست نگرفته، می‌پرسد. خاموش نمی‌شود."""
     c = load_creds()
@@ -9069,11 +9148,23 @@ async def run_bot():
 
 
 def main():
+    ok, other = acquire_run_lock()
+    if not ok:
+        print("\n" + "─" * 52, flush=True)
+        print(f"⛔ نسخه‌ی دیگری از همین اکانت همین حالا در حال اجراست (pid={other}).",
+              flush=True)
+        print("   دو سلف روی یک سشن، اتصال را بی‌پایان قطع می‌کند («اتصال قطع شد»).",
+              flush=True)
+        print("   این نسخه اجرا نشد تا سشنِ سالم خراب نشود.", flush=True)
+        print(f"   اگر مطمئنی آن پروسه مرده است: rm {RUN_LOCK}", flush=True)
+        return 76
     try:
         return asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\n\nخاموش شد. صف و تنظیمات ذخیره شدند.")
         return 0
+    finally:
+        release_run_lock()
 
 
 if __name__ == "__main__":

@@ -505,15 +505,97 @@ def start_self_only(py, env):
 
 
 # ─────────────────── 4c) حالت both: مدیر + سلفِ همین یک اکانت ─────────────
+def db_row(data_dir, uid):
+    """یک ردیف از clients (فقط‌خواندنی) — برای گزارشِ وضعیت در لاگ."""
+    try:
+        import sqlite3
+        db = Path(data_dir) / "manager.db"
+        if not db.is_file() or not uid:
+            return {}
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            r = con.execute("SELECT status, want_on, need_login, started_at"
+                            " FROM clients WHERE uid=?", (int(uid),)).fetchone()
+            return dict(r) if r else {}
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
+def db_set_want_on(data_dir, uid, value):
+    """«نیتِ روشن‌بودن» اکانت را از دیتابیسِ مدیر عوض کن (برای takeover)."""
+    try:
+        import sqlite3
+        db = Path(data_dir) / "manager.db"
+        if not db.is_file() or not uid:
+            return False
+        con = sqlite3.connect(str(db), timeout=10)
+        try:
+            con.execute("UPDATE clients SET want_on=? WHERE uid=?",
+                        (1 if value else 0, int(uid)))
+            con.commit()
+        finally:
+            con.close()
+        return True
+    except Exception as e:
+        log(f"⚠️ عوض‌کردنِ want_on ممکن نشد: {type(e).__name__}: {e}")
+        return False
+
+
+def last_log_lines(folder, n=8):
+    try:
+        txt = (Path(folder) / "run.log").read_text(encoding="utf-8", errors="ignore")
+        lines = [ln for ln in txt.splitlines() if ln.strip()]
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+def self_diagnostic(env, folder):
+    """یک بلوکِ روشن: چرا سلف بالا نیامده (بدونِ دست‌زدن به چیزی)."""
+    row = db_row(env["DATA_DIR"], self_uid())
+    log(f"—— وضعیتِ سلفِ {folder} ——")
+    log(f"   creds={'✅' if (folder / 'jafj_creds.json').exists() else '❌'} "
+        f"session={'✅' if (folder / 'jafj.session').exists() else '❌'} "
+        f"pidfile={'✅' if (folder / '.jafj_self.pid').exists() else '—'} "
+        f"alive={self_running(folder)}")
+    if row:
+        log(f"   دیتابیس: status={row.get('status')} want_on={row.get('want_on')} "
+            f"need_login={row.get('need_login')}")
+    for ln in last_log_lines(folder):
+        log(f"   | {ln}")
+    if not (folder / "jafj.session").exists():
+        log("   👉 لاگین هنوز کامل نشده: از پنلِ مدیر «🚀 راه‌اندازی سلف روی اکانتم».")
+    elif row.get("need_login"):
+        log("   👉 مدیر این اکانت را «نیاز به لاگین» علامت زده — دوباره لاگین کن.")
+    else:
+        log("   👉 اگر خودت هیچ سلفی نمی‌بینی، یعنی مدیر اجرایش نکرده؛ "
+            "با JAFJ_SELF_TAKEOVER=1 می‌توانی اجرا را به من بسپاری.")
+
+
 def start_both(py, env):
+    """مدیر + نظارت بر سلفِ همین اکانت.
+
+    ⚠️ درسِ گران: نسخه‌ی اولِ این حالت خودش یک 95.py دوم اجرا می‌کرد و اگر
+    مدیر هم همان لحظه اجرایش کرده بود، **دو پروسه روی یک سشن** می‌شدند؛
+    تلگرام هر دو را قطع می‌کند و نتیجه‌اش همان «🔄 اتصال قطع شد» بی‌پایان
+    بود. پس پیش‌فرض = فقط نظارت (هیچ پروسه‌ی دومی ساخته نمی‌شود) و اجرای
+    دستی فقط با JAFJ_SELF_TAKEOVER=1 و بعد از «want_on=0»کردنِ اکانت.
+    """
     folder = self_folder(env["DATA_DIR"])
     if folder is None:
         die("JAFJ_ONLY=both دادي ولي JAFJ_SELF_UID يا JAFJ_SELF_DIR ندادي.")
     folder = Path(folder)
+    takeover = (os.environ.get("JAFJ_SELF_TAKEOVER") or "").strip() in (
+        "1", "true", "yes", "on")
     argv, cwd, label = manager_argv()
-    log(f"حالتِ both: {label} + سلفِ {folder}")
+    log(f"حالتِ both: {label} + نظارت بر سلفِ {folder}"
+        + ("  (takeover روشن است)" if takeover else "  (فقط نظارت)"))
     if dry_run(env):
-        log(f"DRY-RUN: {argv} (cwd={cwd}) + python {SELF_NAME} (cwd={folder})")
+        log(f"DRY-RUN: {argv} (cwd={cwd}); نظارت بر {folder}"
+            + ("; در صورت نیاز اجرای مستقیم" if takeover else ""))
         return 0
 
     try:
@@ -523,35 +605,65 @@ def start_both(py, env):
         return 1
     log(f"manager/supervisor pid={mgr.pid}")
 
+    warn_after = float(os.environ.get("JAFJ_SELF_WARN", "120") or 120)
+    wait_ready = float(os.environ.get("JAFJ_SELF_WAIT", "900") or 900)
+    t0 = time.time()
+    ready_since = None
+    seen_alive = False
+    warned = False
+    took = False
     stop = threading.Event()
     th = None
-    wait_s = float(os.environ.get("JAFJ_SELF_WAIT", "900") or 900)
-    deadline = time.time() + wait_s
     while True:
         if mgr.poll() is not None:
             stop.set()
             log(f"مدیر با کد {mgr.returncode} بست — خروج")
             return mgr.returncode or 1
-        if th is None:
+        alive = self_running(folder)
+        now = time.time()
+        if alive and not seen_alive:
+            seen_alive = True
+            warned = False
+            try:
+                pid = (folder / ".jafj_self.pid").read_text().strip()
+            except Exception:
+                pid = "?"
+            log(f"✅ سلفِ این اکانت بالا آمد (pid={pid}) — مدیر خودش اجرا کرد.")
+            th = None
+            took = False
+        elif seen_alive and not alive and not took:
+            seen_alive = False
+            log("⚠️ سلفِ این اکانت خاموش شد — دلیلش در خطوطِ زیر:")
+            self_diagnostic(env, folder)
+        if not alive and not took:
             if self_ready(folder):
-                if self_running(folder):
-                    log("✅ مدیر خودش سلفِ این اکانت را اجرا کرد — اجرای دوم لازم نیست.")
-                    th = "manager"
-                else:
-                    log("سلفِ این اکانت را خودم اجرا می‌کنم (پروسه‌ی مستقیم)…")
+                if ready_since is None:
+                    ready_since = now
+                    log(f"اکانت آماده است ولی سلف بالا نیست — منتظرِ مدیر… ({int(warn_after)}s)")
+                waited = now - ready_since
+                if takeover and waited >= warn_after and th is None:
+                    log("takeover: اجرای سلف را خودم به دست می‌گیرم "
+                        "(want_on=0 تا مدیر دوباره اجرا نکند)…")
+                    db_set_want_on(env["DATA_DIR"], self_uid(), 0)
+                    stop = threading.Event()
                     th = threading.Thread(target=supervise_selfbot,
                                           args=(py, env, folder, stop), daemon=True)
                     th.start()
-            elif time.time() > deadline:
-                log(f"⚠️ تا {int(wait_s)}s پوشه‌ی اکانت آماده نشد ({folder}) — "
-                    "اول از پنلِ مدیر «🚀 راه‌اندازی سلف روی اکانتم» را بزن؛ "
-                    "منتظر می‌مانم و به‌محضِ آماده‌شدن خودم اجرا می‌کنم.")
-                deadline = time.time() + wait_s
-            else:
-                log(f"منتظرِ آماده‌شدنِ اکانت… ({folder})")
-                time.sleep(5)
-                continue
-        time.sleep(2)
+                    took = True
+                    seen_alive = True
+                elif (not takeover) and waited >= warn_after and not warned:
+                    warned = True
+                    self_diagnostic(env, folder)
+                    log("   👉 مدیر سلف را روشن نکرد. اگر می‌خواهی من اجرا کنم: "
+                        "JAFJ_SELF_TAKEOVER=1")
+                    ready_since = now          # گزارشِ بعدی، warn_after بعد
+            elif now - t0 > wait_ready and not warned:
+                warned = True
+                self_diagnostic(env, folder)
+                log(f"   👉 تا {int(wait_ready)}s اکانت آماده نشد "
+                    f"({folder}) — اول از پنلِ مدیر لاگین کن؛ منتظر می‌مانم.")
+                t0 = now
+        time.sleep(3)
 
 
 # ───────────────────────────────────────────────────────────────── main ──

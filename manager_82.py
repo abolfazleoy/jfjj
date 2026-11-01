@@ -3633,9 +3633,20 @@ def _h(text, limit=1600):
     return s2[-limit:] if limit and len(s2) > limit else s2
 
 
+DUP_FAIL_RE = re.compile(
+    r"نسخه‌ی دیگری از همین اکانت|AUTH_KEY_DUPLICATED|"
+    r"jafj\.run\.lock|duplicate(d)? (key|session)|"
+    r"two (?:clients|processes|instances)", re.I)
+
+
 def classify_selfbot_log(tail, rc=None):
     """علتِ توقفِ سلف از آخرین خطوطِ run.log → (نوع, توضیحِ فارسی)."""
     t = tail or ""
+    # «نسخه‌ی تکراری» اول چک می‌شود: پیامش («اتصال قطع شد») با شبکه و سشن
+    # قاطی می‌شود، ولی درمانش کاملاً متفاوت است.
+    if rc == 76 or DUP_FAIL_RE.search(t):
+        return "dup", ("نسخه‌ی دیگری از همین اکانت هم‌زمان در حال اجرا بود "
+                       "(یک سشن، چند پروسه → تلگرام هر دو را قطع می‌کند)")
     if rc == 78 or SESSION_FAIL_RE.search(t):
         return "session", "سشنِ این اکانت باطل/خارج شده است"
     if DEPS_FAIL_RE.search(t):
@@ -3648,6 +3659,29 @@ def classify_selfbot_log(tail, rc=None):
     if rc is not None:
         return "exit", f"سلف با کدِ خروجِ {rc} بسته شد"
     return "", ""
+
+
+def selfbot_failure_notice(nm, uid, kind, hint, tail=""):
+    """متنِ پیامِ «سلف بالا نیامد» برای مشتری/مدیر (خالص و قابل تست)."""
+    first = ""
+    for ln in (tail or "").splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith(("File ", "~", "=====")):
+            first = ln
+    body = (f"⚠️ <b>سلف روی این اکانت بالا نیامد</b>\n\n"
+            f"👤 {_h(nm, 60)}\n<code>{uid}</code>\n"
+            f"🔎 علت: {_h(hint or 'نامعلوم', 200)}\n")
+    if first:
+        body += f"\n<pre>{_h(first, 300)}</pre>\n"
+    if kind == "network":
+        body += ("\n💡 اگر این تکرار شد: مطمئن شو **فقط یک نسخه** از این "
+                 "اکانت بالاست (دو پروسه روی یک سشن = همین قطعِ مداوم). "
+                 "وگرنه شبکه‌ی میزبان MTProto را می‌بندد.\n")
+    if kind == "dup":
+        body += ("\n💡 دو نسخه هم‌زمان روی همین اکانت اجرا شده بود؛ "
+                 "نسخه‌ی اضافه بسته شد و سشن سالم است.\n")
+    body += "\n👉 «⚙️ سرویس من» → «📜 گزارش» همه‌ی لاگ را نشان می‌دهد."
+    return body
 
 
 def selfbot_failure_text(msg, tail="", folder="", limit=1000):
@@ -4199,6 +4233,10 @@ class Supervisor:
                     self.mark_needs_login(uid, "سشن باطل/خارج‌شده")
                 except Exception:
                     pass
+            elif kind == "dup":
+                # نسخه‌ی تکراری: سشن سالم است؛ فقط یک نسخه باید بماند.
+                self.last_failure[uid] = "manager"
+                self.last_detail[uid] = hint[:300]
             else:
                 self.last_failure[uid] = "selfbot"
                 self.last_detail[uid] = hint[:300]
@@ -4235,17 +4273,7 @@ class Supervisor:
             nm = c.get("name") or str(uid)
         except Exception:
             nm = str(uid)
-        first = ""
-        for ln in (tail or "").splitlines():
-            ln = ln.strip()
-            if ln and not ln.startswith(("File ", "~", "=====")):
-                first = ln
-        body = (f"⚠️ <b>سلف روی این اکانت بالا نیامد</b>\n\n"
-                f"👤 {_h(nm, 60)}\n<code>{uid}</code>\n"
-                f"🔎 علت: {_h(hint or 'نامعلوم', 200)}\n")
-        if first:
-            body += f"\n<pre>{_h(first, 300)}</pre>\n"
-        body += ("\n👉 «⚙️ سرویس من» → «📜 گزارش» همه‌ی لاگ را نشان می‌دهد.")
+        body = selfbot_failure_notice(nm, uid, kind, hint, tail)
 
         async def _say():
             try:
@@ -4406,6 +4434,18 @@ class Supervisor:
             tail = (raw or "").strip().replace("\n", " | ")[-900:]
             self.db.log(uid, "start_failed", f"rc={rc} {tail}")
             kind, hint = classify_selfbot_log(raw, rc)
+            if rc == 76 or kind == "dup":
+                # نسخه‌ی دوم عمداً بسته شد؛ سشن سالم است و لاگین لازم نیست.
+                try:
+                    self._bump_fail(uid)
+                except Exception:
+                    pass
+                return self._why(
+                    uid, "manager",
+                    "دو نسخه از این اکانت هم‌زمان اجرا شده بود؛ نسخه‌ی دوم "
+                    "بسته شد تا سشن خراب نشود. اگر بیرون از این سرویس هم یک "
+                    "ربات روی همین اکانت بالا است، همان را ببند.",
+                    hint=hint or "نسخه‌ی تکراری")
             if rc == 78 or kind == "session" or _LOGIN_CODE_RE.search(tail or ""):
                 # سشن باطل (یا بدتر: یک جایی کد ورود رفته) → دیگر تلاش نکن
                 try:
