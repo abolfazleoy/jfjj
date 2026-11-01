@@ -38,6 +38,9 @@ FAKE_SELF = os.path.join(ROOT, "fake_selfbot.py")
 shutil.rmtree(ROOT, ignore_errors=True)
 os.makedirs(DATA, exist_ok=True)
 os.environ["DATA_DIR"] = DATA
+# این تست رفتارِ «بازیابی/آپدیت» را همگام می‌سنجد؛ مهلتِ بوت (که
+# عمداً در بوت واقعی ثانیه‌ها صبر می‌کند) باید خاموش باشد.
+os.environ["JAFJ_RESUME_DELAY"] = "0"
 os.environ["JAFJ_SELFBOT_REF"] = os.path.join(ROOT, "ref_95.py")
 
 with open(FAKE_SELF, "w", encoding="utf-8") as f:
