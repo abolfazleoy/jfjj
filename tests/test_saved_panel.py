@@ -205,7 +205,10 @@ def main():
             and "PANEL opens=True text_ok=True" in out
             and "NO_LOOP ok=True" in out
             and "AGAIN ok=True" in out
-            and "DONE rc=retry" in out)
+            # «lost» = وصل شده بود و بعد قطع شد (جدا از «retry» = اصلاً
+            # وصل نشد)؛ هر دو یعنی «حلقه ادامه پیدا کند» و این تست همان را
+            # می‌سنجد.
+            and ("DONE rc=retry" in out or "DONE rc=lost" in out))
     print("\n%s  saved-panel" % ("✅ PASS" if good else "❌ FAIL"))
     if not good and r.returncode != 0:
         print(out[-3000:])
