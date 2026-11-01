@@ -76,7 +76,8 @@ def main():
         os.environ["JAFJ_DRY_RUN"] = "1"
         os.environ["PORT"] = "9099"
         os.environ.pop("JAFJ_ONLY", None)
-        check("only_mode: پیش‌فرض یعنی manager", M.only_mode() == "", M.only_mode())
+        os.environ.pop("JAFJ_BOOT", None)
+        check("mode: پیش‌فرض یعنی manager", M.mode() == "manager", M.mode())
 
         env = M.check_layout(M.build_env(sys.executable))
         check("env: کد از code/ (JAFJ_IMAGE_DIR)", env["JAFJ_IMAGE_DIR"] == str(M.CODE_DIR))
@@ -98,18 +99,19 @@ def main():
               "Popen" not in body and "SELF_NAME]" not in body)
         check("start_manager فقط entrypointِ ریپو را exec می‌کند",
               "execve" in body and "railway-start.sh" in src)
-        selfbody = re.search(r"def start_selfbot_only\(.*?\n(?=def |\Z)", src, re.S)
-        selfbody = selfbody.group(0) if selfbody else ""
-        check("تنها جایی که سلف spawn می‌شود start_selfbot_only است (حالتِ اختیاری)",
-              "Popen" in selfbody and "JAFJ_SELF_DIR" in selfbody)
+        supbody = re.search(r"def supervise_selfbot\(.*?\n(?=def |\Z)", src, re.S)
+        supbody = supbody.group(0) if supbody else ""
+        check("سلف فقط در حالتِ self/both اجرا می‌شود (supervise_selfbot)",
+              "Popen" in supbody and "SELF_NAME" in supbody)
+        check("start_manager هیچ رشته‌ای برای سلف ندارد", "SELF_NAME" not in body)
 
         # ── ۳) «فقط یک سلف» بدونِ creds/session: پیامِ روشن، نه کرش ────────
         os.environ["JAFJ_ONLY"] = "self"
         os.environ["JAFJ_SELF_UID"] = "12345"
-        check("only_mode=self درست خوانده می‌شود", M.only_mode() == "self")
+        check("mode=self درست خوانده می‌شود", M.mode() == "self")
         code = None
         try:
-            M.start_selfbot_only(Path(sys.executable), dict(env))
+            M.start_self_only(Path(sys.executable), dict(env))
         except SystemExit as e:
             code = e.code
         check("سلف‌تنها بدونِ jafj_creds.json با کد خطا و پیام می‌ایستد",
