@@ -904,12 +904,14 @@ CREATE TABLE IF NOT EXISTS queue (
     sent_at INTEGER,
     message_id INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_q ON queue(status, tier, scheduled_at);
 -- انتخابِ آیتمِ بعدیِ صف با «ORDER BY id LIMIT 1» انجام می‌شود؛ ایندکسِ
--- بالا با scheduled_at مرتب است، پس sqlite مجبور می‌شد کلِ ردیف‌های آن
--- tier را در یک B-Tree موقت مرتب کند (روی ۲۰ هزار ردیف: ~۶.۷ms برای هر
--- پیام!). این ایندکس ترتیب را روی id می‌دهد و همان کوئری صفر می‌شود.
-CREATE INDEX IF NOT EXISTS idx_q_pick ON queue(status, tier, id, scheduled_at);
+-- قبلی (status, tier, scheduled_at) ترتیب را روی scheduled_at می‌داد، پس
+-- sqlite مجبور می‌شد کلِ ردیف‌های آن tier را در یک B-Tree موقت مرتب کند
+-- (روی ۲۰ هزار ردیف: ~۱۶ms برای هر پیام!). این ایندکس ترتیب را روی id
+-- می‌دهد و همان کوئری ۰.۰۰۸ms می‌شود. اندازه‌گیری نشان داد نسخه‌ی
+-- سه‌ستونه به‌همان سرعت است و کوچک‌تر؛ و با بودنِ آن، ایندکسِ قدیمی
+-- (idx_q) هیچ کوئری‌ای را سریع‌تر نمی‌کرد، پس در مهاجرت پایین حذف می‌شود.
+CREATE INDEX IF NOT EXISTS idx_q_pick ON queue(status, tier, id);
 
 CREATE TABLE IF NOT EXISTS exchange (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -986,11 +988,39 @@ class DB:
             # بعد از مهاجرت ساخته شود؛ وگرنه دیتابیس قدیمی هنوز ستون next_check ندارد.
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ex_next_check "
                               "ON exchange(status, next_check)")
-            # یادآورها با (status IN (pending,joined) AND next_reminder<=?) خوانده
-            # می‌شوند؛ بدونِ این ایندکس هر بار کلِ جدول اسکن می‌شد
-            # (روی ۲۰ هزار رکورد ~۱۵ms در هر دورِ حلقه).
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ex_rem "
-                              "ON exchange(status, next_reminder)")
+            # ایندکس‌های زیر فقط سرعت‌اند، نه داده. هرکدام جدا و در
+            # try/except ساخته می‌شوند تا یک دیتابیسِ عجیب/خراب هرگز
+            # جلوی بالا آمدنِ سلف‌بات را نگیرد.
+            for _dml in (
+                # یادآورها با (status IN (pending,joined) AND next_reminder<=?)
+                # خوانده می‌شوند؛ بدونِ این ایندکس هر بار کلِ جدول اسکن
+                # می‌شد (روی ۲۰ هزار رکورد ~۱۵ms در هر دورِ حلقه).
+                "CREATE INDEX IF NOT EXISTS idx_ex_rem "
+                "ON exchange(status, next_reminder)",
+                # برای هر پیامِ ورودی از یک طرف، ex_by_peer آخرین رکوردش را
+                # می‌خواهد؛ بدونِ این ایندکس کلِ جدول پیمایش می‌شد
+                # (اندازه‌گیری روی ۵۰ هزار رکورد: ۱.۲ تا ۲.۳ms → ۰.۰۱ms).
+                "CREATE INDEX IF NOT EXISTS idx_ex_peer "
+                "ON exchange(peer_id)",
+                # ایندکسِ قدیمیِ صف دیگر به کاری نمی‌آید و فقط حجم و
+                # زمانِ نوشتن را زیاد می‌کند (اندازه‌گیری‌شده).
+                "DROP INDEX IF EXISTS idx_q",
+            ):
+                try:
+                    self.conn.execute(_dml)
+                except Exception:
+                    pass
+            # اگر دیتابیس از نسخه‌ی قبل ایندکسِ چهارستونه‌ی صف را دارد،
+            # به نسخه‌ی سه‌ستونه (هم‌سرعت، کم‌حجم‌تر) تبدیل شود.
+            try:
+                _cols = [r[2] for r in
+                         self.conn.execute("PRAGMA index_info(idx_q_pick)")]
+                if _cols and _cols != ["status", "tier", "id"]:
+                    self.conn.execute("DROP INDEX idx_q_pick")
+                    self.conn.execute("CREATE INDEX idx_q_pick "
+                                      "ON queue(status, tier, id)")
+            except Exception:
+                pass
             self.conn.commit()
 
     def _x(self, sql, a=(), f=None):
