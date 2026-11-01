@@ -4948,6 +4948,7 @@ class Supervisor:
         دست نمی‌خورد تا بوتِ دوباره (بعد از بازیابی) آن را بی‌دلیل قطع نکند.
         """
         n = skipped = 0
+        skip_why = []                 # [(uid, دلیل)] — برای پیامِ روشن به مدیر
         self._resume_fail.clear()
         try:
             rows = self.db.wanted()
@@ -4958,6 +4959,7 @@ class Supervisor:
             if self.needs_login(uid) and not force_restart:
                 # سشنِ باطل: بالا آوردنش فقط کدِ ورود برای مشتری می‌سازد.
                 skipped += 1
+                skip_why.append((uid, "نیاز به لاگین"))
                 self.db.log(uid, "boot_skip", "نیاز به لاگین")
                 continue
             # اگر از قبل روشن بود: فقط وقتی ری‌استارت کن که کدِ روی دیسک
@@ -4975,6 +4977,7 @@ class Supervisor:
             ok, why = self.allowed(uid)
             if not ok:
                 skipped += 1
+                skip_why.append((uid, why))
                 self.db.log(uid, "boot_skip", why)
                 continue
             started, _ = self.start(uid)
@@ -4984,7 +4987,17 @@ class Supervisor:
                     self.mgr.shop.p_reset_charge(uid)
             time.sleep(0.5)
         if skipped:
-            print(f"  ⚠️ {skipped} سرویس بدون اعتبار بالا نیامد")
+            # «چرا روشن نکرد؟» باید در همان خط معلوم باشد، نه با حدس. قبلاً
+            # همه‌ی دلیل‌ها «بدون اعتبار» گفته می‌شد که گمراه‌کننده بود.
+            parts = []
+            for uid, why in skip_why[:6]:
+                parts.append(f"{uid}: {why}")
+            more = "" if len(skip_why) <= 6 else f" · و {len(skip_why) - 6} تای دیگر"
+            print(f"  ⏭️ {skipped} سرویس بالا نیامد → " + " · ".join(parts) + more,
+                  flush=True)
+        if n == 0 and not skipped:
+            print("  ℹ️ سرویسی برای بالا آوردن نبود (همه خاموش‌اند یا هیچ "
+                  "اکانتی در دیتابیس نیست)", flush=True)
         return n
 
     def shutdown(self):
@@ -5496,11 +5509,20 @@ class Manager:
                           f"({why}) — تا اتصالِ نسخه‌ی قبلی سمتِ تلگرام بسته "
                           "شود و کلیدِ سشن نسوزد "
                           "(خاموش‌کردن: JAFJ_RESUME_DELAY=0)", flush=True)
-                    self.sup._grace_until = time.time() + delay
+                    deadline = time.time() + delay
+                    self.sup._grace_until = deadline
                     try:
-                        time.sleep(delay)
+                        while True:
+                            left = deadline - time.time()
+                            if left <= 0:
+                                break
+                            print(f"  ⏳ مهلتِ سشن‌ها: {int(left)} ثانیه مانده …",
+                                  flush=True)
+                            time.sleep(min(30.0, max(0.2, left)))
                     finally:
                         self.sup._grace_until = 0.0
+                    print("  ✅ مهلت تمام شد — سرویس‌ها را بالا می‌آورم.",
+                          flush=True)
                 n = self.sup.boot_all(force_restart=force_restart)
                 try:
                     self._boot_last = (n, 0, 0)
