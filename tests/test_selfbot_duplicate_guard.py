@@ -50,6 +50,10 @@ def main():
     os.environ["DATA_DIR"] = str(root / "data")
     os.environ["PORT"] = "8255"
     os.environ.pop("JAFJ_ONLY", None)
+    # این تست قفلِ «مرده» را فوری می‌خواهد؛ مهلتِ قفلِ ضدِ سوختنِ سشن در
+    # tests/test_resume_grace.py جدا سنجیده می‌شود.
+    saved_grace = os.environ.get("JAFJ_LOCK_GRACE")
+    os.environ["JAFJ_LOCK_GRACE"] = "0"
     try:
         # ── ۱) قفلِ یک‌نسخه‌ای در 95.py ───────────────────────────────────
         client = root / "clients" / "1"
@@ -165,6 +169,10 @@ def main():
               (sup.db.get(uid) or {}).get("need_login"))
     finally:
         os.chdir(here)
+        if saved_grace is None:
+            os.environ.pop("JAFJ_LOCK_GRACE", None)
+        else:
+            os.environ["JAFJ_LOCK_GRACE"] = saved_grace
         if saved_data is None:
             os.environ.pop("DATA_DIR", None)
         else:

@@ -5777,6 +5777,10 @@ def acquire_run_lock():
                 pid = 0
             if pid and pid != os.getpid() and _num_alive(pid) and _is_our_selfbot(pid):
                 return False, str(pid)
+            # نسخه‌ی قبلی مرده است، ولی اگر «همین چند لحظه پیش» مرده باشد،
+            # اتصالش سمتِ تلگرام ممکن است هنوز باز باشد؛ وصل‌شدنِ فوری با
+            # همان کلید از IPِ تازه = AuthKeyDuplicated (سوختنِ دائمیِ سشن).
+            _wait_for_lock_grace()
             try:
                 os.remove(RUN_LOCK)          # قفلِ مرده (PID بازاستفاده‌شده)
             except Exception:
@@ -5784,6 +5788,46 @@ def acquire_run_lock():
         except Exception:
             return True, ""                  # اگر نشد، مانعِ اجرا نشو
     return True, ""
+
+
+def _lock_age():
+    """چند ثانیه از نوشتنِ فایلِ قفل گذشته (None اگر معلوم نیست)."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(RUN_LOCK))
+    except Exception:
+        return None
+
+
+def _lock_grace():
+    try:
+        return max(0.0, float(os.environ.get("JAFJ_LOCK_GRACE", "90") or 0))
+    except Exception:
+        return 90.0
+
+
+def _wait_for_lock_grace():
+    """قفلِ مرده‌ی «تازه» را فوری پاک نکن؛ کمی صبر کن.
+
+    چرا: اگر نسخه‌ی قبلی ناگهانی کشته شود (OOM/دیپلوی)، تلگرام اتصالش را
+    چند لحظه باز نگه می‌دارد. اجرای فوریِ نسخه‌ی تازه با همان کلید از IPِ
+    تازه، کلید را برای همیشه باطل می‌کند. یعنی چند ثانیه صبر ارزان‌تر از
+    یک سشنِ سوخته است.
+    """
+    grace = _lock_grace()
+    age = _lock_age()
+    if grace <= 0 or age is None or age >= grace:
+        return True
+    print(f"\n⏳ نسخه‌ی قبلیِ این اکانت {int(age)} ثانیه پیش بسته شده — "
+          f"تا ثانیه‌ی {int(grace)} صبر می‌کنم", flush=True)
+    print("   (اتصالِ قبلی سمتِ تلگرام ممکن است هنوز باز باشد؛ وصل‌شدنِ فوری "
+          "کلید را می‌سوزاند)", flush=True)
+    while True:
+        age = _lock_age()
+        if age is None or age >= grace:
+            break
+        time.sleep(min(5.0, max(0.2, grace - age)))
+    print("✅ مهلت تمام شد — ادامه می‌دهم.", flush=True)
+    return True
 
 
 def release_run_lock():
@@ -5886,9 +5930,9 @@ def log_egress_ip():
     try:
         if os.path.isfile("jafj_ip.txt"):
             with open("jafj_ip.txt", encoding="utf-8") as f:
-                prev = (f.read() or "").strip()
+                prev = ((f.read() or "").strip().split() or [""])[0]
         with open("jafj_ip.txt", "w", encoding="utf-8") as f:
-            f.write(ip + "\n")
+            f.write(f"{ip} {int(time.time())}\n")
     except Exception:
         pass
     print(f"🌐 IPِ خروجی: {ip}"
@@ -5901,6 +5945,12 @@ def log_egress_ip():
               "(AuthKeyDuplicated).", flush=True)
         print("   یعنی مقصر «کد» نیست، میزبان/شبکه است؛ سرویسِ دوم را ببند.",
               flush=True)
+        try:
+            if os.path.exists(SESSION + ".session"):
+                print("   ⚠️ این اکانت سشن دارد و IP عوض شده — اگر بعد از این "
+                      "«کلید باطل شده» دیدی، همین علتش بوده است.", flush=True)
+        except Exception:
+            pass
     return ip
 
 

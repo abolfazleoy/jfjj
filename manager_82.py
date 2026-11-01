@@ -3734,6 +3734,79 @@ def selfbot_failure_text(msg, tail="", folder="", limit=1000):
 # ═══════════════════════════════════════════════════
 #  ناظر پروسه‌ها — هر مشتری یک پروسه‌ی جدا
 # ═══════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════
+#  مهلتِ بوت — چرا هر آپدیت سشن‌ها را می‌سوزاند و این‌جا بسته می‌شود
+#
+#  گزارشِ واقعیِ کاربر: «هر آپدیت سشن می‌سوزد». علتش این بود که هنگامِ
+#  دیپلوی، کانتینرِ تازه در ثانیه‌ی صفر همه‌ی سشن‌ها را وصل می‌کرد، در حالی
+#  که کانتینرِ قبلی هنوز زنده بود (در لاگِ خودش: start 17:33:17 و
+#  «Server marked as stopping» 17:33:24). دو IP، یک کلید →
+#  AuthKeyDuplicated و مرگِ دائمیِ سشن.
+#
+#  راه‌حل: بعد از بوت، تا JAFJ_RESUME_DELAY (پیش‌فرض ۱۲۰s) هیچ سلفی وصل
+#  نشود؛ و اگر نشانه‌ی «خروجِ ناگهانی» یا «اتصالِ خیلی تازه» دیدیم، مهلت
+#  بیشتر شود. با JAFJ_RESUME_DELAY=0 یا JAFJ_NO_RESUME_DELAY=1 خاموش است.
+RESUME_AT_NAME = ".jafj_resume_at"
+LAST_EXIT_NAME = ".jafj_last_exit"
+HARD_EXIT_CODES = (137, 143, -9, 9)      # SIGKILL/OOM، SIGTERM، kill
+RECENT_CONNECT_WINDOW = 180              # ثانیه
+MAX_GRACE = 900
+
+
+def _read_json_soft(path):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _env_off(name):
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes",
+                                                            "on", "بله")
+
+
+def resume_grace_plan(data_dir, env=None, now_ts=None):
+    """(ثانیه, دلیل) — چقدر بعد از بوت صبر کنیم تا هیچ سشنی وصل نشود."""
+    e = env if env is not None else os.environ
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    if _env_off("JAFJ_NO_RESUME_DELAY"):
+        return 0.0, "خاموش (JAFJ_NO_RESUME_DELAY)"
+    try:
+        base = float((e.get("JAFJ_RESUME_DELAY") or "120").strip() or 120)
+    except Exception:
+        base = 120.0
+    base = max(0.0, min(float(MAX_GRACE), base))
+    if base <= 0:
+        return 0.0, "خاموش (JAFJ_RESUME_DELAY=0)"
+    why = "مهلتِ بوت"
+    # ۱) خروجِ ناگهانی = احتمالِ OOM/کشتنِ پروسه؛ اتصالِ قبلی سمتِ تلگرام
+    #    ممکن است هنوز باز باشد → مهلت دو برابر.
+    last = _read_json_soft(os.path.join(str(data_dir), LAST_EXIT_NAME))
+    try:
+        code = int(last.get("code"))
+    except Exception:
+        code = None
+    if code is not None and code in HARD_EXIT_CODES:
+        base = min(float(MAX_GRACE), base * 2)
+        why = f"خروجِ ناگهانیِ قبلی (code={code}) — احتمالاً OOM/کشتن"
+    # ۲) اگر همین چند لحظه پیش سلفی وصل شده بود، هنوز ممکن است نسخه‌ی قبلی
+    #    زنده باشد (دیپلویِ روی هم‌افتاده) → حداقل ۱۸۰ ثانیه.
+    rec = _read_json_soft(os.path.join(str(data_dir), RESUME_AT_NAME))
+    try:
+        ts = float(rec.get("ts") or 0)
+    except Exception:
+        ts = 0.0
+    age = now_ts - ts if ts else None
+    if age is not None and 0 <= age < RECENT_CONNECT_WINDOW:
+        if base < RECENT_CONNECT_WINDOW:
+            base = float(RECENT_CONNECT_WINDOW)
+        why = (f"آخرین اتصالِ سشن‌ها فقط {int(age)} ثانیه پیش بود — "
+               "شاید نسخه‌ی قبلی هنوز زنده است")
+    return float(min(float(MAX_GRACE), base)), why
+
+
 class Supervisor:
     def __init__(self, cfg, db):
         self.cfg = cfg
@@ -3749,6 +3822,8 @@ class Supervisor:
         # تا پروسه‌ای که فوراً می‌میرد (سشنِ خراب/FloodWait) هر ۳۰ ثانیه
         # دوباره و دوباره اجرا نشود.
         self._resume_fail = {}
+        # تا این زمان هیچ سلفی وصل نمی‌شود (مهلتِ بوت؛ بخشِ resume_grace_plan).
+        self._grace_until = 0.0
         # قفلِ «بالا آوردنِ همه» — بوتِ خودکار و بازیابیِ دستی نباید هم‌زمان
         # یک سرویس را دو بار ری‌استارت کنند.
         self.boot_lock = threading.Lock()
@@ -4540,6 +4615,7 @@ class Supervisor:
         self.db.set(uid, started_at=now(), want_on=1, need_login=0)
         self._resume_fail.pop(uid, None)
         self.db.log(uid, "start", f"pid={p.pid}")
+        self.mark_connected(uid)
         self.last_detail.pop(uid, None)
         # ثانیه‌های اول را زیرِ نظر بگیر: مرگِ دیرتر یا «گیرکردن در اتصال»
         # همین‌جا معلوم می‌شود، نه با صبر کردنِ الکیِ مشتری.
@@ -4735,6 +4811,30 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def mark_connected(self, uid=None):
+        """زمانِ آخرین «وصل‌کردنِ سشن» را روی دیسک بنویس.
+
+        چرا روی دیسک و نه در حافظه: نسخه‌ی بعدیِ همین کد (بعد از دیپلوی)
+        باید بداند که چند لحظه پیش سلفی وصل شده — یعنی احتمالاً کانتینرِ
+        قبلی هنوز زنده است و اتصال‌دادنِ فوری، کلیدِ سشن را می‌سوزاند.
+        """
+        try:
+            p = os.path.join(BASE_DIR, RESUME_AT_NAME)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"ts": time.time(), "uid": uid, "pid": os.getpid()}, f)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+        return True
+
+    def grace_left(self):
+        """چند ثانیه از مهلتِ بوت مانده (۰ = تمام شده)."""
+        try:
+            return max(0.0, float(self._grace_until or 0) - time.time())
+        except Exception:
+            return 0.0
+
     def _bump_fail(self, uid):
         """تلاشِ ناموفق را ثبت کن و دفعه‌ی بعد را عقب بینداز (۶۰s، ۱۲۰s … تا ۱۰m).
 
@@ -4758,6 +4858,10 @@ class Supervisor:
         خروجی: (شروع‌شده‌ها, ناموفق‌ها, رد‌شده‌ها) — لیستِ uid/پیام.
         """
         started, failed, skipped = [], [], []
+        if self.grace_left() > 0:
+            # مهلتِ بوت: هیچ سشنی وصل نشود تا نسخه‌ی قبلی قطعاً از تلگرام
+            # جدا شده باشد (دو IP روی یک کلید = سوختنِ دائمیِ سشن).
+            return started, failed, skipped
         try:
             rows = self.db.wanted()
         except Exception:
@@ -5386,6 +5490,17 @@ class Manager:
                       flush=True)
                 return
             try:
+                delay, why = resume_grace_plan(BASE_DIR)
+                if delay > 0:
+                    print(f"  ⏳ مهلتِ سشن‌ها: {int(delay)} ثانیه صبر می‌کنم "
+                          f"({why}) — تا اتصالِ نسخه‌ی قبلی سمتِ تلگرام بسته "
+                          "شود و کلیدِ سشن نسوزد "
+                          "(خاموش‌کردن: JAFJ_RESUME_DELAY=0)", flush=True)
+                    self.sup._grace_until = time.time() + delay
+                    try:
+                        time.sleep(delay)
+                    finally:
+                        self.sup._grace_until = 0.0
                 n = self.sup.boot_all(force_restart=force_restart)
                 try:
                     self._boot_last = (n, 0, 0)
