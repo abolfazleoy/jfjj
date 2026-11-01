@@ -3790,6 +3790,163 @@ class ForkDaemon:
             pass
 
 
+SHARD_SIZE = 8          # پیش‌فرض؛ با JAFJ_SHARD_SIZE عوض می‌شود
+
+
+def shard_size(env=None):
+    """چند اکانت در یک پروسه‌ی shard (۱ تا ۶۴)."""
+    e = env if env is not None else os.environ
+    try:
+        v = int((e.get("JAFJ_SHARD_SIZE") or "").strip() or SHARD_SIZE)
+    except Exception:
+        v = SHARD_SIZE
+    return max(1, min(64, v))
+
+
+class ShardDaemon(ForkDaemon):
+    """چند اکانت در یک پروسه (`jafj_shardd.py`).
+
+    حافظه‌ی اندازه‌گیری‌شده: fork ~۱۱.۲MB برای هر اکانت، shard ~۳.۳MB.
+    بهایش: یک پروسه = یک نقطه‌ی شکست، پس اندازه‌اش کوچک نگه داشته می‌شود.
+    """
+
+    def __init__(self, selfbot=None, python=None, size=None):
+        ForkDaemon.__init__(self, selfbot, python)
+        self.size = int(size or shard_size())
+        self.uids = {}                  # uid → pid (همیشه pid این پروسه)
+
+    def forker_path(self):
+        d = os.path.dirname(os.path.abspath(self.selfbot))
+        for base in (d, os.path.dirname(os.path.abspath(__file__))):
+            cand = os.path.join(base, "jafj_shardd.py")
+            if os.path.isfile(cand):
+                return cand
+        return os.path.join(d, "jafj_shardd.py")
+
+    def start(self, timeout=120):
+        if self.alive():
+            return True
+        path = self.forker_path()
+        if not os.path.isfile(path):
+            self.last_error = f"jafj_shardd.py پیدا نشد ({path})"
+            return False
+        try:
+            _env = dict(os.environ)
+            _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
+            self.proc = subprocess.Popen(
+                [self.python, path, "--selfbot", os.path.abspath(self.selfbot),
+                 "--max-accounts", str(self.size)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, env=_env,
+                start_new_session=True)
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return False
+        msg = self._read_until({"event": "ready"}, timeout=timeout)
+        if msg is None:
+            self.last_error = "شارد آماده نشد (timeout)"
+            return False
+        return True
+
+    def room(self):
+        return max(0, self.size - len(self.uids))
+
+    def spawn(self, cwd, log, uid, timeout=90):
+        if not self.alive():
+            self.uids.clear()
+        with self._lock:
+            if not self.start():
+                return None, self.last_error or "شارد بالا نیامد"
+            try:
+                self._send({"cmd": "run", "cwd": str(cwd), "log": str(log),
+                            "uid": str(uid)})
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
+            msg = self._read_ok(timeout=timeout)
+            if not msg or not msg.get("ok"):
+                return None, (msg or {}).get("error") or "پاسخِ شارد نیامد"
+            self.uids[str(uid)] = int(msg.get("pid") or 0)
+            return self.uids[str(uid)], ""
+
+    def alive_uid(self, uid):
+        """آیا این اکانت داخلِ شارد زنده است؟ (کدِ خروج = returncode)"""
+        uid = str(uid)
+        self.drain()
+        if not self.alive():
+            return None if uid in self.exits else False
+        with self._lock:
+            try:
+                self._send({"cmd": "ping"})
+            except Exception:
+                return False
+            end = time.time() + 5
+            while time.time() < end:
+                msg = self._read_msg(max(0.1, end - time.time()))
+                if msg is None:
+                    break
+                if msg.get("ok") and "accounts" in msg:
+                    return uid in [str(x) for x in msg.get("accounts") or []]
+        return False
+
+    def stop_uid(self, uid, timeout=40):
+        uid = str(uid)
+        with self._lock:
+            if not self.alive():
+                self.uids.pop(uid, None)
+                return True
+            try:
+                self._send({"cmd": "stop", "uid": uid})
+            except Exception:
+                return False
+            end = time.time() + timeout
+            while time.time() < end:
+                msg = self._read_msg(max(0.1, end - time.time()))
+                if msg is None:
+                    break
+                if msg.get("uid") == uid and "ok" in msg:
+                    ok = bool(msg.get("ok"))
+                    if not ok:
+                        # رشته نمرد → کلِ شارد را ببند (بقیه ری‌استارت می‌شوند)
+                        try:
+                            self.proc.terminate()
+                        except Exception:
+                            pass
+                    self.uids.pop(uid, None)
+                    return True
+        self.uids.pop(uid, None)
+        return False
+
+
+class _ShardProc:
+    """دستگیره‌ی یک اکانت داخلِ شارد — مثلِ Popen اما محدود به همان اکانت."""
+
+    def __init__(self, pid, daemon, uid):
+        self.pid = int(pid)
+        self.daemon = daemon
+        self.uid = str(uid)
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        a = self.daemon.alive_uid(self.uid)
+        if a is True:
+            return None
+        self.returncode = self.daemon.exits.get(int(self.pid))
+        if not isinstance(self.returncode, int):
+            self.returncode = 1
+        return self.returncode
+
+    def terminate(self):
+        self.daemon.stop_uid(self.uid)
+
+    def kill(self):
+        self.daemon.stop_uid(self.uid)
+
+    def remote_stop(self):
+        return self.daemon.stop_uid(self.uid)
+
+
 # ═══════════════════════════════════════════════════
 #  «چرا سلف بالا نیامد؟» — تشخیصِ علت از لاگِ خودِ سلف
 #
@@ -4027,6 +4184,9 @@ def spawn_mode(env=None):
     v = (e.get("JAFJ_SPAWN_MODE") or "").strip().lower()
     if v in ("process", "proc", "off", "0", "no", "جدا", "جداگانه"):
         return "process"
+    if v in ("shard", "shards", "sharded", "share-proc", "shard-proc",
+             "شارد", "یک‌پروسه"):
+        return "shard" if fork_supported() else "process"
     if v in ("fork", "forked", "shared", "share", "1", "on", "yes", "اشتراکی"):
         return "fork" if fork_supported() else "process"
     return "fork" if fork_supported() else "process"
@@ -4035,7 +4195,7 @@ def spawn_mode(env=None):
 # مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:
 # «process» = یک پروسه برای هر اکانت، «fork» = حافظه‌ی مشترک (WISPBYTE_FA §۱۲).
 # fork: اندازه‌گیریِ پله‌ای ۱ تا ۸ اکانت → هر اکانتِ اضافه ۱۱.۲MB.
-PER_ACCOUNT_MB = {"fork": 11, "process": 62}
+PER_ACCOUNT_MB = {"shard": 4, "fork": 11, "process": 62}
 RAM_RESERVE_MB = 96          # برای مدیر، دیتابیس، پشتیبان و OS
 
 
@@ -4935,7 +5095,22 @@ class Supervisor:
             _env = dict(os.environ)
             _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
             p = None
-            if spawn_mode() == "fork" and not getattr(self, "_fork_broken", False):
+            if spawn_mode() == "shard" and not getattr(self, "_shard_broken", False):
+                # چند اکانت در یک پروسه: ~۳.۳MB به‌ازای هر اکانت (fork: ~۱۱.۲)
+                _sd = self.pick_shard()
+                _pid, _err = _sd.spawn(
+                    folder, os.path.join(folder, "run.log"), uid)
+                if _pid:
+                    p = _ShardProc(_pid, _sd, uid)
+                else:
+                    self._shard_broken = True
+                    try:
+                        print(f"  ⚠️ شارد برای {uid} نشد ({_err}) — از این به "
+                              "بعد با پروسه‌ی fork اجرا می‌کنم", flush=True)
+                    except Exception:
+                        pass
+            if (spawn_mode() == "fork" or getattr(self, "_shard_broken", False)) \
+                    and p is None and not getattr(self, "_fork_broken", False):
                 # حافظه‌ی تلگرام بینِ همه‌ی اکانت‌ها مشترک می‌شود (COW).
                 _pid, _err = self.fork_daemon().spawn(
                     folder, os.path.join(folder, "run.log"), uid)
@@ -5053,6 +5228,17 @@ class Supervisor:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             return True, "خاموش بود"
+        if hasattr(p, "remote_stop"):
+            # اکانتِ داخلِ shard: کشتنِ گروهِ پروسه یعنی کشتنِ همه‌ی اکانت‌های
+            # همان شارد. باید از خودِ شارد بخواهیم فقط همین یکی را ببندد.
+            try:
+                p.remote_stop()
+            except Exception:
+                pass
+            self.procs.pop(uid, None)
+            self._clear_pid(uid)
+            self.db.log(uid, "stop")
+            return True, "خاموش شد"
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except Exception:
@@ -5223,6 +5409,26 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def shard_pool(self):
+        """شاردهای ساخته‌شده (هر کدام چند اکانت)."""
+        pool = getattr(self, "_shards", None)
+        if pool is None:
+            pool = []
+            self._shards = pool
+        return pool
+
+    def pick_shard(self):
+        """شاردی که جا دارد؛ اگر همه پر بودند یکی تازه بساز."""
+        for d in self.shard_pool():
+            try:
+                if d.alive() and d.room() > 0:
+                    return d
+            except Exception:
+                continue
+        d = ShardDaemon(SELFBOT)
+        self.shard_pool().append(d)
+        return d
+
     def fork_daemon(self):
         """دیمنِ fork (یک‌بار ساخته می‌شود)."""
         d = getattr(self, "_forkd", None)
@@ -5237,6 +5443,14 @@ class Supervisor:
         for uid, p in list(getattr(self, "procs", {}).items()):
             try:
                 if p is None or p.poll() is not None:
+                    continue
+                if getattr(p, "daemon", None) is not None and hasattr(p, "uid"):
+                    # چند اکانت یک پروسه‌اند: PSSِ شارد را بین‌شان تقسیم کن،
+                    # وگرنه ۸ اکانت هر کدام «۷۶MB» نشان می‌دهند.
+                    _d = p.daemon
+                    _n = max(1, len(getattr(_d, "uids", {}) or {}))
+                    _tot = proc_pss_mb(p.pid) or proc_rss_mb(p.pid) or 0.0
+                    out.append((uid, p.pid, round(_tot / _n, 1)))
                     continue
                 mb = proc_pss_mb(p.pid)
                 if mb is None:
@@ -5391,6 +5605,9 @@ class Supervisor:
         if _mode == "fork":
             print("  🧠 حالتِ اجرا: اشتراکی (fork) — تلگرام یک‌بار در رم؛ "
                   "هر اکانتِ اضافه ~۱۱MB به‌جای ~۶۲MB", flush=True)
+        elif _mode == "shard":
+            print(f"  🧠 حالتِ اجرا: شارد — {shard_size()} اکانت در یک پروسه؛ "
+                  "هر اکانتِ اضافه ~۴MB", flush=True)
         skip_why = []                 # [(uid, دلیل)] — برای پیامِ روشن به مدیر
         self._resume_fail.clear()
         try:
@@ -5463,6 +5680,11 @@ class Supervisor:
                 self._forkd.close()
         except Exception:
             pass
+        for _sd in list(getattr(self, "_shards", []) or []):
+            try:
+                _sd.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════

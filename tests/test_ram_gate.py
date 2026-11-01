@@ -125,6 +125,9 @@ def main():
         check("ظرفیت: حالتِ process کمتر جا می‌دهد", n2 < n, (n, n2))
         n3, _, _ = M.capacity_estimate(free_mb=50, mode="fork")
         check("ظرفیت: حافظه‌ی کم → صفر (نه عددِ منفی)", n3 == 0, n3)
+        nS, perS, _ = M.capacity_estimate(free_mb=1024, mode="shard")
+        check("ظرفیت: shard → هر سلف ۴MB", perS == 4, perS)
+        check("ظرفیت: shard از fork بیشتر جا می‌دهد", nS > n, (nS, n))
         n4, _, f4 = M.capacity_estimate(free_mb=None, mode="fork")
         check("ظرفیت: بدونِ خواندنِ حافظه → None بی‌استثنا",
               n4 is None or isinstance(n4, int))
