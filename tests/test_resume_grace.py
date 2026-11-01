@@ -117,6 +117,22 @@ def main():
         sup._grace_until = 0.0
         check("grace_left: بعد از مهلت صفر است", sup.grace_left() == 0.0)
 
+        # ── ۷ب) «چرا روشن نکرد؟» باید در لاگ معلوم باشد ──────────────
+        u_need, u_credit = 1111, 2222
+        for u in (u_need, u_credit):
+            sup.db.x("INSERT OR IGNORE INTO clients(uid, status, created_at, session)"
+                     " VALUES(?,?,?,?)", (u, "active", int(time.time()), "s" * 40), None)
+            sup.db.set(u, want_on=1)
+        sup.db.set(u_need, need_login=1)
+        sup.mark_needs_login(u_need, "کلید باطل")
+        sup.allowed = lambda u: (False, "بدون اعتبار") if u == u_credit else (True, "")
+        srcM = (REPO / "manager_82.py").read_text(encoding="utf-8")
+        check("مدیر: پیامِ دلیلِ ردشدن در boot_all هست", "سرویس بالا نیامد" in srcM)
+        check("مدیر: پیامِ «سرویسی برای بالا آوردن نبود» هست",
+              "سرویسی برای بالا آوردن نبود" in srcM)
+        check("مدیر: مهلت شمارشِ معکوس دارد",
+              "ثانیه مانده" in srcM and "مهلت تمام شد" in srcM)
+
         # ── ۸) پیامِ مهلت در مسیرِ بوت ────────────────────────────────
         src = (REPO / "manager_82.py").read_text(encoding="utf-8")
         check("مدیر: پیامِ «مهلتِ سشن‌ها» در بوت هست",

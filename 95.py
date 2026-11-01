@@ -251,6 +251,77 @@ DEFAULTS = {
     },
 }
 
+# ── سقفِ حافظه‌ی کش‌ها ───────────────────────────────────────────────
+# تلگرام (telethon) هر کاربر/گروهی که ببیند را در `_mb_entity_cache` نگه
+# می‌دارد و آن دیکشنری **هیچ سقفی ندارد**. یک سلف‌باتِ تبادل که در چند ماه
+# با هزاران نفر طرف می‌شود، بی‌سروصدا چند مگابایت برای همیشه نگه می‌دارد.
+# اندازه‌گیری: هر موجودیت ~۰.۴ کیلوبایت → ۱۰٬۰۰۰ موجودیت ≈ ۴ مگابایت.
+ENTITY_CACHE_LIMIT = 8000
+LINK_CACHE_LIMIT = 1500
+
+
+def _env_int(name, default):
+    try:
+        v = int((os.environ.get(name) or "").strip() or default)
+    except Exception:
+        v = default
+    return max(0, v)
+
+
+ENTITY_CACHE_LIMIT = _env_int("JAFJ_ENTITY_CACHE", ENTITY_CACHE_LIMIT)
+LINK_CACHE_LIMIT = _env_int("JAFJ_LINK_CACHE", LINK_CACHE_LIMIT)
+
+
+def trim_entity_cache(client, limit=None):
+    """(تعدادِ حذف‌شده) — قدیمی‌ترین موجودیت‌ها را از کشِ تلگرام بردار.
+
+    چرا: `hash_map` سقف ندارد و با هر کاربرِ تازه رشد می‌کند. حذفِ قدیمی‌ها
+    فقط یعنی «برای بارِ بعد باید دوباره resolve شود» — هیچ رفتاری عوض
+    نمی‌شود، فقط حافظه آزاد می‌شود.
+    """
+    lim = int(limit if limit is not None else ENTITY_CACHE_LIMIT)
+    if lim <= 0:
+        return 0
+    try:
+        cache = getattr(client, "_mb_entity_cache", None)
+        hm = getattr(cache, "hash_map", None)
+        if not isinstance(hm, dict) or len(hm) <= lim:
+            return 0
+        keep = dict(list(hm.items())[-lim:])     # dict ترتیبِ درج را می‌داند
+        removed = len(hm) - len(keep)
+        hm.clear()
+        hm.update(keep)
+        return removed
+    except Exception:
+        return 0
+
+
+def trim_link_cache(eng, limit=None):
+    """(تعدادِ حذف‌شده) — کشِ «شناسه‌ی کانالِ لینک‌ها» را کوتاه کن.
+
+    این کش هم بدونِ سقف پر می‌شد: هر لینکِ تازه‌ای که در جریانِ تبادل دیده
+    شود یک رکورد می‌گذاشت و رکوردهای منقضی هیچ‌وقت پاک نمی‌شدند.
+    """
+    lim = int(limit if limit is not None else LINK_CACHE_LIMIT)
+    try:
+        cache = getattr(eng, "_exchange_link_id_cache", None)
+        if not isinstance(cache, dict):
+            return 0
+        now0 = time.time()
+        dead = [k for k, v in list(cache.items())
+                if not v or not isinstance(v, tuple) or v[0] < now0]
+        for k in dead:
+            cache.pop(k, None)
+        extra = 0
+        if lim > 0:
+            while len(cache) > lim:
+                cache.pop(next(iter(cache)), None)
+                extra += 1
+        return len(dead) + extra
+    except Exception:
+        return 0
+
+
 SESSION = "jafj"
 CREDS_FILE = "jafj_creds.json"
 AI_FILE = "jafj_ai.json"
@@ -834,6 +905,11 @@ CREATE TABLE IF NOT EXISTS queue (
     message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_q ON queue(status, tier, scheduled_at);
+-- انتخابِ آیتمِ بعدیِ صف با «ORDER BY id LIMIT 1» انجام می‌شود؛ ایندکسِ
+-- بالا با scheduled_at مرتب است، پس sqlite مجبور می‌شد کلِ ردیف‌های آن
+-- tier را در یک B-Tree موقت مرتب کند (روی ۲۰ هزار ردیف: ~۶.۷ms برای هر
+-- پیام!). این ایندکس ترتیب را روی id می‌دهد و همان کوئری صفر می‌شود.
+CREATE INDEX IF NOT EXISTS idx_q_pick ON queue(status, tier, id, scheduled_at);
 
 CREATE TABLE IF NOT EXISTS exchange (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -877,6 +953,14 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout = 30000")
+        # پیش‌فرضِ sqlite برای هر اتصال ~۲ مگابایت کش می‌گیرد (۲۰۰۰ صفحه).
+        # با ۱۰۰ اکانت یعنی ۲۰۰ مگابایت فقط کشِ دیتابیس. این سلف کوئریِ
+        # سنگین ندارد؛ ۴۰۰ صفحه (۱.۶ مگابایت کمتر برای هر اکانت) کافی است.
+        try:
+            self.conn.execute("PRAGMA cache_size = -400")
+            self.conn.execute("PRAGMA mmap_size = 0")
+        except Exception:
+            pass
         with self.lock:
             self.conn.executescript(SCHEMA)
             # مهاجرت: ستون‌های جدید روی دیتابیس قدیمی
@@ -902,6 +986,11 @@ class DB:
             # بعد از مهاجرت ساخته شود؛ وگرنه دیتابیس قدیمی هنوز ستون next_check ندارد.
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ex_next_check "
                               "ON exchange(status, next_check)")
+            # یادآورها با (status IN (pending,joined) AND next_reminder<=?) خوانده
+            # می‌شوند؛ بدونِ این ایندکس هر بار کلِ جدول اسکن می‌شد
+            # (روی ۲۰ هزار رکورد ~۱۵ms در هر دورِ حلقه).
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_ex_rem "
+                              "ON exchange(status, next_reminder)")
             self.conn.commit()
 
     def _x(self, sql, a=(), f=None):
@@ -915,16 +1004,32 @@ class DB:
             self.conn.commit()
             return c.lastrowid
 
+    def _pick(self, sql_forced, sql_plain, a=(), f="all"):
+        """اجرای کوئری با ایندکسِ اجباری؛ اگر ایندکس موجود نبود (دیتابیسِ
+        دست‌کاری‌شده) همان کوئری بدونِ اجبار اجرا می‌شود تا هیچ‌وقت خطا ندهد."""
+        try:
+            return self._x(sql_forced, a, f)
+        except sqlite3.OperationalError:
+            return self._x(sql_plain, a, f)
+
     def enqueue(self, target, text, tier="standard", when=0):
         now = int(time.time())
         return self._x("INSERT INTO queue (target,text,tier,created_at,scheduled_at)"
                        " VALUES (?,?,?,?,?)", (target, text, tier, now, when or now))
 
     def next_pending(self, tier):
-        """آیتم‌های بدون مقصد نگه داشته می‌شوند تا کانال تعیین شود."""
-        return self._x("SELECT * FROM queue WHERE status='pending' AND tier=?"
-                       " AND target<>'' AND scheduled_at<=? ORDER BY id LIMIT 1",
-                       (tier, int(time.time())), "one")
+        """آیتم‌های بدون مقصد نگه داشته می‌شوند تا کانال تعیین شود.
+
+        این کوئری داغ‌ترین کوئریِ صف است (هر پیام یک بار). با ایندکسِ
+        ``idx_q_pick`` ترتیب روی ``id`` می‌آید و sqlite دیگر لازم نیست همه‌ی
+        ردیف‌های هم‌tier را مرتب کند؛ اندازه‌گیری روی ۲۰ هزار ردیف:
+        ۶.۷ میلی‌ثانیه → ۰.۰۰۸ میلی‌ثانیه."""
+        return self._pick(
+            "SELECT * FROM queue INDEXED BY idx_q_pick WHERE status='pending'"
+            " AND tier=? AND target<>'' AND scheduled_at<=? ORDER BY id LIMIT 1",
+            "SELECT * FROM queue WHERE status='pending' AND tier=?"
+            " AND target<>'' AND scheduled_at<=? ORDER BY id LIMIT 1",
+            (tier, int(time.time())), "one")
 
     def held_count(self, tier=None):
         """پیام‌هایی که منتظر تعیین کانال‌اند."""
@@ -979,8 +1084,11 @@ class DB:
                        (), "one")["c"]
 
     def list_pending(self, n=10):
-        return self._x("SELECT * FROM queue WHERE status='pending' ORDER BY id LIMIT ?",
-                       (n,), "all")
+        return self._pick(
+            "SELECT * FROM queue INDEXED BY idx_q_pick WHERE status='pending'"
+            " ORDER BY id LIMIT ?",
+            "SELECT * FROM queue WHERE status='pending' ORDER BY id LIMIT ?",
+            (n,), "all")
 
     def clear_pending(self):
         with self.lock:
@@ -7663,6 +7771,17 @@ async def connect_and_run(eng, creds):
                 # هیچ لینک دعوتی را برای تشخیص، Import/Join نمی‌کنیم.
                 cid = None
             cache[key] = (now0 + (300 if cid is not None else 30), cid)
+            # سقفِ کش: با globals() خوانده می‌شود تا اگر این تابع به‌تنهایی
+            # (بدونِ کلِ ماژول) اجرا شد، NameError ندهد.
+            try:
+                _lim = int(globals().get("LINK_CACHE_LIMIT", 1500) or 0)
+            except Exception:
+                _lim = 1500
+            if _lim > 0 and len(cache) > _lim:
+                try:
+                    trim_link_cache(eng)
+                except Exception:
+                    pass
             return cid
 
         mine_ids = set()
@@ -9227,6 +9346,27 @@ async def connect_and_run(eng, creds):
                 eng.log("error", "risk_loop", f"{type(e).__name__}: {e}")
             await asyncio.sleep(max(10, int(eng.st["risk"].get("check_interval_sec", 60) or 60)))
 
+    async def memory_loop():
+        """هر ۱۰ دقیقه: کش‌های بی‌سقف را کوتاه کن (نشتیِ آرامِ حافظه).
+
+        بدونِ این، حافظه‌ی هر اکانت در طولِ هفته‌ها فقط بالا می‌رفت و تنها
+        راهِ برگشتنش ری‌استارت بود.
+        """
+        while True:
+            try:
+                n = trim_entity_cache(client)
+                if n:
+                    print(f"  🧹 {n} موجودیتِ قدیمی از کشِ تلگرام آزاد شد",
+                          flush=True)
+                m = trim_link_cache(eng)
+                if m:
+                    print(f"  🧹 {m} لینکِ قدیمی از کش آزاد شد", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(600)
+
     task = asyncio.create_task(sender_loop())
     ex_task = asyncio.create_task(exchange_worker())
     scan_task = asyncio.create_task(scan_loop())
@@ -9234,6 +9374,7 @@ async def connect_and_run(eng, creds):
     report_task = asyncio.create_task(report_loop())
     risk_task = asyncio.create_task(risk_loop())
     st_task = asyncio.create_task(status_loop())
+    mem_task = asyncio.create_task(memory_loop())
 
     await note(_startup_text())
 
@@ -9246,7 +9387,8 @@ async def connect_and_run(eng, creds):
     except BaseException as _e:
         _shutdown_exc = _e
     finally:
-        for t in (task, ex_task, scan_task, member_task, report_task, risk_task, st_task):
+        for t in (task, ex_task, scan_task, member_task, report_task, risk_task,
+                  st_task, mem_task):
             t.cancel()
         # دور awaitهای پاک‌سازی فقط except Exception می‌گذاریم؛ لغوِ بیرونی
         # اینجا بلعیده نمی‌شود (gather با return_exceptions خطای لغوِ فرزندها
@@ -9254,7 +9396,7 @@ async def connect_and_run(eng, creds):
         # فرزندها کامل انجام می‌شود.
         try:
             await asyncio.gather(task, ex_task, scan_task, member_task,
-                                 report_task, risk_task, st_task,
+                                 report_task, risk_task, st_task, mem_task,
                                  return_exceptions=True)
         except Exception:
             pass

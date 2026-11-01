@@ -465,6 +465,29 @@ def manager_argv():
     return [str(CODE_DIR / MANAGER_NAME)], str(CODE_DIR), "manager_82.py (بدون supervisor)"
 
 
+def warm_bytecode(py):
+    """فایل‌های بزرگ را یک بار کامپایل کن تا `__pycache__` آماده باشد.
+
+    چرا: کامپایلِ `manager_82.py` (۹۲۱ کیلوبایت) به‌تنهایی ~۲۷ مگابایت
+    حافظه‌ی موقت می‌گیرد. روی سرورِ ۵۱۲ مگابایتی همین می‌تواند لحظه‌ی بوت
+    را به OOM بکشاند. با بایت‌کدِ آماده، مدیر با ~۱۷ مگابایت بالا می‌آید.
+    هزینه: یک بار، چند ثانیه.
+    """
+    targets = [p for p in (CODE_DIR / "manager_82.py", CODE_DIR / "95.py",
+                           CODE_DIR / "jafj_forkd.py", CODE_DIR / "jafj_shardd.py")
+               if p.is_file()]
+    if not targets:
+        return
+    try:
+        r = subprocess.run([str(py), "-m", "compileall", "-q", "-j", "1"]
+                           + [str(t) for t in targets],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode == 0:
+            log("بایت‌کد آماده شد (کمک به مصرفِ حافظه‌ی بوت)")
+    except Exception:
+        pass
+
+
 def start_manager(py, env):
     argv, cwd, label = manager_argv()
     if dry_run(env):
@@ -787,6 +810,7 @@ def main():
         log("حالتِ بررسی (--check): اجرا نمی‌کنم.")
         boot_listener_stop()
         return 0
+    warm_bytecode(py)
     m = mode()
     log(f"code={CODE_DIR} data={env['DATA_DIR']} python={py} "
         f"mode={m} port={env['PORT']}")

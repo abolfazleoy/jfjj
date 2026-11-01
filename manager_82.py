@@ -3586,19 +3586,368 @@ class _AdoptedProc:
     کار می‌کنند و نسخه‌ی دومِ سلف اجرا نمی‌شود.
     """
 
-    def __init__(self, pid):
+    def __init__(self, pid, daemon=None):
         self.pid = int(pid)
+        self.daemon = daemon            # برای خواندنِ کدِ خروجِ واقعی
+        self.returncode = None
+
+    def _exit_code(self, default=1):
+        """کدِ خروج را از دیمنِ fork بگیر (۷۶ تکراری، ۷۷ سوخته، ۷۸ لاگین)."""
+        try:
+            if self.daemon is not None:
+                self.daemon.drain()
+                code = self.daemon.exits.get(self.pid)
+                if isinstance(code, int):
+                    return code
+        except Exception:
+            pass
+        return default
 
     def poll(self):
         try:
             os.kill(self.pid, 0)
-            return None
         except ProcessLookupError:
-            return 1
+            self.returncode = self._exit_code()
+            return self.returncode
         except PermissionError:
-            return None
+            pass
         except Exception:
-            return 1
+            self.returncode = self._exit_code()
+            return self.returncode
+        # پروسه‌ی زامبی (مرده ولی جمع‌نشده) هم «مرده» است؛ وگرنه سلفی که با
+        # fork اجرا شده و مرده، برای همیشه «زنده» شمرده می‌شود.
+        try:
+            with open(f"/proc/{self.pid}/stat", encoding="utf-8") as f:
+                if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
+                    self.returncode = self._exit_code()
+                    return self.returncode
+        except Exception:
+            pass
+        return None
+
+    def kill(self):
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+
+class ForkDaemon:
+    """کلاینتِ `jafj_forkd.py` — سلف‌ها با حافظه‌ی مشترک.
+
+    چرا: هر سلفِ جدا `import telethon` را تکرار می‌کند (~۴۰ مگابایت). با
+    fork از یک والدِ مشترک، آن ۴۰ مگابایت یک‌بار در رم می‌نشیند و بینِ همه
+    شریک می‌شود (copy-on-write). برای ۱۰۰ اکانت تفاوتِ چند گیگابایت است.
+
+    رابطش عمداً همان چیزی است که Supervisor از یک پروسه می‌خواهد: pid و poll.
+    """
+
+    def __init__(self, selfbot=None, python=None):
+        self.python = python or sys.executable
+        self.selfbot = selfbot or SELFBOT
+        self.proc = None
+        self._buf = b""
+        self._lock = threading.Lock()
+        self.last_error = ""
+        self.exits = {}                 # pid → کدِ خروج (از رویدادهای دیمن)
+
+    def forker_path(self):
+        d = os.path.dirname(os.path.abspath(self.selfbot))
+        cand = os.path.join(d, "jafj_forkd.py")
+        if os.path.isfile(cand):
+            return cand
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "jafj_forkd.py")
+
+    def alive(self):
+        return bool(self.proc is not None and self.proc.poll() is None)
+
+    def start(self, timeout=90):
+        if self.alive():
+            return True
+        path = self.forker_path()
+        if not os.path.isfile(path):
+            self.last_error = f"jafj_forkd.py پیدا نشد ({path})"
+            return False
+        try:
+            _env = dict(os.environ)
+            _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
+            self.proc = subprocess.Popen(
+                [self.python, path, "--selfbot", os.path.abspath(self.selfbot)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, env=_env,
+                start_new_session=True)
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return False
+        msg = self._read_until({"event": "ready"}, timeout=timeout)
+        if msg is None:
+            self.last_error = "دیمن آماده نشد (timeout)"
+            return False
+        return True
+
+    def _send(self, obj):
+        self.proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n")
+                              .encode("utf-8"))
+        self.proc.stdin.flush()
+
+    def _read_msg(self, timeout):
+        end = time.time() + max(0.0, timeout)
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl >= 0:
+                line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+                try:
+                    msg = json.loads(line.decode("utf-8", "ignore"))
+                except Exception:
+                    continue
+                if isinstance(msg, dict) and msg.get("event") == "exit":
+                    # ۷۶ = نسخه‌ی تکراری، ۷۷ = کلیدِ سوخته، ۷۸ = نیاز به لاگین
+                    try:
+                        self.exits[int(msg.get("pid"))] = msg.get("code")
+                    except Exception:
+                        pass
+                    continue
+                return msg
+            left = end - time.time()
+            if left <= 0 or not self.alive():
+                return None
+            try:
+                import select
+                r, _, _ = select.select([self.proc.stdout], [], [], left)
+                if not r:
+                    return None
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+    def drain(self, timeout=0.02):
+        """رویدادهای معلق را بخوان (کدِ خروجِ فرزندها را ذخیره می‌کند)."""
+        while True:
+            msg = self._read_msg(timeout)
+            if msg is None:
+                return
+
+    def _read_until(self, want, timeout=30):
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._read_msg(max(0.1, end - time.time()))
+            if msg is None:
+                return None
+            if all(msg.get(k) == v for k, v in want.items()):
+                return msg
+        return None
+
+    def _read_ok(self, timeout=30, skip_events=True):
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._read_msg(max(0.1, end - time.time()))
+            if msg is None:
+                return None
+            if "ok" in msg:
+                return msg
+            if not skip_events:
+                return msg
+        return None
+
+    def spawn(self, cwd, log, uid, timeout=60):
+        """(pid, خطا) — فرزندِ تازه با cwd پوشه‌ی همان اکانت."""
+        with self._lock:
+            if not self.start():
+                return None, self.last_error or "دیمن بالا نیامد"
+            try:
+                self._send({"cmd": "run", "cwd": str(cwd), "log": str(log),
+                            "uid": str(uid)})
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
+            msg = self._read_ok(timeout=timeout)
+            if not msg or not msg.get("ok"):
+                return None, (msg or {}).get("error") or "پاسخِ دیمن نیامد"
+            try:
+                return int(msg["pid"]), ""
+            except Exception:
+                return None, "pid نامعتبر"
+
+    def close(self):
+        try:
+            if self.alive():
+                self._send({"cmd": "quit"})
+        except Exception:
+            pass
+        try:
+            if self.alive():
+                self.proc.terminate()
+        except Exception:
+            pass
+
+
+# پیش‌فرض ۱۶: هر پروسه‌ی شارد ~۶۷MB پایه دارد (اندازه‌گیری‌شده)، پس
+# شاردهای کوچکِ زیاد گران‌تر از یک شاردِ بزرگ‌اند. ۴ شارد × ۲ اکانت = ۲۶۷MB
+# در حالی که ۱ شارد × ۲۴ اکانت = ۸۲MB.
+SHARD_SIZE = 16         # پیش‌فرض؛ با JAFJ_SHARD_SIZE عوض می‌شود
+
+
+def shard_size(env=None):
+    """چند اکانت در یک پروسه‌ی shard (۱ تا ۶۴)."""
+    e = env if env is not None else os.environ
+    try:
+        v = int((e.get("JAFJ_SHARD_SIZE") or "").strip() or SHARD_SIZE)
+    except Exception:
+        v = SHARD_SIZE
+    return max(1, min(64, v))
+
+
+class ShardDaemon(ForkDaemon):
+    """چند اکانت در یک پروسه (`jafj_shardd.py`).
+
+    حافظه‌ی اندازه‌گیری‌شده: fork ~۱۱.۲MB برای هر اکانت، shard ~۳.۳MB.
+    بهایش: یک پروسه = یک نقطه‌ی شکست، پس اندازه‌اش کوچک نگه داشته می‌شود.
+    """
+
+    def __init__(self, selfbot=None, python=None, size=None):
+        ForkDaemon.__init__(self, selfbot, python)
+        self.size = int(size or shard_size())
+        self.uids = {}                  # uid → pid (همیشه pid این پروسه)
+
+    def forker_path(self):
+        d = os.path.dirname(os.path.abspath(self.selfbot))
+        for base in (d, os.path.dirname(os.path.abspath(__file__))):
+            cand = os.path.join(base, "jafj_shardd.py")
+            if os.path.isfile(cand):
+                return cand
+        return os.path.join(d, "jafj_shardd.py")
+
+    def start(self, timeout=120):
+        if self.alive():
+            return True
+        path = self.forker_path()
+        if not os.path.isfile(path):
+            self.last_error = f"jafj_shardd.py پیدا نشد ({path})"
+            return False
+        try:
+            _env = dict(os.environ)
+            _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
+            self.proc = subprocess.Popen(
+                [self.python, path, "--selfbot", os.path.abspath(self.selfbot),
+                 "--max-accounts", str(self.size)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, env=_env,
+                start_new_session=True)
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return False
+        msg = self._read_until({"event": "ready"}, timeout=timeout)
+        if msg is None:
+            self.last_error = "شارد آماده نشد (timeout)"
+            return False
+        return True
+
+    def room(self):
+        return max(0, self.size - len(self.uids))
+
+    def spawn(self, cwd, log, uid, timeout=90):
+        if not self.alive():
+            self.uids.clear()
+        with self._lock:
+            if not self.start():
+                return None, self.last_error or "شارد بالا نیامد"
+            try:
+                self._send({"cmd": "run", "cwd": str(cwd), "log": str(log),
+                            "uid": str(uid)})
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
+            msg = self._read_ok(timeout=timeout)
+            if not msg or not msg.get("ok"):
+                return None, (msg or {}).get("error") or "پاسخِ شارد نیامد"
+            self.uids[str(uid)] = int(msg.get("pid") or 0)
+            return self.uids[str(uid)], ""
+
+    def alive_uid(self, uid):
+        """آیا این اکانت داخلِ شارد زنده است؟ (کدِ خروج = returncode)"""
+        uid = str(uid)
+        self.drain()
+        if not self.alive():
+            return None if uid in self.exits else False
+        with self._lock:
+            try:
+                self._send({"cmd": "ping"})
+            except Exception:
+                return False
+            end = time.time() + 5
+            while time.time() < end:
+                msg = self._read_msg(max(0.1, end - time.time()))
+                if msg is None:
+                    break
+                if msg.get("ok") and "accounts" in msg:
+                    return uid in [str(x) for x in msg.get("accounts") or []]
+        return False
+
+    def stop_uid(self, uid, timeout=40):
+        uid = str(uid)
+        with self._lock:
+            if not self.alive():
+                self.uids.pop(uid, None)
+                return True
+            try:
+                self._send({"cmd": "stop", "uid": uid})
+            except Exception:
+                return False
+            end = time.time() + timeout
+            while time.time() < end:
+                msg = self._read_msg(max(0.1, end - time.time()))
+                if msg is None:
+                    break
+                if msg.get("uid") == uid and "ok" in msg:
+                    ok = bool(msg.get("ok"))
+                    if not ok:
+                        # رشته نمرد → کلِ شارد را ببند (بقیه ری‌استارت می‌شوند)
+                        try:
+                            self.proc.terminate()
+                        except Exception:
+                            pass
+                    self.uids.pop(uid, None)
+                    return True
+        self.uids.pop(uid, None)
+        return False
+
+
+class _ShardProc:
+    """دستگیره‌ی یک اکانت داخلِ شارد — مثلِ Popen اما محدود به همان اکانت."""
+
+    def __init__(self, pid, daemon, uid):
+        self.pid = int(pid)
+        self.daemon = daemon
+        self.uid = str(uid)
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        a = self.daemon.alive_uid(self.uid)
+        if a is True:
+            return None
+        self.returncode = self.daemon.exits.get(int(self.pid))
+        if not isinstance(self.returncode, int):
+            self.returncode = 1
+        return self.returncode
+
+    def terminate(self):
+        self.daemon.stop_uid(self.uid)
+
+    def kill(self):
+        self.daemon.stop_uid(self.uid)
+
+    def remote_stop(self):
+        return self.daemon.stop_uid(self.uid)
 
 
 # ═══════════════════════════════════════════════════
@@ -3748,6 +4097,9 @@ def selfbot_failure_text(msg, tail="", folder="", limit=1000):
 #  بیشتر شود. با JAFJ_RESUME_DELAY=0 یا JAFJ_NO_RESUME_DELAY=1 خاموش است.
 RESUME_AT_NAME = ".jafj_resume_at"
 LAST_EXIT_NAME = ".jafj_last_exit"
+HEARTBEAT_NAME = ".jafj_heartbeat"       # «اجرای قبلی چطور مرد؟»
+HEARTBEAT_EVERY = 60
+RAM_GATE_MB = 60                         # زیرِ این مقدار، سلفِ تازه بالا نمی‌آید
 HARD_EXIT_CODES = (137, 143, -9, 9)      # SIGKILL/OOM، SIGTERM، kill
 RECENT_CONNECT_WINDOW = 180              # ثانیه
 MAX_GRACE = 900
@@ -3805,6 +4157,253 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
         why = (f"آخرین اتصالِ سشن‌ها فقط {int(age)} ثانیه پیش بود — "
                "شاید نسخه‌ی قبلی هنوز زنده است")
     return float(min(float(MAX_GRACE), base)), why
+
+
+# ═══════════════════════════════════════════════════
+#  ضربانِ قلب — «دیروز داشت کار می‌کرد، یهو سرور آفلاین شد» چرا؟
+#
+#  وقتی کانتینر با کمبودِ حافظه (OOM) یا با Stopِ پنل کشته می‌شود، هیچ
+#  کدی اجرا نمی‌شود؛ پس نه crash.log، نه .jafj_last_exit، هیچ‌چیز نمی‌ماند
+#  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
+#  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
+#  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def total_ram_mb():
+    """کلِ حافظه‌ی دستگاه (MB) از /proc/meminfo — None اگر معلوم نشد."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+# زیرِ این مقدار حافظه، پیش‌فرض «shard» می‌شود: در fork هر اکانت ~۱۱MB
+# سربارِ پروسه دارد و برای یک سرورِ ۵۱۲ مگابایتی یعنی ۵۰ اکانت کمتر.
+AUTO_SHARD_BELOW_MB = 1536.0
+
+
+def fork_supported():
+    """آیا این سیستم fork واقعی دارد؟ (لینوکس بله، ویندوز نه)"""
+    try:
+        return bool(hasattr(os, "fork") and os.path.isdir("/proc/self"))
+    except Exception:
+        return False
+
+
+def spawn_mode(env=None):
+    """«fork» (پیش‌فرض) یا «process» — به‌ترتیب با حافظه‌ی مشترک/جدا.
+
+    پیش‌فرض عمداً fork است: بدونِ این، هر اکانت یک نسخه‌ی کاملِ telethon
+    (~۴۰ مگابایت) جدا می‌خورد. کسی که رفتارِ قدیمی را می‌خواهد
+    `JAFJ_SPAWN_MODE=process` بگذارد؛ روی ویندوز/بدونِ fork خودکار
+    process می‌شود.
+    """
+    e = env if env is not None else os.environ
+    v = (e.get("JAFJ_SPAWN_MODE") or "").strip().lower()
+    if v in ("process", "proc", "off", "0", "no", "جدا", "جداگانه"):
+        return "process"
+    if v in ("shard", "shards", "sharded", "share-proc", "shard-proc",
+             "شارد", "یک‌پروسه"):
+        return "shard" if fork_supported() else "process"
+    if v in ("fork", "forked", "shared", "share", "1", "on", "yes", "اشتراکی"):
+        return "fork" if fork_supported() else "process"
+    if not fork_supported():
+        return "process"
+    # پیش‌فرضِ خودکار: روی ماشین‌های کم‌حافظه shard (هر اکانت ~۳.۳MB)،
+    # روی بقیه fork (هر اکانت یک پروسه‌ی جدا، خطاها کاملاً جدا).
+    total = None
+    try:
+        raw = (e.get("JAFJ_TOTAL_MB") or "").strip()
+        total = float(raw) if raw else total_ram_mb()
+    except Exception:
+        total = None
+    if total is not None and total <= AUTO_SHARD_BELOW_MB:
+        return "shard"
+    return "fork"
+
+
+# مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:
+# «process» = یک پروسه برای هر اکانت، «fork» = حافظه‌ی مشترک (WISPBYTE_FA §۱۲).
+# fork: اندازه‌گیریِ پله‌ای ۱ تا ۸ اکانت → هر اکانتِ اضافه ۱۱.۲MB.
+PER_ACCOUNT_MB = {"shard": 3, "fork": 12, "process": 62}
+# هزینه‌ی پایه‌ی هر **پروسه** (اندازه‌گیری‌شده): هر پروسه‌ای که `telethon` را
+# لود می‌کند ~۶۷MB PSS می‌گیرد و این بینِ پروسه‌ها **مشترک نمی‌شود**.
+# پس تعدادِ پروسه‌ها از تعدادِ اکانت‌ها مهم‌تر است:
+#   ۱ شارد × ۲۴ اکانت = ۸۲MB   ولی   ۴ شارد × ۲ اکانت = ۲۶۷MB
+PROC_BASE_MB = {"shard": 67, "fork": 70, "process": 62}
+MANAGER_MB = 20              # مدیر در حالتِ پایدار ~۱۷MB (اندازه‌گیری‌شده)
+RAM_RESERVE_MB = 96          # برای دیتابیس، پشتیبان و OS
+
+
+def capacity_estimate(free_mb=None, mode=None, reserve_mb=None, size=None):
+    """(چند اکانت جا می‌شود, مصرفِ هر اکانت, حافظه‌ی آزاد).
+
+    مدلِ اندازه‌گیری‌شده:
+
+        process : n × ۶۲MB
+        fork    : ۷۰MB (دیمن + اکانتِ اول) + (n−۱) × ۱۲MB
+        shard   : ceil(n/size) پروسه × ۶۷MB + n × ۳MB
+
+    نکته‌ی مهم: چون هر **پروسه** ~۶۷MB پایه دارد، در shard تعدادِ پروسه
+    (یعنی `JAFJ_SHARD_SIZE`) تعیین‌کننده است، نه تعدادِ اکانت.
+    """
+    m = mode or spawn_mode()
+    per = PER_ACCOUNT_MB.get(m, PER_ACCOUNT_MB["process"])
+    base = PROC_BASE_MB.get(m, PROC_BASE_MB["process"])
+    res = RAM_RESERVE_MB if reserve_mb is None else float(reserve_mb)
+    if free_mb is None:
+        try:
+            free_mb = mem_available_mb()
+        except Exception:
+            free_mb = None
+    if free_mb is None:
+        return None, per, None
+    try:
+        usable = float(free_mb) - float(res) - MANAGER_MB
+    except Exception:
+        return None, per, None
+    if usable <= 0:
+        return 0, per, float(free_mb)
+    if m == "process":
+        return int(usable // per), per, float(free_mb)
+    if m == "fork":
+        if usable <= base:
+            return 0, per, float(free_mb)
+        return int(1 + (usable - base) // per), per, float(free_mb)
+    # shard: پرکردنِ پشتِ‌سرِهمِ شاردها
+    sz = int(size or shard_size())
+    sz = max(1, sz)
+    n, shards = 0, 1
+    while n < 100000:
+        nxt = n + 1
+        need_shards = -(-nxt // sz)             # ceil
+        if nxt * per + need_shards * base > usable:
+            break
+        n, shards = nxt, need_shards
+    return n, per, float(free_mb)
+
+
+def proc_pss_mb(pid):
+    """سهمِ واقعیِ یک پروسه از حافظه (MB) از /proc/PID/smaps_rollup.
+
+    چرا PSS و نه RSS: با fork، صفحه‌های مشترک در RSSِ **هر** فرزند کامل
+    حساب می‌شوند؛ یعنی ۱۰۰ اکانت با RSS «۸ گیگ» نشان می‌دهند در حالی که
+    واقعاً ~۱ گیگ برده‌اند. PSS سهمِ هر پروسه از صفحه‌های مشترک را تقسیم
+    می‌کند — همان عددی که کرنل/کنترل‌پنل حساب می‌کند.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/smaps_rollup", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
+def proc_rss_mb(pid):
+    """حافظه‌ی واقعیِ یک پروسه (MB) از /proc — None اگر نبود."""
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
+def ram_gate_mb(env=None):
+    """حدِ حافظه‌ی آزادِ لازم برای روشن‌کردنِ سلفِ بعدی (۰ = بی‌نگهبان).
+
+    چرا: هر سلف (telethon + asyncio + sqlite) حدودِ ۶۰-۹۰ مگابایت است. وقتی
+    حافظه‌ی آزاد ته می‌کشد، کرنل کلِ کانتینر را می‌کشد و «سرور آفلاین»
+    می‌شود — یعنی به‌جای یک سرویسِ کم، همه می‌خوابند. بهتر است سلفِ تازه
+    بالا نیاید و دلیلش را بگوید.
+    """
+    e = env if env is not None else os.environ
+    try:
+        v = float((e.get("JAFJ_MIN_FREE_MB") or "").strip() or RAM_GATE_MB)
+    except Exception:
+        v = float(RAM_GATE_MB)
+    return max(0.0, min(8192.0, v))
+
+
+def ram_gate_check(env=None):
+    """(اجازه؟, حافظه‌ی آزاد, حد) — فقط‌خواندنی و بی‌خطر."""
+    limit = ram_gate_mb(env)
+    if limit <= 0:
+        return True, None, 0.0
+    try:
+        free = mem_available_mb()
+    except Exception:
+        free = None
+    if free is None:
+        return True, None, limit        # نمی‌دانیم → مانع نشو
+    return (float(free) >= limit), float(free), limit
+
+
+def write_heartbeat(data_dir, extra=None):
+    """(فایلِ ضربان) — ارزان و بی‌خطر؛ هر خطایی بلعیده می‌شود."""
+    rec = {"ts": time.time(), "pid": os.getpid()}
+    try:
+        rec["free"] = mem_available_mb()
+    except Exception:
+        rec["free"] = None
+    if isinstance(extra, dict):
+        rec.update(extra)
+    try:
+        path = os.path.join(str(data_dir), HEARTBEAT_NAME)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        os.replace(tmp, path)
+        return rec
+    except Exception:
+        return rec
+
+
+def read_heartbeat(data_dir):
+    return _read_json_soft(os.path.join(str(data_dir), HEARTBEAT_NAME))
+
+
+def last_death_report(data_dir, now_ts=None):
+    """متنِ «اجرای قبلی چطور تمام شد» ("" = چیزی برای گفتن نیست)."""
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    hb = read_heartbeat(data_dir)
+    try:
+        hb_ts = float(hb.get("ts") or 0)
+    except Exception:
+        hb_ts = 0.0
+    if hb_ts <= 0:
+        return ""
+    ex = _read_json_soft(os.path.join(str(data_dir), LAST_EXIT_NAME))
+    try:
+        ex_ts = float(ex.get("ts") or 0)
+    except Exception:
+        ex_ts = 0.0
+    try:
+        ex_code = int(ex.get("code"))
+    except Exception:
+        ex_code = None
+    age = int(max(0, now_ts - hb_ts))
+    clean = ex_ts >= (hb_ts - 5)
+    free = hb.get("free")
+    clients = hb.get("clients")
+    hardy = f"حافظه‌ی آزاد {free}MB، {clients} سلف روشن"
+    if clean and ex_code not in HARD_EXIT_CODES:
+        if age > 600:
+            return (f"ℹ️ سرویس حدودِ {age // 60} دقیقه خاموش بود (خروجِ "
+                    f"ثبت‌شده: code={ex_code}).")
+        return ""
+    if clean:
+        return (f"🧯 اجرای قبلی با کدِ {ex_code} تمام شد (SIGKILL/OOM یا "
+                f"کشته‌شدنِ پروسه) — آخرین ضربان {age} ثانیه پیش ({hardy}).")
+    return (f"🧯 اجرای قبلی **بدونِ خروجِ تمیز** تمام شد — آخرین ضربان "
+            f"{age} ثانیه پیش ({hardy}). یعنی پروسه ناگهانی کشته شده؛ "
+            "معمولاً کمبودِ حافظه (OOM) یا Stop از پنل.")
 
 
 class Supervisor:
@@ -4524,6 +5123,22 @@ class Supervisor:
                 self.db.log(uid, "deps_missing", f"python={sys.executable}")
             except Exception:
                 pass
+        # ── نگهبانِ حافظه: با RAMِ ته‌کشیده سلفِ تازه بالا نیاید ──
+        # (وگرنه OOM کلِ کانتینر را می‌خوابانَد و همه‌ی سرویس‌ها می‌روند)
+        _ok_ram, _free, _limit = ram_gate_check()
+        if not _ok_ram:
+            try:
+                self.db.log(uid, "ram_gate", f"free={_free} limit={_limit}")
+            except Exception:
+                pass
+            return self._why(
+                uid, "manager",
+                f"حافظه‌ی آزاد کافی نیست: {int(_free)} مگابایت "
+                f"(حدِ لازم {int(_limit)}). سلف‌های دیگر را خاموش کن یا "
+                "پلن/سقفِ حافظه را بالا ببر — وگرنه کلِ سرور با OOM خاموش "
+                "می‌شود و همه‌ی سرویس‌ها می‌افتند. "
+                "(خاموش‌کردنِ نگهبان: JAFJ_MIN_FREE_MB=0)",
+                hint="کمبودِ حافظه")
         logf = open(os.path.join(folder, "run.log"), "a", encoding="utf-8")
         # هدرِ کامل: بدونِ این، «چرا بالا نیامد» فقط با آزمون و خطا فهمیده
         # می‌شد. حالا خودِ لاگ می‌گوید با چه مفسر/مسیری اجرا شده.
@@ -4540,11 +5155,44 @@ class Supervisor:
             # سشن معتبر نباشد با کدِ ۷۸ خارج می‌شود و ما علامت می‌زنیم.
             _env = dict(os.environ)
             _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
-            p = subprocess.Popen(
-                [sys.executable, SELFBOT],
-                cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, env=_env,
-                start_new_session=True)
+            p = None
+            if spawn_mode() == "shard" and not getattr(self, "_shard_broken", False):
+                # چند اکانت در یک پروسه: ~۳.۳MB به‌ازای هر اکانت (fork: ~۱۱.۲)
+                _sd = self.pick_shard()
+                _pid, _err = _sd.spawn(
+                    folder, os.path.join(folder, "run.log"), uid)
+                if _pid:
+                    p = _ShardProc(_pid, _sd, uid)
+                else:
+                    self._shard_broken = True
+                    try:
+                        print(f"  ⚠️ شارد برای {uid} نشد ({_err}) — از این به "
+                              "بعد با پروسه‌ی fork اجرا می‌کنم", flush=True)
+                    except Exception:
+                        pass
+            if (spawn_mode() == "fork" or getattr(self, "_shard_broken", False)) \
+                    and p is None and not getattr(self, "_fork_broken", False):
+                # حافظه‌ی تلگرام بینِ همه‌ی اکانت‌ها مشترک می‌شود (COW).
+                _pid, _err = self.fork_daemon().spawn(
+                    folder, os.path.join(folder, "run.log"), uid)
+                if _pid:
+                    p = _AdoptedProc(_pid, self.fork_daemon())
+                else:
+                    # یک بار شکست کافی است: وگرنه هر اکانت ۶۰ ثانیه معطلِ
+                    # timeout می‌شود و هیچ‌کس بالا نمی‌آید.
+                    self._fork_broken = True
+                    try:
+                        print(f"  ⚠️ fork برای {uid} نشد ({_err}) — از این به "
+                              "بعد با پروسه‌ی جدا اجرا می‌کنم تا معطل نشود",
+                              flush=True)
+                    except Exception:
+                        pass
+            if p is None:
+                p = subprocess.Popen(
+                    [sys.executable, SELFBOT],
+                    cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, env=_env,
+                    start_new_session=True)
         except Exception as e:
             try:
                 logf.close()
@@ -4641,6 +5289,17 @@ class Supervisor:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             return True, "خاموش بود"
+        if hasattr(p, "remote_stop"):
+            # اکانتِ داخلِ shard: کشتنِ گروهِ پروسه یعنی کشتنِ همه‌ی اکانت‌های
+            # همان شارد. باید از خودِ شارد بخواهیم فقط همین یکی را ببندد.
+            try:
+                p.remote_stop()
+            except Exception:
+                pass
+            self.procs.pop(uid, None)
+            self._clear_pid(uid)
+            self.db.log(uid, "stop")
+            return True, "خاموش شد"
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except Exception:
@@ -4811,6 +5470,58 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def shard_pool(self):
+        """شاردهای ساخته‌شده (هر کدام چند اکانت)."""
+        pool = getattr(self, "_shards", None)
+        if pool is None:
+            pool = []
+            self._shards = pool
+        return pool
+
+    def pick_shard(self):
+        """شاردی که جا دارد؛ اگر همه پر بودند یکی تازه بساز."""
+        for d in self.shard_pool():
+            try:
+                if d.alive() and d.room() > 0:
+                    return d
+            except Exception:
+                continue
+        d = ShardDaemon(SELFBOT)
+        self.shard_pool().append(d)
+        return d
+
+    def fork_daemon(self):
+        """دیمنِ fork (یک‌بار ساخته می‌شود)."""
+        d = getattr(self, "_forkd", None)
+        if d is None:
+            d = ForkDaemon(SELFBOT)
+            self._forkd = d
+        return d
+
+    def children_rss(self):
+        """[(uid, pid, MB)] برای سلف‌های روشن + مجموع. برای گزارشِ حافظه."""
+        out = []
+        for uid, p in list(getattr(self, "procs", {}).items()):
+            try:
+                if p is None or p.poll() is not None:
+                    continue
+                if getattr(p, "daemon", None) is not None and hasattr(p, "uid"):
+                    # چند اکانت یک پروسه‌اند: PSSِ شارد را بین‌شان تقسیم کن،
+                    # وگرنه ۸ اکانت هر کدام «۷۶MB» نشان می‌دهند.
+                    _d = p.daemon
+                    _n = max(1, len(getattr(_d, "uids", {}) or {}))
+                    _tot = proc_pss_mb(p.pid) or proc_rss_mb(p.pid) or 0.0
+                    out.append((uid, p.pid, round(_tot / _n, 1)))
+                    continue
+                mb = proc_pss_mb(p.pid)
+                if mb is None:
+                    mb = proc_rss_mb(p.pid)
+                if mb is not None:
+                    out.append((uid, p.pid, mb))
+            except Exception:
+                continue
+        return out
+
     def mark_connected(self, uid=None):
         """زمانِ آخرین «وصل‌کردنِ سشن» را روی دیسک بنویس.
 
@@ -4948,16 +5659,40 @@ class Supervisor:
         دست نمی‌خورد تا بوتِ دوباره (بعد از بازیابی) آن را بی‌دلیل قطع نکند.
         """
         n = skipped = 0
+        try:
+            _mode = spawn_mode()
+        except Exception:
+            _mode = "process"
+        if _mode == "fork":
+            print("  🧠 حالتِ اجرا: اشتراکی (fork) — تلگرام یک‌بار در رم؛ "
+                  "هر اکانتِ اضافه ~۱۱MB به‌جای ~۶۲MB", flush=True)
+        elif _mode == "shard":
+            print(f"  🧠 حالتِ اجرا: شارد — {shard_size()} اکانت در یک پروسه؛ "
+                  "هر اکانتِ اضافه ~۴MB", flush=True)
+        skip_why = []                 # [(uid, دلیل)] — برای پیامِ روشن به مدیر
         self._resume_fail.clear()
         try:
             rows = self.db.wanted()
         except Exception:
             rows = self.db.runnable()
+        try:
+            _cap, _per, _free = capacity_estimate(mode=_mode)
+            if _cap is not None:
+                print(f"  📊 ظرفیتِ تخمینی: {int(_free)}MB آزاد ÷ ~{_per}MB "
+                      f"≈ {_cap} سلف (حالتِ {_mode}) — "
+                      f"{len(rows)} اکانت باید روشن باشند", flush=True)
+                if len(rows) > _cap:
+                    print(f"  ⚠️ با این پلن {len(rows) - _cap} اکانت جا نمی‌شود: "
+                          f"یا پلن/حافظه را بالا ببر یا سلف‌ها را کم کن",
+                          flush=True)
+        except Exception:
+            pass
         for c in rows:
             uid = c["uid"]
             if self.needs_login(uid) and not force_restart:
                 # سشنِ باطل: بالا آوردنش فقط کدِ ورود برای مشتری می‌سازد.
                 skipped += 1
+                skip_why.append((uid, "نیاز به لاگین"))
                 self.db.log(uid, "boot_skip", "نیاز به لاگین")
                 continue
             # اگر از قبل روشن بود: فقط وقتی ری‌استارت کن که کدِ روی دیسک
@@ -4975,6 +5710,7 @@ class Supervisor:
             ok, why = self.allowed(uid)
             if not ok:
                 skipped += 1
+                skip_why.append((uid, why))
                 self.db.log(uid, "boot_skip", why)
                 continue
             started, _ = self.start(uid)
@@ -4984,12 +5720,32 @@ class Supervisor:
                     self.mgr.shop.p_reset_charge(uid)
             time.sleep(0.5)
         if skipped:
-            print(f"  ⚠️ {skipped} سرویس بدون اعتبار بالا نیامد")
+            # «چرا روشن نکرد؟» باید در همان خط معلوم باشد، نه با حدس. قبلاً
+            # همه‌ی دلیل‌ها «بدون اعتبار» گفته می‌شد که گمراه‌کننده بود.
+            parts = []
+            for uid, why in skip_why[:6]:
+                parts.append(f"{uid}: {why}")
+            more = "" if len(skip_why) <= 6 else f" · و {len(skip_why) - 6} تای دیگر"
+            print(f"  ⏭️ {skipped} سرویس بالا نیامد → " + " · ".join(parts) + more,
+                  flush=True)
+        if n == 0 and not skipped:
+            print("  ℹ️ سرویسی برای بالا آوردن نبود (همه خاموش‌اند یا هیچ "
+                  "اکانتی در دیتابیس نیست)", flush=True)
         return n
 
     def shutdown(self):
         for uid in list(self.procs):
             self.stop(uid)
+        try:
+            if getattr(self, "_forkd", None) is not None:
+                self._forkd.close()
+        except Exception:
+            pass
+        for _sd in list(getattr(self, "_shards", []) or []):
+            try:
+                _sd.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════
@@ -5496,11 +6252,20 @@ class Manager:
                           f"({why}) — تا اتصالِ نسخه‌ی قبلی سمتِ تلگرام بسته "
                           "شود و کلیدِ سشن نسوزد "
                           "(خاموش‌کردن: JAFJ_RESUME_DELAY=0)", flush=True)
-                    self.sup._grace_until = time.time() + delay
+                    deadline = time.time() + delay
+                    self.sup._grace_until = deadline
                     try:
-                        time.sleep(delay)
+                        while True:
+                            left = deadline - time.time()
+                            if left <= 0:
+                                break
+                            print(f"  ⏳ مهلتِ سشن‌ها: {int(left)} ثانیه مانده …",
+                                  flush=True)
+                            time.sleep(min(30.0, max(0.2, left)))
                     finally:
                         self.sup._grace_until = 0.0
+                    print("  ✅ مهلت تمام شد — سرویس‌ها را بالا می‌آورم.",
+                          flush=True)
                 n = self.sup.boot_all(force_restart=force_restart)
                 try:
                     self._boot_last = (n, 0, 0)
@@ -14715,6 +15480,48 @@ class Manager:
             traceback.print_exc()
             return False, f"{type(e).__name__}: {e}"
 
+    async def heartbeat_loop(self):
+        """هر دقیقه یک ضربان بنویس و هر ۵ دقیقه حافظه را در لاگ بگو."""
+        _last_log = 0.0
+        while True:
+            try:
+                free = mem_available_mb()
+                try:
+                    running = self.sup.running_count()
+                except Exception:
+                    running = None
+                write_heartbeat(BASE_DIR, {"free": free, "clients": running})
+                nowt = time.time()
+                if nowt - _last_log >= 300:
+                    _last_log = nowt
+                    parts = [f"RAM آزاد: {free if free is not None else '?'}MB",
+                             f"سلف‌های روشن: "
+                             f"{running if running is not None else '?'}"]
+                    try:
+                        kids = self.sup.children_rss()
+                        if kids:
+                            tot = round(sum(k[2] for k in kids), 1)
+                            worst = sorted(kids, key=lambda k: -k[2])[:3]
+                            parts.append(
+                                f"مصرفِ سلف‌ها: {tot}MB / {len(kids)} اکانت "
+                                f"(~{round(tot / len(kids), 1)}MB هر کدام، PSS) (" +
+                                ", ".join(f"{u}:{mb}MB" for u, _p, mb in worst) +
+                                ")")
+                        me = proc_pss_mb(os.getpid()) or proc_rss_mb(os.getpid())
+                        if me:
+                            parts.append(f"مدیر: {me}MB")
+                    except Exception:
+                        pass
+                    print("  💾 " + " · ".join(parts), flush=True)
+                    if free is not None and free < 80:
+                        print("  ⚠️ حافظه‌ی آزاد کم است — اگر ادامه پیدا کند "
+                              "کرنل پروسه را می‌کشد (سرور آفلاین می‌شود). "
+                              "تعدادِ سلف‌ها را کم کن یا BACKUP_EVERY را بالا ببر.",
+                              flush=True)
+            except Exception as e:
+                print(f"  ⚠️ ضربان: {type(e).__name__}", flush=True)
+            await asyncio.sleep(HEARTBEAT_EVERY)
+
     async def backup_loop(self):
         """حلقه پشتیبان خودکار — هر backup_interval() یکبار، بیدار و اثرانگشت را چک می‌کند.
         روی Render رایگان پیش‌فرض ۱۲۰ثانیه است تا بین دو دیپلوی نهایت ۲ دقیقه داده از دست برود.
@@ -15671,12 +16478,22 @@ class Manager:
         # می‌زند چند دقیقه جواب نمی‌دهد. watchdog هم از همان اول فعال است تا
         # اگر یکی جا افتاد، خودش جبران کند.
         threading.Thread(target=self.sup.watchdog, daemon=True).start()
+        # «چرا دیروز یهو آفلاین شد؟» — از ضربانِ اجرای قبلی می‌گوییم.
+        try:
+            _death = last_death_report(BASE_DIR)
+            if _death:
+                print(f"  {_death}", flush=True)
+                self._death_note = _death
+        except Exception as e:
+            print(f"  ⚠️ گزارشِ مرگِ قبلی: {type(e).__name__}", flush=True)
+        write_heartbeat(BASE_DIR, {"stage": "boot"})
         print(f"{'='*54}\n")
         self._spawn_boot(notify_admins=False, why="بوت")
         # ارجاع را نگه دار؛ وگرنه حلقهٔ پشتیبان ممکن است وسط کار جمع شود و بک‌آپ نرود.
         self._bg_tasks = []
-        for _coro in (self.duplicate_watch_loop(), self.reminder_loop(),
-                      self.points_loop(), self.trial_loop()):
+        for _coro in (self.heartbeat_loop(), self.duplicate_watch_loop(),
+                      self.reminder_loop(), self.points_loop(),
+                      self.trial_loop()):
             self._bg_tasks.append(asyncio.create_task(_coro))
         # پشتیبان خودکار روی تلگرام
         try:
