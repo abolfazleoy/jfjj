@@ -3750,6 +3750,7 @@ RESUME_AT_NAME = ".jafj_resume_at"
 LAST_EXIT_NAME = ".jafj_last_exit"
 HEARTBEAT_NAME = ".jafj_heartbeat"       # «اجرای قبلی چطور مرد؟»
 HEARTBEAT_EVERY = 60
+RAM_GATE_MB = 60                         # زیرِ این مقدار، سلفِ تازه بالا نمی‌آید
 HARD_EXIT_CODES = (137, 143, -9, 9)      # SIGKILL/OOM، SIGTERM، kill
 RECENT_CONNECT_WINDOW = 180              # ثانیه
 MAX_GRACE = 900
@@ -3817,6 +3818,36 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def ram_gate_mb(env=None):
+    """حدِ حافظه‌ی آزادِ لازم برای روشن‌کردنِ سلفِ بعدی (۰ = بی‌نگهبان).
+
+    چرا: هر سلف (telethon + asyncio + sqlite) حدودِ ۶۰-۹۰ مگابایت است. وقتی
+    حافظه‌ی آزاد ته می‌کشد، کرنل کلِ کانتینر را می‌کشد و «سرور آفلاین»
+    می‌شود — یعنی به‌جای یک سرویسِ کم، همه می‌خوابند. بهتر است سلفِ تازه
+    بالا نیاید و دلیلش را بگوید.
+    """
+    e = env if env is not None else os.environ
+    try:
+        v = float((e.get("JAFJ_MIN_FREE_MB") or "").strip() or RAM_GATE_MB)
+    except Exception:
+        v = float(RAM_GATE_MB)
+    return max(0.0, min(8192.0, v))
+
+
+def ram_gate_check(env=None):
+    """(اجازه؟, حافظه‌ی آزاد, حد) — فقط‌خواندنی و بی‌خطر."""
+    limit = ram_gate_mb(env)
+    if limit <= 0:
+        return True, None, 0.0
+    try:
+        free = mem_available_mb()
+    except Exception:
+        free = None
+    if free is None:
+        return True, None, limit        # نمی‌دانیم → مانع نشو
+    return (float(free) >= limit), float(free), limit
+
+
 def write_heartbeat(data_dir, extra=None):
     """(فایلِ ضربان) — ارزان و بی‌خطر؛ هر خطایی بلعیده می‌شود."""
     rec = {"ts": time.time(), "pid": os.getpid()}
@@ -4595,6 +4626,22 @@ class Supervisor:
                 self.db.log(uid, "deps_missing", f"python={sys.executable}")
             except Exception:
                 pass
+        # ── نگهبانِ حافظه: با RAMِ ته‌کشیده سلفِ تازه بالا نیاید ──
+        # (وگرنه OOM کلِ کانتینر را می‌خوابانَد و همه‌ی سرویس‌ها می‌روند)
+        _ok_ram, _free, _limit = ram_gate_check()
+        if not _ok_ram:
+            try:
+                self.db.log(uid, "ram_gate", f"free={_free} limit={_limit}")
+            except Exception:
+                pass
+            return self._why(
+                uid, "manager",
+                f"حافظه‌ی آزاد کافی نیست: {int(_free)} مگابایت "
+                f"(حدِ لازم {int(_limit)}). سلف‌های دیگر را خاموش کن یا "
+                "پلن/سقفِ حافظه را بالا ببر — وگرنه کلِ سرور با OOM خاموش "
+                "می‌شود و همه‌ی سرویس‌ها می‌افتند. "
+                "(خاموش‌کردنِ نگهبان: JAFJ_MIN_FREE_MB=0)",
+                hint="کمبودِ حافظه")
         logf = open(os.path.join(folder, "run.log"), "a", encoding="utf-8")
         # هدرِ کامل: بدونِ این، «چرا بالا نیامد» فقط با آزمون و خطا فهمیده
         # می‌شد. حالا خودِ لاگ می‌گوید با چه مفسر/مسیری اجرا شده.
