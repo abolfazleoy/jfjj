@@ -115,9 +115,11 @@ def main():
         me = M.proc_rss_mb(os.getpid())
         # ── ظرفیتِ تخمینی (چند سلف روی این پلن) ──────────────────────
         n, per, free = M.capacity_estimate(free_mb=1024, mode="fork")
-        check("ظرفیت: fork → هر سلف ۲۶MB", per == 26, per)
-        check("ظرفیت: ۱۰۲۴MB آزاد → (۱۰۲۴−۹۶)/۲۶ ≈ ۳۵ سلف",
-              n == int((1024 - M.RAM_RESERVE_MB) // 26), n)
+        check("ظرفیت: fork → هر سلف ۱۱MB (اندازه‌گیریِ پله‌ای)", per == 11, per)
+        check("ظرفیت: ۱۰۲۴MB آزاد → (۱۰۲۴−۹۶)/۱۱ سلف",
+              n == int((1024 - M.RAM_RESERVE_MB) // 11), n)
+        check("ظرفیت: ۴ گیگ → بیش از ۳۰۰ اکانت", 
+              M.capacity_estimate(free_mb=4096, mode="fork")[0] > 300)
         n2, per2, _ = M.capacity_estimate(free_mb=1024, mode="process")
         check("ظرفیت: process → هر سلف ۶۲MB", per2 == 62, per2)
         check("ظرفیت: حالتِ process کمتر جا می‌دهد", n2 < n, (n, n2))
@@ -132,11 +134,22 @@ def main():
 
         check("proc_rss_mb: حافظه‌ی خودِ پروسه را می‌خواند",
               me is not None and me > 5, me)
+        pss = M.proc_pss_mb(os.getpid())
+        check("proc_pss_mb: سهمِ واقعیِ خودِ پروسه را می‌خواند",
+              pss and pss > 0, pss)
+        check("proc_pss_mb: PIDِ ناموجود → None", M.proc_pss_mb(999999) is None)
+        # PSS هرگز از RSS بیشتر نیست (سهمِ مشترک تقسیم می‌شود)
+        check("proc_pss_mb: PSS ≤ RSS",
+              pss is not None and M.proc_rss_mb(os.getpid()) is not None
+              and pss <= M.proc_rss_mb(os.getpid()) + 1)
         check("proc_rss_mb: PIDِ ناموجود → None", M.proc_rss_mb(999999) is None)
         rss = sup.children_rss()
         check("children_rss: لیستی از (uid, pid, MB) می‌دهد",
               isinstance(rss, list) and all(len(x) == 3 for x in rss), rss)
         src_now = (REPO / "manager_82.py").read_text(encoding="utf-8")
+        src_hb = open(os.path.join(REPO, "manager_82.py"), encoding="utf-8").read()
+        check("ضربان: مصرفِ سرانه و PSS را چاپ می‌کند",
+              "هر کدام، PSS" in src_hb)
         check("ضربان: مصرفِ تجمعیِ سلف‌ها را چاپ می‌کند",
               "مصرفِ سلف‌ها" in src_now)
 

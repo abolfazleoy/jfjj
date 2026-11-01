@@ -4034,7 +4034,8 @@ def spawn_mode(env=None):
 
 # مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:
 # «process» = یک پروسه برای هر اکانت، «fork» = حافظه‌ی مشترک (WISPBYTE_FA §۱۲).
-PER_ACCOUNT_MB = {"fork": 26, "process": 62}
+# fork: اندازه‌گیریِ پله‌ای ۱ تا ۸ اکانت → هر اکانتِ اضافه ۱۱.۲MB.
+PER_ACCOUNT_MB = {"fork": 11, "process": 62}
 RAM_RESERVE_MB = 96          # برای مدیر، دیتابیس، پشتیبان و OS
 
 
@@ -4061,6 +4062,24 @@ def capacity_estimate(free_mb=None, mode=None, reserve_mb=None):
         return int(usable // per), per, float(free_mb)
     except Exception:
         return None, per, None
+
+
+def proc_pss_mb(pid):
+    """سهمِ واقعیِ یک پروسه از حافظه (MB) از /proc/PID/smaps_rollup.
+
+    چرا PSS و نه RSS: با fork، صفحه‌های مشترک در RSSِ **هر** فرزند کامل
+    حساب می‌شوند؛ یعنی ۱۰۰ اکانت با RSS «۸ گیگ» نشان می‌دهند در حالی که
+    واقعاً ~۱ گیگ برده‌اند. PSS سهمِ هر پروسه از صفحه‌های مشترک را تقسیم
+    می‌کند — همان عددی که کرنل/کنترل‌پنل حساب می‌کند.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/smaps_rollup", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
 
 
 def proc_rss_mb(pid):
@@ -5219,7 +5238,9 @@ class Supervisor:
             try:
                 if p is None or p.poll() is not None:
                     continue
-                mb = proc_rss_mb(p.pid)
+                mb = proc_pss_mb(p.pid)
+                if mb is None:
+                    mb = proc_rss_mb(p.pid)
                 if mb is not None:
                     out.append((uid, p.pid, mb))
             except Exception:
@@ -5369,7 +5390,7 @@ class Supervisor:
             _mode = "process"
         if _mode == "fork":
             print("  🧠 حالتِ اجرا: اشتراکی (fork) — تلگرام یک‌بار در رم؛ "
-                  "هر اکانتِ اضافه ~۲۵–۳۵MB به‌جای ~۷۰MB", flush=True)
+                  "هر اکانتِ اضافه ~۱۱MB به‌جای ~۶۲MB", flush=True)
         skip_why = []                 # [(uid, دلیل)] — برای پیامِ روشن به مدیر
         self._resume_fail.clear()
         try:
@@ -15199,10 +15220,11 @@ class Manager:
                             tot = round(sum(k[2] for k in kids), 1)
                             worst = sorted(kids, key=lambda k: -k[2])[:3]
                             parts.append(
-                                f"مصرفِ سلف‌ها: {tot}MB (" +
+                                f"مصرفِ سلف‌ها: {tot}MB / {len(kids)} اکانت "
+                                f"(~{round(tot / len(kids), 1)}MB هر کدام، PSS) (" +
                                 ", ".join(f"{u}:{mb}MB" for u, _p, mb in worst) +
                                 ")")
-                        me = proc_rss_mb(os.getpid())
+                        me = proc_pss_mb(os.getpid()) or proc_rss_mb(os.getpid())
                         if me:
                             parts.append(f"مدیر: {me}MB")
                     except Exception:
