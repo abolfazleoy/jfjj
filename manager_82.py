@@ -3602,6 +3602,70 @@ class _AdoptedProc:
 
 
 # ═══════════════════════════════════════════════════
+#  «چرا سلف بالا نیامد؟» — تشخیصِ علت از لاگِ خودِ سلف
+#
+#  بدون این، شدنی‌ترین حالت این بود: مدیر پروسه را اجرا می‌کرد، سلف دو
+#  ثانیه بعد می‌مرد، مدیر آن را «روشن» می‌شمرد، watchdog هر ۳۰ ثانیه تا ۱۰
+#  دقیقه دوباره تلاش می‌کرد و مشتری هیچ پیامی نمی‌گرفت — یعنی از بیرون
+#  دقیقاً «۹۵.py اجرا نمی‌شود» دیده می‌شد.
+# ═══════════════════════════════════════════════════
+SESSION_FAIL_RE = re.compile(
+    r"سشنِ این اکانت معتبر نیست|needs[_ ]relogin|از تلگرام خارج|"
+    r"SESSION_REVOKED|AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|"
+    r"Client is not authorized|not authorized", re.I)
+NET_FAIL_RE = re.compile(
+    r"اتصال برای بررسیِ سشن|اتصال قطع شد|اتصال دوباره|ConnectionError|"
+    r"Cannot connect|Connection to Telegram failed|timed out|TimeoutError|"
+    r"Auto-reconnect|NetworkError|OSError", re.I)
+DEPS_FAIL_RE = re.compile(
+    r"Telethon نصب نیست|ModuleNotFoundError|ImportError|No module named", re.I)
+CRASH_RE = re.compile(
+    r"Traceback \(most recent call last\)|Error:|Exception:", re.I)
+
+
+def _h(text, limit=1600):
+    """متنِ لاگ برای گذاشتن داخل پیامِ HTML تلگرام."""
+    try:
+        s2 = str(text or "")
+    except Exception:
+        return ""
+    s2 = s2.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return s2[-limit:] if limit and len(s2) > limit else s2
+
+
+def classify_selfbot_log(tail, rc=None):
+    """علتِ توقفِ سلف از آخرین خطوطِ run.log → (نوع, توضیحِ فارسی)."""
+    t = tail or ""
+    if rc == 78 or SESSION_FAIL_RE.search(t):
+        return "session", "سشنِ این اکانت باطل/خارج شده است"
+    if DEPS_FAIL_RE.search(t):
+        return "deps", ("پایتونی که سلف را اجرا می‌کند telethon ندارد "
+                        "(venv یا نصبِ وابستگی‌ها ناقص است)")
+    if NET_FAIL_RE.search(t):
+        return "network", "به تلگرام وصل نمی‌شود (شبکه/MTProto یا فیلترِ میزبان)"
+    if CRASH_RE.search(t):
+        return "crash", "سلف با خطا (Traceback) بسته شد"
+    if rc is not None:
+        return "exit", f"سلف با کدِ خروجِ {rc} بسته شد"
+    return "", ""
+
+
+def selfbot_failure_text(msg, tail="", folder="", limit=1000):
+    """پیامِ شکست + آخرین خطوطِ لاگِ سلف + مسیرِ پوشه‌ی همان اکانت."""
+    out = str(msg or "")
+    t = (tail or "").strip()
+    if t and t not in ("لاگی نیست.", "خالی"):
+        lines = [ln for ln in t.splitlines() if ln.strip()]
+        clean = "\n".join(lines)[-limit:]
+        if clean:
+            out += ("\n\n📜 <b>آخرین خطوطِ سلف</b>\n<pre>"
+                    + _h(clean, 0) + "</pre>")
+    if folder:
+        out += f"\n📂 <code>{_h(folder, 0)}</code>"
+    return out
+
+
+# ═══════════════════════════════════════════════════
 #  ناظر پروسه‌ها — هر مشتری یک پروسه‌ی جدا
 # ═══════════════════════════════════════════════════
 class Supervisor:
@@ -3609,7 +3673,11 @@ class Supervisor:
         self.cfg = cfg
         self.db = db
         self.procs = {}          # uid -> Popen
-        self.last_failure = {}   # uid -> manager | selfbot
+        self.last_failure = {}   # uid -> manager | session | selfbot
+        # uid -> توضیحِ فارسیِ علت (برای پیامِ مشتری و /diag)
+        self.last_detail = {}
+        self._fail_notified = {} # uid -> زمانِ آخرین اطلاع‌رسانیِ شکست
+        self._deps_ok = None     # آیا sys.executable می‌تواند telethon را import کند؟
         self.mgr = None          # به Manager وصل می‌شود
         # uid -> {"n": تعداد تلاش‌های ناموفق، "next": زمانِ تلاشِ بعدی}
         # تا پروسه‌ای که فوراً می‌میرد (سشنِ خراب/FloodWait) هر ۳۰ ثانیه
@@ -4036,6 +4104,172 @@ class Supervisor:
                        "فرستاده نشد. از «🚀 راه‌اندازی سلف روی اکانتم» دوباره "
                        "لاگین کن.")
 
+    # ---------- تشخیص و اطلاع‌رسانیِ «چرا سلف بالا نیامد» ----------
+    def _why(self, uid, kind, msg, hint="", tail_n=12):
+        """شکست را یک‌دست ثبت کن: علت + آخرین خطوطِ run.log + مسیرِ پوشه.
+
+        `kind` همان چیزی است که بقیه‌ی کد با آن کار می‌کند
+        (manager | session | selfbot)، `hint` توضیحِ خواناست.
+        """
+        self.last_failure[uid] = kind
+        try:
+            self.last_detail[uid] = (hint or msg or "")[:300]
+        except Exception:
+            pass
+        tail = ""
+        try:
+            tail = self.tail(uid, tail_n)
+        except Exception:
+            tail = ""
+        try:
+            folder = self.folder(uid)
+        except Exception:
+            folder = ""
+        return False, selfbot_failure_text(msg, tail, folder)
+
+    def python_deps_ok(self):
+        """آیا مفسری که سلف را اجرا می‌کند telethon دارد؟ (یک‌بار در هر بوت)
+
+        چرا لازم است: اگر venv ساخته نشده باشد، مدیر با همان مفسری اجرا
+        می‌شود که سلف را هم اجرا می‌کند؛ ولی سلف بعد از `pip install`ِ
+        ناموفق (محیطِ externally-managed) فوراً می‌میرد و هیچ دلیلی هم به
+        مشتری نمی‌رسد. این چک قبل از Popen جلوی آن را می‌گیرد.
+        """
+        if self._deps_ok is not None:
+            return self._deps_ok
+        try:
+            r = subprocess.run([sys.executable, "-c", "import telethon"],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            self._deps_ok = (r.returncode == 0)
+        except Exception:
+            self._deps_ok = False
+        return self._deps_ok
+
+    def _watch_start(self, uid, p, delay=None):
+        """پروسه‌ی تازه را در ثانیه‌های اول زیرِ نظر بگیر و اگر مرد، بگو چرا.
+
+        `start()` فقط ۱.۲ ثانیه صبر می‌کرد. سلفی که در ثانیه‌ی ۲ یا ۵ (سشن
+        باطل، نبودِ telethon، خطای شبکه) می‌مرد «روشن» شمرده می‌شد و مشتری
+        هیچ پیامی نمی‌گرفت. این رشته، هم مرگِ دیرتر را می‌بیند و هم
+        «گیرکردن در اتصال» را (سلفی که زنده است ولی هیچ‌وقت وصل نمی‌شود،
+        پس هرگز پنل نمی‌فرستد).
+        """
+        if delay is None:
+            try:
+                delay = float(os.environ.get("JAFJ_START_WATCH", "") or 25)
+            except Exception:
+                delay = 25.0
+
+        def _run():
+            rc = None
+            try:
+                rc = p.wait(timeout=delay)
+            except Exception:
+                rc = None                     # هنوز زنده است
+            if self.procs.get(uid) is not p:
+                return                        # پروسه‌ی دیگری جایگزین شده
+            tail = ""
+            try:
+                tail = self.tail(uid, 25)
+            except Exception:
+                tail = ""
+            kind, hint = classify_selfbot_log(tail, rc)
+            if rc is None:
+                if not kind:                  # سالم و در حال کار
+                    try:
+                        self.db.log(uid, "alive", f"{int(delay)}s pid={p.pid}")
+                    except Exception:
+                        pass
+                    return
+                # زنده ولی وصل نمی‌شود / در حلقه‌ی تلاش است
+                self.last_detail[uid] = hint[:300]
+                try:
+                    self.db.log(uid, "start_stuck_" + kind, hint)
+                except Exception:
+                    pass
+                self._notify_start_failure(uid, kind, hint, tail)
+                return
+            self.procs.pop(uid, None)
+            self._clear_pid(uid)
+            if kind == "session":
+                self.last_failure[uid] = "session"
+                self.last_detail[uid] = hint[:300]
+                try:
+                    self.mark_needs_login(uid, "سشن باطل/خارج‌شده")
+                except Exception:
+                    pass
+            else:
+                self.last_failure[uid] = "selfbot"
+                self.last_detail[uid] = hint[:300]
+                try:
+                    self._bump_fail(uid)
+                except Exception:
+                    pass
+            try:
+                self.db.log(uid, "start_failed_" + (kind or "exit"),
+                            f"rc={rc} {hint}")
+            except Exception:
+                pass
+            self._notify_start_failure(uid, kind, hint, tail)
+
+        try:
+            threading.Thread(target=_run, daemon=True,
+                             name=f"jafj-watch-{uid}").start()
+        except Exception:
+            pass
+
+    def _notify_start_failure(self, uid, kind, hint, tail=""):
+        """حداکثر یک‌بار در ساعت: به مشتری و مدیر بگو چرا سلف روشن نشد."""
+        if not self.mgr:
+            return False
+        try:
+            now_t = time.time()
+            if now_t - float(self._fail_notified.get(uid) or 0) < 3600:
+                return False
+            self._fail_notified[uid] = now_t
+        except Exception:
+            pass
+        try:
+            c = self.db.get(uid) or {}
+            nm = c.get("name") or str(uid)
+        except Exception:
+            nm = str(uid)
+        first = ""
+        for ln in (tail or "").splitlines():
+            ln = ln.strip()
+            if ln and not ln.startswith(("File ", "~", "=====")):
+                first = ln
+        body = (f"⚠️ <b>سلف روی این اکانت بالا نیامد</b>\n\n"
+                f"👤 {_h(nm, 60)}\n<code>{uid}</code>\n"
+                f"🔎 علت: {_h(hint or 'نامعلوم', 200)}\n")
+        if first:
+            body += f"\n<pre>{_h(first, 300)}</pre>\n"
+        body += ("\n👉 «⚙️ سرویس من» → «📜 گزارش» همه‌ی لاگ را نشان می‌دهد.")
+
+        async def _say():
+            try:
+                await self.mgr.say(uid, body, key=f"startfail:{uid}:{int(now_t // 3600)}")
+            except Exception:
+                pass
+            for a in (self.cfg.get("admin_ids") or []):
+                try:
+                    await self.mgr.say(
+                        a, body + (f"\n📂 <code>{_h(self.folder(uid), 0)}</code>"),
+                        key=f"startfail-admin:{uid}:{int(now_t // 3600)}")
+                    break
+                except Exception:
+                    continue
+
+        try:
+            loop = getattr(self.mgr, "_loop", None)
+            if loop is None:
+                return False
+            asyncio.run_coroutine_threadsafe(_say(), loop)
+            return True
+        except Exception:
+            return False
+
     def is_running(self, uid):
         p = self.procs.get(uid)
         if p is None:
@@ -4051,8 +4285,9 @@ class Supervisor:
         if self.is_running(uid):
             return True, "از قبل روشن بود"
         if self.mgr and self.running_count() >= int(self.cfg["max_clients"]):
-            self.last_failure[uid] = "manager"
-            return False, "ظرفیت اجرای همزمان تکمیل است"
+            return self._why(uid, "manager",
+                             "ظرفیت اجرای همزمان تکمیل است "
+                             f"({self.running_count()}/{self.cfg['max_clients']})")
         folder = self.folder(uid)
         _sess_file = os.path.join(folder, "jafj.session")
         if not os.path.exists(_sess_file):
@@ -4078,19 +4313,19 @@ class Supervisor:
                         pass
                     self.prepare(uid, _c0["session"], _c0.get("phone") or "", _mx0, _plan)
                 except Exception as e:
-                    self.last_failure[uid] = "manager"
-                    return False, f"بازسازی سشن نشد: {e}"
+                    return self._why(uid, "manager", f"بازسازی سشن نشد: {e}")
                 if not os.path.exists(_sess_file):
-                    self.last_failure[uid] = "manager"
-                    return False, "سشن ندارد"
+                    return self._why(uid, "manager", "سشن ندارد")
             else:
-                self.last_failure[uid] = "manager"
-                return False, "سشن ندارد"
+                return self._why(
+                    uid, "manager",
+                    "سشن ندارد — این اکانت هنوز لاگین نشده "
+                    "(jafj.session داخلِ پوشه‌ی همین اکانت نیست). "
+                    "از «🚀 راه‌اندازی سلف روی اکانتم» لاگین کن.")
         # ── ۱) سشن سالم است؟ (وگرنه سلف برای «روشن شدن» کد می‌گیرد) ──
         ready, why_not = self._session_ok_or_mark(uid)
         if not ready:
-            self.last_failure[uid] = "session"
-            return False, why_not
+            return self._why(uid, "session", why_not, hint="سشن باطل/خارج‌شده")
         # قبل از هر اجرا/ری‌استارت، هم امتیاز و هم محدودیت جدید پلن را Sync کن.
         if self.mgr:
             try:
@@ -4103,11 +4338,38 @@ class Supervisor:
                 self.db.log(uid, "points_sync_failed", str(e))
         ok_sync, sync_err = self.sync_selfbot(uid)
         if not ok_sync:
-            self.last_failure[uid] = "manager"
-            return False, ("به‌روزرسانی فایل سلف نشد: " + sync_err + " · "
-                           + build_stamp() + _self_sync_failure_hint(sync_err))
+            return self._why(
+                uid, "manager",
+                "به‌روزرسانی فایل سلف نشد: " + sync_err + " · "
+                + build_stamp() + _self_sync_failure_hint(sync_err),
+                hint="فایلِ سلف (95.py) سرِ جایش نیست")
+        # ── ۰) پیش‌پرواز: سلف و مفسرِ اجراکننده سالم‌اند؟ ──
+        # بدون این، اگر پایتونِ سلف telethon نداشته باشد پروسه بالا می‌آید،
+        # در لاگِ خودش می‌نویسد «Telethon نصب نیست» و می‌میرد؛ از بیرون فقط
+        # «پنل نمی‌آید» دیده می‌شود.
+        if not os.path.isfile(SELFBOT) or os.path.getsize(SELFBOT or "") == 0:
+            return self._why(uid, "manager",
+                             f"فایلِ سلف نیست یا خالی است: {SELFBOT}",
+                             hint="۹۵.py سرِ جایش نیست")
+        if not self.python_deps_ok():
+            # فقط هشدار، نه توقف: خودِ 95.py اول telethon را نصب می‌کند
+            # (pip) و اگر نشد می‌میرد؛ آن مرگ را _watch_start با علتِ
+            # «deps» گزارش می‌کند. مسدود کردنِ اجرا اینجا، سلفِ سالمی را که
+            # فقط هشدار داده بود از کار می‌انداخت.
+            try:
+                self.db.log(uid, "deps_missing", f"python={sys.executable}")
+            except Exception:
+                pass
         logf = open(os.path.join(folder, "run.log"), "a", encoding="utf-8")
+        # هدرِ کامل: بدونِ این، «چرا بالا نیامد» فقط با آزمون و خطا فهمیده
+        # می‌شد. حالا خودِ لاگ می‌گوید با چه مفسر/مسیری اجرا شده.
         logf.write(f"\n===== start {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+        try:
+            logf.write(f"  python={sys.executable} cwd={folder}\n")
+            logf.write(f"  self={SELFBOT} ref={SELFBOT_REF} "
+                       f"build={build_stamp()}\n")
+        except Exception:
+            pass
         logf.flush()
         try:
             # JAFJ_NO_AUTO_LOGIN=1 → سلف هرگز خودش کدِ ورود نمی‌فرستد؛ اگر
@@ -4120,8 +4382,13 @@ class Supervisor:
                 stdin=subprocess.DEVNULL, env=_env,
                 start_new_session=True)
         except Exception as e:
-            logf.close()
-            return False, f"{type(e).__name__}: {e}"
+            try:
+                logf.close()
+            except Exception:
+                pass
+            return self._why(uid, "manager",
+                             f"اجرای سلف شکست خورد: {type(e).__name__}: {e}",
+                             hint="Popen ناموفق بود")
         self.procs[uid] = p
         self._write_pid(uid, p.pid)      # بمانَد تا بعد از ری‌استارت manager
         try:
@@ -4135,20 +4402,33 @@ class Supervisor:
             self.procs.pop(uid, None)
             self._clear_pid(uid)
             rc = p.returncode
-            tail = self.tail(uid, 10).strip().replace("\n", " | ")[-900:]
+            raw = self.tail(uid, 12)
+            tail = (raw or "").strip().replace("\n", " | ")[-900:]
             self.db.log(uid, "start_failed", f"rc={rc} {tail}")
-            if rc == 78 or _LOGIN_CODE_RE.search(tail or ""):
+            kind, hint = classify_selfbot_log(raw, rc)
+            if rc == 78 or kind == "session" or _LOGIN_CODE_RE.search(tail or ""):
                 # سشن باطل (یا بدتر: یک جایی کد ورود رفته) → دیگر تلاش نکن
-                self.last_failure[uid] = "session"
-                self.mark_needs_login(uid, "سشن باطل/خارج‌شده")
-                return False, ("این اکانت باید دوباره لاگین شود — کدِ ورودِ اضافی "
-                               "فرستاده نشد و اجرای خودکارش تا لاگین متوقف شد.")
-            self.last_failure[uid] = "selfbot"
-            return False, "سلف اجرا نشد؛ Session یا اطلاعات ورود را بررسی کن.\n" + tail
+                try:
+                    self.mark_needs_login(uid, "سشن باطل/خارج‌شده")
+                except Exception:
+                    pass
+                return self._why(
+                    uid, "session",
+                    "این اکانت باید دوباره لاگین شود — کدِ ورودِ اضافی "
+                    "فرستاده نشد و اجرای خودکارش تا لاگین متوقف شد.",
+                    hint=hint or "سشن باطل/خارج‌شده")
+            reason = hint or "سلف اجرا نشد"
+            return self._why(uid, "selfbot",
+                             f"سلف اجرا نشد ({reason})؛ Session یا اطلاعات ورود "
+                             "را بررسی کن.", hint=reason, tail_n=14)
         # اگر سلف با موفقیت بالا آمد، مهرِ «نیاز به لاگین» برداشته می‌شود
         self.db.set(uid, started_at=now(), want_on=1, need_login=0)
         self._resume_fail.pop(uid, None)
         self.db.log(uid, "start", f"pid={p.pid}")
+        self.last_detail.pop(uid, None)
+        # ثانیه‌های اول را زیرِ نظر بگیر: مرگِ دیرتر یا «گیرکردن در اتصال»
+        # همین‌جا معلوم می‌شود، نه با صبر کردنِ الکیِ مشتری.
+        self._watch_start(uid, p)
         return True, f"روشن شد (pid {p.pid})"
 
     def stop(self, uid, remember_off=False):
@@ -5464,6 +5744,14 @@ class Manager:
         try:
             self.db.set(uid, need_login=0, want_on=1)
             self.sup.clear_needs_login(uid)
+            # سشنِ تازه = سالم؛ اگر سشنِ خرابِ قبلی قرنطینه شده بود (.bad)،
+            # کنارش را بردار تا مسیرِ «بازسازی از دیتابیس» دوباره باز شود.
+            try:
+                bad = os.path.join(self.sup.folder(uid), "jafj.session.bad")
+                if os.path.isfile(bad):
+                    os.remove(bad)
+            except Exception:
+                pass
             self._login_notified and self._login_notified.pop(uid, None)
         except Exception:
             pass
@@ -14808,6 +15096,53 @@ class Manager:
         return ok, msg
 
 
+    def selfbot_diag_lines(self, limit=3):
+        """خطوطِ /diag برای سلف‌هایی که روشن نشده‌اند: علت + آخرین خطِ لاگ.
+
+        گزارشِ کاربر «مدیر بالا می‌آید ولی پنلِ سلف نمی‌آید» تا امروز فقط با
+        گشتنِ دستیِ data/clients/<uid>/run.log جواب می‌گرفت. حالا همان جواب
+        داخلِ /diag هست.
+        """
+        out = []
+        try:
+            rows = self.db.wanted()
+        except Exception:
+            rows = []
+        shown = 0
+        for c in rows:
+            uid = c.get("uid")
+            if uid is None or shown >= limit:
+                continue
+            try:
+                alive = self.sup.is_running(uid)
+            except Exception:
+                alive = False
+            detail = ""
+            try:
+                detail = self.sup.last_detail.get(uid) or ""
+            except Exception:
+                detail = ""
+            if alive and not detail:
+                continue
+            nm = c.get("name") or str(uid)
+            if alive:
+                out.append(f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
+                           "روشن ✅")
+            else:
+                out.append(f"  • {self._esc(nm)[:24]} <code>{uid}</code>: "
+                           f"خاموش — {self._esc(detail or 'علت ثبت نشده')[:90]}")
+                try:
+                    tail = self.sup.tail(uid, 8)
+                except Exception:
+                    tail = ""
+                firsts = [ln.strip() for ln in (tail or "").splitlines()
+                          if ln.strip() and not ln.strip().startswith(
+                              ("File ", "~", "=====", "python=", "self="))]
+                if firsts:
+                    out.append(f"    <pre>{_h(firsts[-1], 160)}</pre>")
+            shown += 1
+        return out
+
     def diag_text(self):
         """🔍 عیب‌یابی: چرا داده می‌پرد / چرا کرش می‌کند؟ (همه در یک نگاه)"""
         L = self.LINE
@@ -14851,6 +15186,15 @@ class Manager:
               f" (کد نمی‌رود؛ /needlogin)" if n_login else "🔑 نیاز به لاگین: ۰"),
              f"🧠 حافظه‌ی آزاد: {free}MB" if free is not None else "🧠 حافظه: ؟",
              f"⏱ بالا: {up // 60} دقیقه"]
+        try:
+            sb_lines = self.selfbot_diag_lines()
+        except Exception:
+            sb_lines = []
+        if sb_lines:
+            t.append("")
+            t.append("🤖 <b>سلف‌های روشن‌نشده</b> (علت + آخرین خطِ لاگ)")
+            t += sb_lines
+            t.append("  <i>لاگِ کامل: «⚙️ سرویس من» → «📜 گزارش»</i>")
         ex = last_exit_info()
         if ex:
             t.append(f"💥 آخرین خروج: کد {ex.get('code')} بعد از "
