@@ -3748,6 +3748,8 @@ def selfbot_failure_text(msg, tail="", folder="", limit=1000):
 #  بیشتر شود. با JAFJ_RESUME_DELAY=0 یا JAFJ_NO_RESUME_DELAY=1 خاموش است.
 RESUME_AT_NAME = ".jafj_resume_at"
 LAST_EXIT_NAME = ".jafj_last_exit"
+HEARTBEAT_NAME = ".jafj_heartbeat"       # «اجرای قبلی چطور مرد؟»
+HEARTBEAT_EVERY = 60
 HARD_EXIT_CODES = (137, 143, -9, 9)      # SIGKILL/OOM، SIGTERM، kill
 RECENT_CONNECT_WINDOW = 180              # ثانیه
 MAX_GRACE = 900
@@ -3805,6 +3807,75 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
         why = (f"آخرین اتصالِ سشن‌ها فقط {int(age)} ثانیه پیش بود — "
                "شاید نسخه‌ی قبلی هنوز زنده است")
     return float(min(float(MAX_GRACE), base)), why
+
+
+# ═══════════════════════════════════════════════════
+#  ضربانِ قلب — «دیروز داشت کار می‌کرد، یهو سرور آفلاین شد» چرا؟
+#
+#  وقتی کانتینر با کمبودِ حافظه (OOM) یا با Stopِ پنل کشته می‌شود، هیچ
+#  کدی اجرا نمی‌شود؛ پس نه crash.log، نه .jafj_last_exit، هیچ‌چیز نمی‌ماند
+#  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
+#  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
+#  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def write_heartbeat(data_dir, extra=None):
+    """(فایلِ ضربان) — ارزان و بی‌خطر؛ هر خطایی بلعیده می‌شود."""
+    rec = {"ts": time.time(), "pid": os.getpid()}
+    try:
+        rec["free"] = mem_available_mb()
+    except Exception:
+        rec["free"] = None
+    if isinstance(extra, dict):
+        rec.update(extra)
+    try:
+        path = os.path.join(str(data_dir), HEARTBEAT_NAME)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        os.replace(tmp, path)
+        return rec
+    except Exception:
+        return rec
+
+
+def read_heartbeat(data_dir):
+    return _read_json_soft(os.path.join(str(data_dir), HEARTBEAT_NAME))
+
+
+def last_death_report(data_dir, now_ts=None):
+    """متنِ «اجرای قبلی چطور تمام شد» ("" = چیزی برای گفتن نیست)."""
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    hb = read_heartbeat(data_dir)
+    try:
+        hb_ts = float(hb.get("ts") or 0)
+    except Exception:
+        hb_ts = 0.0
+    if hb_ts <= 0:
+        return ""
+    ex = _read_json_soft(os.path.join(str(data_dir), LAST_EXIT_NAME))
+    try:
+        ex_ts = float(ex.get("ts") or 0)
+    except Exception:
+        ex_ts = 0.0
+    try:
+        ex_code = int(ex.get("code"))
+    except Exception:
+        ex_code = None
+    age = int(max(0, now_ts - hb_ts))
+    clean = ex_ts >= (hb_ts - 5)
+    free = hb.get("free")
+    clients = hb.get("clients")
+    hardy = f"حافظه‌ی آزاد {free}MB، {clients} سلف روشن"
+    if clean and ex_code not in HARD_EXIT_CODES:
+        if age > 600:
+            return (f"ℹ️ سرویس حدودِ {age // 60} دقیقه خاموش بود (خروجِ "
+                    f"ثبت‌شده: code={ex_code}).")
+        return ""
+    if clean:
+        return (f"🧯 اجرای قبلی با کدِ {ex_code} تمام شد (SIGKILL/OOM یا "
+                f"کشته‌شدنِ پروسه) — آخرین ضربان {age} ثانیه پیش ({hardy}).")
+    return (f"🧯 اجرای قبلی **بدونِ خروجِ تمیز** تمام شد — آخرین ضربان "
+            f"{age} ثانیه پیش ({hardy}). یعنی پروسه ناگهانی کشته شده؛ "
+            "معمولاً کمبودِ حافظه (OOM) یا Stop از پنل.")
 
 
 class Supervisor:
@@ -14737,6 +14808,32 @@ class Manager:
             traceback.print_exc()
             return False, f"{type(e).__name__}: {e}"
 
+    async def heartbeat_loop(self):
+        """هر دقیقه یک ضربان بنویس و هر ۵ دقیقه حافظه را در لاگ بگو."""
+        _last_log = 0.0
+        while True:
+            try:
+                free = mem_available_mb()
+                try:
+                    running = self.sup.running_count()
+                except Exception:
+                    running = None
+                write_heartbeat(BASE_DIR, {"free": free, "clients": running})
+                nowt = time.time()
+                if nowt - _last_log >= 300:
+                    _last_log = nowt
+                    print(f"  💾 RAM آزاد: {free if free is not None else '?'}MB "
+                          f"· سلف‌های روشن: {running if running is not None else '?'}",
+                          flush=True)
+                    if free is not None and free < 80:
+                        print("  ⚠️ حافظه‌ی آزاد کم است — اگر ادامه پیدا کند "
+                              "کرنل پروسه را می‌کشد (سرور آفلاین می‌شود). "
+                              "تعدادِ سلف‌ها را کم کن یا BACKUP_EVERY را بالا ببر.",
+                              flush=True)
+            except Exception as e:
+                print(f"  ⚠️ ضربان: {type(e).__name__}", flush=True)
+            await asyncio.sleep(HEARTBEAT_EVERY)
+
     async def backup_loop(self):
         """حلقه پشتیبان خودکار — هر backup_interval() یکبار، بیدار و اثرانگشت را چک می‌کند.
         روی Render رایگان پیش‌فرض ۱۲۰ثانیه است تا بین دو دیپلوی نهایت ۲ دقیقه داده از دست برود.
@@ -15693,12 +15790,22 @@ class Manager:
         # می‌زند چند دقیقه جواب نمی‌دهد. watchdog هم از همان اول فعال است تا
         # اگر یکی جا افتاد، خودش جبران کند.
         threading.Thread(target=self.sup.watchdog, daemon=True).start()
+        # «چرا دیروز یهو آفلاین شد؟» — از ضربانِ اجرای قبلی می‌گوییم.
+        try:
+            _death = last_death_report(BASE_DIR)
+            if _death:
+                print(f"  {_death}", flush=True)
+                self._death_note = _death
+        except Exception as e:
+            print(f"  ⚠️ گزارشِ مرگِ قبلی: {type(e).__name__}", flush=True)
+        write_heartbeat(BASE_DIR, {"stage": "boot"})
         print(f"{'='*54}\n")
         self._spawn_boot(notify_admins=False, why="بوت")
         # ارجاع را نگه دار؛ وگرنه حلقهٔ پشتیبان ممکن است وسط کار جمع شود و بک‌آپ نرود.
         self._bg_tasks = []
-        for _coro in (self.duplicate_watch_loop(), self.reminder_loop(),
-                      self.points_loop(), self.trial_loop()):
+        for _coro in (self.heartbeat_loop(), self.duplicate_watch_loop(),
+                      self.reminder_loop(), self.points_loop(),
+                      self.trial_loop()):
             self._bg_tasks.append(asyncio.create_task(_coro))
         # پشتیبان خودکار روی تلگرام
         try:
