@@ -251,6 +251,77 @@ DEFAULTS = {
     },
 }
 
+# ── سقفِ حافظه‌ی کش‌ها ───────────────────────────────────────────────
+# تلگرام (telethon) هر کاربر/گروهی که ببیند را در `_mb_entity_cache` نگه
+# می‌دارد و آن دیکشنری **هیچ سقفی ندارد**. یک سلف‌باتِ تبادل که در چند ماه
+# با هزاران نفر طرف می‌شود، بی‌سروصدا چند مگابایت برای همیشه نگه می‌دارد.
+# اندازه‌گیری: هر موجودیت ~۰.۴ کیلوبایت → ۱۰٬۰۰۰ موجودیت ≈ ۴ مگابایت.
+ENTITY_CACHE_LIMIT = 8000
+LINK_CACHE_LIMIT = 1500
+
+
+def _env_int(name, default):
+    try:
+        v = int((os.environ.get(name) or "").strip() or default)
+    except Exception:
+        v = default
+    return max(0, v)
+
+
+ENTITY_CACHE_LIMIT = _env_int("JAFJ_ENTITY_CACHE", ENTITY_CACHE_LIMIT)
+LINK_CACHE_LIMIT = _env_int("JAFJ_LINK_CACHE", LINK_CACHE_LIMIT)
+
+
+def trim_entity_cache(client, limit=None):
+    """(تعدادِ حذف‌شده) — قدیمی‌ترین موجودیت‌ها را از کشِ تلگرام بردار.
+
+    چرا: `hash_map` سقف ندارد و با هر کاربرِ تازه رشد می‌کند. حذفِ قدیمی‌ها
+    فقط یعنی «برای بارِ بعد باید دوباره resolve شود» — هیچ رفتاری عوض
+    نمی‌شود، فقط حافظه آزاد می‌شود.
+    """
+    lim = int(limit if limit is not None else ENTITY_CACHE_LIMIT)
+    if lim <= 0:
+        return 0
+    try:
+        cache = getattr(client, "_mb_entity_cache", None)
+        hm = getattr(cache, "hash_map", None)
+        if not isinstance(hm, dict) or len(hm) <= lim:
+            return 0
+        keep = dict(list(hm.items())[-lim:])     # dict ترتیبِ درج را می‌داند
+        removed = len(hm) - len(keep)
+        hm.clear()
+        hm.update(keep)
+        return removed
+    except Exception:
+        return 0
+
+
+def trim_link_cache(eng, limit=None):
+    """(تعدادِ حذف‌شده) — کشِ «شناسه‌ی کانالِ لینک‌ها» را کوتاه کن.
+
+    این کش هم بدونِ سقف پر می‌شد: هر لینکِ تازه‌ای که در جریانِ تبادل دیده
+    شود یک رکورد می‌گذاشت و رکوردهای منقضی هیچ‌وقت پاک نمی‌شدند.
+    """
+    lim = int(limit if limit is not None else LINK_CACHE_LIMIT)
+    try:
+        cache = getattr(eng, "_exchange_link_id_cache", None)
+        if not isinstance(cache, dict):
+            return 0
+        now0 = time.time()
+        dead = [k for k, v in list(cache.items())
+                if not v or not isinstance(v, tuple) or v[0] < now0]
+        for k in dead:
+            cache.pop(k, None)
+        extra = 0
+        if lim > 0:
+            while len(cache) > lim:
+                cache.pop(next(iter(cache)), None)
+                extra += 1
+        return len(dead) + extra
+    except Exception:
+        return 0
+
+
 SESSION = "jafj"
 CREDS_FILE = "jafj_creds.json"
 AI_FILE = "jafj_ai.json"
@@ -7671,6 +7742,8 @@ async def connect_and_run(eng, creds):
                 # هیچ لینک دعوتی را برای تشخیص، Import/Join نمی‌کنیم.
                 cid = None
             cache[key] = (now0 + (300 if cid is not None else 30), cid)
+            if len(cache) > LINK_CACHE_LIMIT and LINK_CACHE_LIMIT > 0:
+                trim_link_cache(eng)
             return cid
 
         mine_ids = set()
@@ -9235,6 +9308,27 @@ async def connect_and_run(eng, creds):
                 eng.log("error", "risk_loop", f"{type(e).__name__}: {e}")
             await asyncio.sleep(max(10, int(eng.st["risk"].get("check_interval_sec", 60) or 60)))
 
+    async def memory_loop():
+        """هر ۱۰ دقیقه: کش‌های بی‌سقف را کوتاه کن (نشتیِ آرامِ حافظه).
+
+        بدونِ این، حافظه‌ی هر اکانت در طولِ هفته‌ها فقط بالا می‌رفت و تنها
+        راهِ برگشتنش ری‌استارت بود.
+        """
+        while True:
+            try:
+                n = trim_entity_cache(client)
+                if n:
+                    print(f"  🧹 {n} موجودیتِ قدیمی از کشِ تلگرام آزاد شد",
+                          flush=True)
+                m = trim_link_cache(eng)
+                if m:
+                    print(f"  🧹 {m} لینکِ قدیمی از کش آزاد شد", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(600)
+
     task = asyncio.create_task(sender_loop())
     ex_task = asyncio.create_task(exchange_worker())
     scan_task = asyncio.create_task(scan_loop())
@@ -9242,6 +9336,7 @@ async def connect_and_run(eng, creds):
     report_task = asyncio.create_task(report_loop())
     risk_task = asyncio.create_task(risk_loop())
     st_task = asyncio.create_task(status_loop())
+    mem_task = asyncio.create_task(memory_loop())
 
     await note(_startup_text())
 
@@ -9254,7 +9349,8 @@ async def connect_and_run(eng, creds):
     except BaseException as _e:
         _shutdown_exc = _e
     finally:
-        for t in (task, ex_task, scan_task, member_task, report_task, risk_task, st_task):
+        for t in (task, ex_task, scan_task, member_task, report_task, risk_task,
+                  st_task, mem_task):
             t.cancel()
         # دور awaitهای پاک‌سازی فقط except Exception می‌گذاریم؛ لغوِ بیرونی
         # اینجا بلعیده نمی‌شود (gather با return_exceptions خطای لغوِ فرزندها
@@ -9262,7 +9358,7 @@ async def connect_and_run(eng, creds):
         # فرزندها کامل انجام می‌شود.
         try:
             await asyncio.gather(task, ex_task, scan_task, member_task,
-                                 report_task, risk_task, st_task,
+                                 report_task, risk_task, st_task, mem_task,
                                  return_exceptions=True)
         except Exception:
             pass

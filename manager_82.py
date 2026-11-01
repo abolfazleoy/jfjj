@@ -4164,6 +4164,23 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def total_ram_mb():
+    """کلِ حافظه‌ی دستگاه (MB) از /proc/meminfo — None اگر معلوم نشد."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+# زیرِ این مقدار حافظه، پیش‌فرض «shard» می‌شود: در fork هر اکانت ~۱۱MB
+# سربارِ پروسه دارد و برای یک سرورِ ۵۱۲ مگابایتی یعنی ۵۰ اکانت کمتر.
+AUTO_SHARD_BELOW_MB = 1536.0
+
+
 def fork_supported():
     """آیا این سیستم fork واقعی دارد؟ (لینوکس بله، ویندوز نه)"""
     try:
@@ -4189,7 +4206,19 @@ def spawn_mode(env=None):
         return "shard" if fork_supported() else "process"
     if v in ("fork", "forked", "shared", "share", "1", "on", "yes", "اشتراکی"):
         return "fork" if fork_supported() else "process"
-    return "fork" if fork_supported() else "process"
+    if not fork_supported():
+        return "process"
+    # پیش‌فرضِ خودکار: روی ماشین‌های کم‌حافظه shard (هر اکانت ~۳.۳MB)،
+    # روی بقیه fork (هر اکانت یک پروسه‌ی جدا، خطاها کاملاً جدا).
+    total = None
+    try:
+        raw = (e.get("JAFJ_TOTAL_MB") or "").strip()
+        total = float(raw) if raw else total_ram_mb()
+    except Exception:
+        total = None
+    if total is not None and total <= AUTO_SHARD_BELOW_MB:
+        return "shard"
+    return "fork"
 
 
 # مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:

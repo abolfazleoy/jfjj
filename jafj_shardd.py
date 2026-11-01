@@ -68,6 +68,59 @@ def _reply(obj, lock):
             pass
 
 
+# نامِ ثابت → مقدارِ پیش‌فرضِ نسبی در 95.py
+REL_PATHS = {
+    "SESSION": "jafj",
+    "CREDS_FILE": "jafj_creds.json",
+    "AI_FILE": "jafj_ai.json",
+    "LIMITS_FILE": "jafj_limits.json",
+    "STATUS_FILE": "jafj_status.json",
+    "SETTINGS_FILE": "jafj_settings.json",
+    "DB_FILE": "jafj.db",
+    "LOG_FILE": "jafj.log",
+    "RUN_LOCK": "jafj.run.lock",
+}
+
+
+def _fix_defaults(fn, mapping):
+    """آرگومان‌های پیش‌فرضی که با مقدارِ نسبی بسته شده‌اند را مطلق کن.
+
+    مهم: `def __init__(self, path=DB_FILE)` مقدار را **هنگامِ تعریف** قفل
+    می‌کند؛ پس پچِ گلوبال به‌تنهایی کافی نیست.
+    """
+    try:
+        d = getattr(fn, "__defaults__", None)
+        if d:
+            nd = tuple(mapping.get(x, x) if isinstance(x, str) else x for x in d)
+            if nd != d:
+                fn.__defaults__ = nd
+        kw = getattr(fn, "__kwdefaults__", None)
+        if kw:
+            for k, v in list(kw.items()):
+                if isinstance(v, str) and v in mapping:
+                    kw[k] = mapping[v]
+    except Exception:
+        pass
+
+
+def _patch_paths(ns, folder):
+    """(mapping) — مسیرهای همین اکانت را داخلِ namespace مطلق کن."""
+    import types
+    mapping = {}
+    for name, rel in REL_PATHS.items():
+        abs_p = os.path.join(folder, rel)
+        ns[name] = abs_p
+        mapping[rel] = abs_p
+    for obj in list(ns.values()):
+        if isinstance(obj, types.FunctionType):
+            _fix_defaults(obj, mapping)
+        elif isinstance(obj, type):
+            for v in vars(obj).values():
+                if isinstance(v, types.FunctionType):
+                    _fix_defaults(v, mapping)
+    return mapping
+
+
 def _rewrite(src, folder):
     """مسیرهای نسبیِ 95.py را برای همین اکانت مطلق کن."""
     out = src
@@ -95,11 +148,12 @@ def _dep_names(src):
 class Account:
     """یک اکانت داخلِ شارد: رشته + لاگِ خودش + وضعیت."""
 
-    def __init__(self, uid, cwd, log_path, code):
+    def __init__(self, uid, cwd, log_path, code, fallback_code=None):
         self.uid = str(uid)
         self.cwd = str(cwd)
         self.log_path = str(log_path or "")
-        self.code = code
+        self.code = code                 # کدِ مشترک (یک بار کامپایل)
+        self.fallback_code = fallback_code   # نسخه‌ی بازنویسی‌شده (اگر پچ نشد)
         self.thread = None
         self.exited = None        # کدِ خروج وقتی تمام شد
         self._log = None
@@ -132,6 +186,14 @@ class Account:
                 ns = {"__name__": "jafj_acc_%s" % self.uid,
                       "__file__": self.path, "__builtins__": __builtins__}
                 exec(self.code, ns)
+                # مسیرهای این اکانت (سشن/دیتابیس/قفل) مطلق می‌شوند.
+                _patch_paths(ns, self.cwd)
+                if not str(ns.get("DB_FILE") or "").startswith(self.cwd):
+                    # اگر 95.py عوض شد و پچ جواب نداد: نسخه‌ی بازنویسی‌شده.
+                    self.write("  ⚠️ پچِ مسیرها نگرفت — با کامپایلِ جداگانه\n")
+                    ns = {"__name__": "jafj_acc_%s" % self.uid,
+                          "__file__": self.path, "__builtins__": __builtins__}
+                    exec(self.fallback_code, ns)
                 # اصلاح‌های مخصوصِ شارد، بعد از اجرای بدنه و قبل از main():
                 ns["print"] = self._mk_print()
                 exec(LOCK_OWNER_SHIM, ns)
@@ -196,6 +258,7 @@ def main():
 
     out_lock = threading.Lock()
     src = ""
+    base_code = None
     try:
         with open(selfbot_path, encoding="utf-8", errors="replace") as f:
             src = f.read()
@@ -203,6 +266,13 @@ def main():
         _reply({"event": "ready", "pid": os.getpid(), "error": "selfbot-missing"},
                out_lock)
         return 2
+
+    try:
+        # یک بار برای همه‌ی اکانت‌ها: نه ۲۵ مگابایت جهشِ کامپایل برای هر
+        # اکانت، نه یک کدآبجکتِ جدا برای هر کدام.
+        base_code = compile(src, selfbot_path, "exec")
+    except Exception:
+        base_code = None
 
     if str(args.preload_telethon).strip() not in ("0", "false", "no", "نه"):
         try:
@@ -265,11 +335,13 @@ def main():
                 continue
             try:
                 os.makedirs(cwd, exist_ok=True)
-                code = compile(_rewrite(src, cwd), selfbot_path, "exec")
+                fb = None
+                if base_code is None:
+                    fb = compile(_rewrite(src, cwd), selfbot_path, "exec")
             except Exception as e:
                 _reply({"ok": False, "error": "prepare: %s" % e}, out_lock)
                 continue
-            acc = Account(uid, cwd, logp, code)
+            acc = Account(uid, cwd, logp, base_code if base_code is not None else fb, fb)
             accounts[uid] = acc
             acc.start()
             _reply({"ok": True, "pid": os.getpid(), "uid": uid}, out_lock)
