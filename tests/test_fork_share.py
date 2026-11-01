@@ -6,10 +6,16 @@
 ~۴ گیگابایت فقط برای کدِ تکراری. با fork از یک والدِ مشترک، آن حافظه یک‌بار
 می‌نشیند و بینِ فرزندها مشترک می‌شود (copy-on-write).
 
-این تست واقعاً اندازه می‌گیرد: یک بلوکِ بزرگ در والد ساخته می‌شود، سپس دو
-فرزند fork می‌شوند و PSS (حافظه‌ی واقعیِ هر پروسه) با RSS مقایسه می‌شود.
+این تست سه چیز را واقعاً اندازه می‌گیرد:
+
+1. دو فرزند، هرکدام با پوشه و لاگِ خودش.
+2. PSS در مقابل RSS: یک بلوکی که در **دیمن** لود شده باید مشترک بماند.
+3. فرزند گروهِ پروسه‌ی خودش را دارد، پس `killpg` برای یک اکانت بقیه و دیمن
+   را نمی‌کشد (این باگ واقعاً وجود داشت).
+
+و یک محافظِ رگرسیون: دیمن هرگز فایلِ سلف را import نمی‌کند. فایلِ سلفی که
+بدنه‌اش همان اول صبر می‌کند (بدونِ main) نباید دیمن را بلوکه کند.
 """
-import json
 import os
 import sys
 import tempfile
@@ -51,30 +57,49 @@ def mem(pid):
 def alive(pid):
     try:
         os.kill(pid, 0)
-        return True
     except Exception:
         return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
+                return False
+    except Exception:
+        pass
+    return True
 
 
+# بدنه‌ی سلف — مثلِ `python file.py` اجرا می‌شود (بدونِ main، مثلِ اسکریپت).
 FAKE_SELF = '''
 import os, sys, time
-BIG = bytearray(b"x" * (96 * 1024 * 1024))   # ۹۶ مگابایتِ مشترک
-def main():
-    print("FAKE-SB cwd=%s pid=%d big=%d" % (os.getcwd(), os.getpid(), len(BIG)),
-          flush=True)
-    time.sleep(25)
-    return 0
+sys.stdout.write("FAKE-SB cwd=%s pid=%d\\n" % (os.getcwd(), os.getpid()))
+sys.stdout.flush()
+try:
+    import bigmod                      # در دیمن لود شده → باید مشترک بماند
+    sys.stdout.write("BIG=%d\\n" % len(bigmod.BIG))
+    sys.stdout.flush()
+except Exception as e:
+    sys.stdout.write("NO-BIG %r\\n" % (e,))
+    sys.stdout.flush()
+time.sleep(25)
+raise SystemExit(0)
 '''
+
+# بلوکِ بزرگ فقط برای اثباتِ اشتراکِ حافظه (در دیمن لود می‌شود).
+BIGMOD = 'BIG = bytearray(b"x" * (96 * 1024 * 1024))\n'
 
 
 def main():
     root = Path(tempfile.mkdtemp(prefix="jafj_fork_"))
     here = os.getcwd()
-    saved_data = os.environ.get("DATA_DIR")
-    saved_port = os.environ.get("PORT")
+    saved = {k: os.environ.get(k) for k in
+             ("DATA_DIR", "PORT", "JAFJ_ONLY", "PYTHONPATH",
+              "JAFJ_PRELOAD_EXTRA")}
     os.environ["DATA_DIR"] = str(root / "data")
     os.environ["PORT"] = "8551"
     os.environ.pop("JAFJ_ONLY", None)
+    os.environ["PYTHONPATH"] = str(root)
+    os.environ["JAFJ_PRELOAD_EXTRA"] = "bigmod"
+    (root / "bigmod.py").write_text(BIGMOD, encoding="utf-8")
     selfbot = root / "fake_self.py"
     selfbot.write_text(FAKE_SELF, encoding="utf-8")
     try:
@@ -105,11 +130,19 @@ def main():
         a.mkdir()
         b.mkdir()
         la, lb = a / "run.log", b / "run.log"
+        t0 = time.time()
         pid_a, err_a = d.spawn(a, la, "111")
+        d_sa = time.time() - t0
+        t0 = time.time()
         pid_b, err_b = d.spawn(b, lb, "222")
+        d_sb = time.time() - t0
         check("spawn: فرزندِ اول pid دارد", bool(pid_a), err_a)
         check("spawn: فرزندِ دوم pid دارد", bool(pid_b), err_b)
         check("spawn: دو pid متفاوت", pid_a and pid_b and pid_a != pid_b)
+        # دیمن نباید هیچ‌وقت بدنه‌ی سلف را اجرا کند؛ وگرنه اسکریپتی که اول
+        # صبر می‌کند کلِ سرویس را قفل می‌کرد.
+        check("spawn: فوری جواب می‌دهد (بدنه‌ی سلف در دیمن اجرا نمی‌شود)",
+              d_sa < 3 and d_sb < 3, (d_sa, d_sb))
         time.sleep(1.5)
         check("فرزندِ اول زنده است", pid_a and alive(pid_a))
         check("فرزندِ دوم زنده است", pid_b and alive(pid_b))
@@ -118,6 +151,9 @@ def main():
               la.read_text(encoding="utf-8", errors="ignore")[:200])
         check("فرزندِ دوم در پوشه‌ی خودش اجرا شد",
               str(b) in lb.read_text(encoding="utf-8", errors="ignore"))
+        check("فرزند: فایلِ سلف به‌عنوان __main__ اجرا شد",
+              "BIG=" in la.read_text(encoding="utf-8", errors="ignore"),
+              la.read_text(encoding="utf-8", errors="ignore")[:300])
 
         # ── ۴) حافظه‌ی مشترک: PSS باید خیلی کمتر از RSS باشد ─────────
         rss_a, pss_a = mem(pid_a)
@@ -127,7 +163,7 @@ def main():
             shared = 1 - (pss_a / rss_a)
             print(f"   RSS={rss_a:.0f}MB PSS={pss_a:.0f}MB → سهمِ مشترک "
                   f"~{shared * 100:.0f}%")
-            check("حافظه: بلوکِ مشترک بینِ فرزندها شریک شده (PSS < RSS)",
+            check("حافظه: بلوکِ لودشده در دیمن بینِ فرزندها مشترک است",
                   pss_a < rss_a * 0.75, (rss_a, pss_a))
         else:
             check("حافظه: PSS در دسترس نیست (skipped)", True)
@@ -143,8 +179,7 @@ def main():
             pg_a = os.getpgid(pid_a)
         except Exception:
             pg_a = None
-        check("فرزند گروهِ پروسه‌ی خودش را دارد (setsid)",
-              pg_a == pid_a, pg_a)
+        check("فرزند گروهِ پروسه‌ی خودش را دارد (setsid)", pg_a == pid_a, pg_a)
         check("فرزند هم‌گروهِ مدیر نیست",
               pg_a is not None and pg_a != os.getpgid(os.getpid()))
 
@@ -153,8 +188,9 @@ def main():
         time.sleep(0.8)
         check("فرزند بعد از SIGTERM می‌میرد", not alive(pid_a))
         check("فرزندِ دیگر دست‌نخورده می‌ماند", alive(pid_b))
+        check("داِمن بعد از کشتنِ یک فرزند زنده است", d.alive())
 
-        # ── ۷) مدیر: مسیرِ fork در start() و بستن در shutdown ───────
+        # ── ۸) مدیر: مسیرِ fork در start() و بستن در shutdown ───────
         src = (REPO / "manager_82.py").read_text(encoding="utf-8")
         check("مدیر: start() حالتِ fork را می‌شناسد",
               'spawn_mode() == "fork"' in src)
@@ -167,10 +203,14 @@ def main():
               "_fork_broken" in src)
         check("مدیر: _AdoptedProc سیگنال‌پذیر است",
               hasattr(M._AdoptedProc, "kill") and hasattr(M._AdoptedProc, "terminate"))
+        check("مدیر: کدِ خروجِ فرزند را از دیمن می‌خواند",
+              "def drain" in src and "self.exits" in src)
+
         fork_src = (REPO / "jafj_forkd.py").read_text(encoding="utf-8")
-        check("داِمن: gc.freeze قبل از fork (صفحه‌های مشترک کمتر کپی می‌شوند)",
-              "gc.freeze()" in fork_src)
+        check("داِمن: gc.freeze قبل از fork", "gc.freeze()" in fork_src)
         check("داِمن: فرزند setsid می‌شود", "os.setsid()" in fork_src)
+        check("داِمن: فایلِ سلف را import نمی‌کند",
+              "spec_from_file_location" not in fork_src)
 
         os.kill(pid_b, 15)
         d.close()
@@ -178,14 +218,11 @@ def main():
         check("داِمن بعد از close می‌میرد", not d.alive())
     finally:
         os.chdir(here)
-        if saved_data is None:
-            os.environ.pop("DATA_DIR", None)
-        else:
-            os.environ["DATA_DIR"] = saved_data
-        if saved_port is None:
-            os.environ.pop("PORT", None)
-        else:
-            os.environ["PORT"] = saved_port
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         import shutil
         shutil.rmtree(root, ignore_errors=True)
 

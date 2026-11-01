@@ -3,12 +3,15 @@
 """jafj_forkd — «همه‌ی سلف‌ها یک نسخه‌ی تلگرام در رم داشته باشند».
 
 مشکل: هر `95.py` یک پروسه‌ی جدا است و فقط `import telethon` حدودِ ۴۰ مگابایت
-رم می‌گیرد (اندازه‌گیری‌شده). با ۱۰۰ اکانت یعنی ~۴ گیگابایت فقط برای کدِ
+رم می‌گیرد (اندازه‌گیری‌شده). با ۱۰۰ اکانت یعنی چند گیگابایت فقط برای کدِ
 تلگرام که ۱۰۰ بار تکرار شده.
 
-راه‌حل: این دیمن یک‌بار `95.py` و `telethon` را لود می‌کند و بعد برای هر اکانت
-`fork` می‌زند. صفحه‌های حافظه‌ی تلگرام بینِ همه‌ی فرزندها **مشترک** می‌شوند
+راه‌حل: این دیمن یک‌بار کتابخانه‌ها را لود می‌کند و بعد برای هر اکانت `fork`
+می‌زند. صفحه‌های حافظه‌ی تلگرام بینِ همه‌ی فرزندها **مشترک** می‌شوند
 (copy-on-write)، پس در حافظه‌ی واقعی (PSS/cgroup) یک‌بار حساب می‌شوند.
+
+اندازه‌گیریِ واقعی با همان `95.py` (۳ اکانت): پروسه‌ی جدا ۶۲MB برای هر اکانت،
+fork ~۲۰MB — جزئیات در `WISPBYTE_FA.md` §۱۲.
 
 پروتکل: خط‌به‌خط JSON روی stdin/stdout.
 
@@ -16,24 +19,21 @@
       → {"ok":true,"pid":4567,"uid":"123"}
     {"cmd":"ping"}          → {"ok":true,"alive":[…]}
     {"cmd":"quit"}          → خروج
-    رویداد: {"event":"exit","pid":4567,"code":0}
+    رویداد: {"event":"exit","pid":4567,"uid":"123","code":0}
 
-نکته‌ی ایمنی: این دیمن عمداً **تک‌رشته‌ای** است و تنها کاری که می‌کند fork
-است؛ fork از یک پروسه‌ی چندرشته‌ای (مدیر) می‌تواند قفل‌ها را در حالتِ نامعلوم
-به ارث بدهد.
+نکته‌های ایمنی:
+
+* دیمن عمداً **تک‌رشته‌ای** است و تنها کاری که می‌کند fork است؛ fork از یک
+  پروسه‌ی چندرشته‌ای (مدیر) می‌تواند قفل‌ها را در حالتِ نامعلوم به ارث بدهد.
+* دیمن **هرگز** فایلِ سلف را import نمی‌کند: import یعنی اجرای بدنه‌ی ماژول
+  در دیمن؛ اگر آن بدنه بلوکه شود (مثلِ اسکریپتی که همان اول صبر می‌کند)
+  دیگر هیچ اکانتی بالا نمی‌آمد. فرزند خودش فایل را مثلِ `python 95.py`
+  اجرا می‌کند.
 """
 import argparse
-import importlib.util
 import json
 import os
 import sys
-
-
-def _load_selfbot(path):
-    spec = importlib.util.spec_from_file_location("jafj_selfbot", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _reply(obj):
@@ -44,8 +44,13 @@ def _reply(obj):
         pass
 
 
-def _child_main(mod, cwd, log_path):
-    """بدنه‌ی فرزند — هرگز برنگردد؛ با os._exit تمام شود."""
+def _child_exec(selfbot_path, cwd, log_path, code_obj=None):
+    """بدنه‌ی فرزند — هرگز برنگردد؛ با os._exit تمام شود.
+
+    دقیقاً همان کاری که `python 95.py` می‌کند: فایل به‌عنوان `__main__` اجرا
+    می‌شود، پس `if __name__ == "__main__": sys.exit(main())` پایینِ فایل
+    کارِ خودش را می‌کند و رفتارِ سلف با حالتِ پروسه‌ی جدا یکی است.
+    """
     out = None
     # گروهِ پروسه‌ی مستقل: بدونِ این، `killpg`ِ مدیر برای خاموش‌کردنِ یک
     # اکانت، دیمن و همه‌ی سلف‌های دیگر را هم می‌کشت.
@@ -71,12 +76,25 @@ def _child_main(mod, cwd, log_path):
             os.dup2(out, 2)
         except Exception:
             out = None
+    try:
+        sys.argv = [selfbot_path]
+        d = os.path.dirname(os.path.abspath(selfbot_path))
+        if d and d not in sys.path:
+            sys.path.insert(0, d)
+    except Exception:
+        pass
     code = 1
     try:
-        code = mod.main()
-        if hasattr(code, "__await__"):        # اگر روزی main() async شد
-            import asyncio
-            code = asyncio.run(code)
+        obj = code_obj
+        if obj is None:
+            with open(selfbot_path, encoding="utf-8", errors="replace") as f:
+                src = f.read()
+            obj = compile(src, selfbot_path, "exec")
+        ns = {"__name__": "__main__", "__file__": selfbot_path,
+              "__doc__": None, "__package__": None, "__spec__": None,
+              "__builtins__": __builtins__}
+        exec(obj, ns)               # کدِ کامپایل‌شده در دیمن → صفحه‌های مشترک
+        code = 0
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except KeyboardInterrupt:
@@ -104,23 +122,62 @@ def main():
     ap.add_argument("--preload-extra", default="",
                     help="ماژول‌های اضافی با کاما (مثلاً sqlite3,asyncio)")
     args = ap.parse_args()
+    selfbot_path = os.path.abspath(args.selfbot)
+    if not os.path.isfile(selfbot_path):
+        _reply({"event": "ready", "pid": os.getpid(), "warning": "selfbot-missing"})
+        return 2
 
-    mod = _load_selfbot(os.path.abspath(args.selfbot))
-    has_main = callable(getattr(mod, "main", None))
+    # فقط کتابخانه‌ها؛ خودِ فایلِ سلف عمداً لود نمی‌شود (بالا توضیح داده شد).
     if str(args.preload_telethon).strip() not in ("0", "false", "no", "نه"):
         try:
             import telethon            # noqa: F401  (عمداً برای اشتراکِ حافظه)
         except Exception:
             pass
-    for name in [x.strip() for x in (args.preload_extra or "").split(",") if x.strip()]:
+    # کدِ 95.py را همین‌جا کامپایل می‌کنیم (اجرا نه): هم فرزندها دیگر
+    # کامپایل نمی‌کنند، هم کد‌آبجکت‌ها بینِ آن‌ها مشترک می‌مانند.
+    code_obj = None
+    try:
+        with open(selfbot_path, encoding="utf-8", errors="replace") as f:
+            _src = f.read()
+        code_obj = compile(_src, selfbot_path, "exec")
+    except Exception:
+        code_obj = None
+
+    # وابستگی‌های 95.py را هم این‌جا لود کن تا در فرزندها **مشترک** باشند،
+    # ولی خودِ بدنه‌ی فایل اجرا نمی‌شود (تنها import‌های سطحِ بالا).
+    try:
+        import ast
+        _local = {os.path.splitext(x)[0]
+                  for x in os.listdir(os.path.dirname(selfbot_path) or ".")
+                  if x.endswith(".py")}
+        _names = set()
+        for _n in ast.walk(ast.parse(_src)):
+            if isinstance(_n, ast.Import):
+                for _a in _n.names:
+                    _names.add(_a.name.split(".")[0])
+            elif isinstance(_n, ast.ImportFrom) and _n.level == 0 and _n.module:
+                _names.add(_n.module.split(".")[0])
+        for _m in sorted(_names):
+            if _m in _local or _m in ("__future__",):
+                continue
+            try:
+                __import__(_m)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    _extra = (args.preload_extra
+              or os.environ.get("JAFJ_PRELOAD_EXTRA") or "")
+    for name in [x.strip() for x in _extra.split(",") if x.strip()]:
         try:
             __import__(name)
         except Exception:
             pass
 
-    # اشیای لود‌شده (کدِ تلگرام و 95.py) را از چرخه‌ی GC بیرون بگذار: هم
-    # جست‌وجوی GC ارزان‌تر می‌شود، هم فرزندها کمتر دست به صفحه‌های
-    # copy-on-write می‌زنند — یعنی همان حافظه‌ی مشترک واقعاً مشترک می‌ماند.
+    # اشیای لود‌شده را از چرخه‌ی GC بیرون بگذار: هم جست‌وجوی GC ارزان‌تر
+    # می‌شود، هم فرزندها کمتر دست به صفحه‌های copy-on-write می‌زنند — یعنی
+    # حافظه‌ی مشترک واقعاً مشترک می‌ماند.
     try:
         import gc
         gc.collect()
@@ -178,18 +235,13 @@ def main():
                 cwd = msg.get("cwd") or "."
                 log_path = msg.get("log") or ""
                 uid = str(msg.get("uid") or "")
-                if not has_main:
-                    # سلفی که main() ندارد را با fork نمی‌شود اجرا کرد؛ مدیر
-                    # خودش به پروسه‌ی جدا برمی‌گردد (به‌جای خطای بی‌معنی).
-                    _reply({"ok": False, "error": "selfbot main() ندارد"})
-                    continue
                 try:
                     pid = os.fork()
                 except Exception as e:
                     _reply({"ok": False, "error": f"fork: {type(e).__name__}: {e}"})
                     continue
                 if pid == 0:                      # ── فرزند ──
-                    _child_main(mod, cwd, log_path)
+                    _child_exec(selfbot_path, cwd, log_path, code_obj)
                     os._exit(1)                   # هرگز نمی‌رسیم
                 children[pid] = uid
                 _reply({"ok": True, "pid": pid, "uid": uid})
