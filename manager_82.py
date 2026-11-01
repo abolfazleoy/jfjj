@@ -3592,13 +3592,157 @@ class _AdoptedProc:
     def poll(self):
         try:
             os.kill(self.pid, 0)
-            return None
         except ProcessLookupError:
             return 1
         except PermissionError:
-            return None
+            pass
         except Exception:
             return 1
+        # پروسه‌ی زامبی (مرده ولی جمع‌نشده) هم «مرده» است؛ وگرنه سلفی که با
+        # fork اجرا شده و مرده، برای همیشه «زنده» شمرده می‌شود.
+        try:
+            with open(f"/proc/{self.pid}/stat", encoding="utf-8") as f:
+                if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
+                    return 1
+        except Exception:
+            pass
+        return None
+
+
+class ForkDaemon:
+    """کلاینتِ `jafj_forkd.py` — سلف‌ها با حافظه‌ی مشترک.
+
+    چرا: هر سلفِ جدا `import telethon` را تکرار می‌کند (~۴۰ مگابایت). با
+    fork از یک والدِ مشترک، آن ۴۰ مگابایت یک‌بار در رم می‌نشیند و بینِ همه
+    شریک می‌شود (copy-on-write). برای ۱۰۰ اکانت تفاوتِ چند گیگابایت است.
+
+    رابطش عمداً همان چیزی است که Supervisor از یک پروسه می‌خواهد: pid و poll.
+    """
+
+    def __init__(self, selfbot=None, python=None):
+        self.python = python or sys.executable
+        self.selfbot = selfbot or SELFBOT
+        self.proc = None
+        self._buf = b""
+        self._lock = threading.Lock()
+        self.last_error = ""
+
+    def forker_path(self):
+        d = os.path.dirname(os.path.abspath(self.selfbot))
+        cand = os.path.join(d, "jafj_forkd.py")
+        if os.path.isfile(cand):
+            return cand
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "jafj_forkd.py")
+
+    def alive(self):
+        return bool(self.proc is not None and self.proc.poll() is None)
+
+    def start(self, timeout=90):
+        if self.alive():
+            return True
+        path = self.forker_path()
+        if not os.path.isfile(path):
+            self.last_error = f"jafj_forkd.py پیدا نشد ({path})"
+            return False
+        try:
+            _env = dict(os.environ)
+            _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
+            self.proc = subprocess.Popen(
+                [self.python, path, "--selfbot", os.path.abspath(self.selfbot)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0, env=_env,
+                start_new_session=True)
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return False
+        msg = self._read_until({"event": "ready"}, timeout=timeout)
+        if msg is None:
+            self.last_error = "دیمن آماده نشد (timeout)"
+            return False
+        return True
+
+    def _send(self, obj):
+        self.proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n")
+                              .encode("utf-8"))
+        self.proc.stdin.flush()
+
+    def _read_msg(self, timeout):
+        end = time.time() + max(0.0, timeout)
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl >= 0:
+                line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+                try:
+                    return json.loads(line.decode("utf-8", "ignore"))
+                except Exception:
+                    continue
+            left = end - time.time()
+            if left <= 0 or not self.alive():
+                return None
+            try:
+                import select
+                r, _, _ = select.select([self.proc.stdout], [], [], left)
+                if not r:
+                    return None
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+    def _read_until(self, want, timeout=30):
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._read_msg(max(0.1, end - time.time()))
+            if msg is None:
+                return None
+            if all(msg.get(k) == v for k, v in want.items()):
+                return msg
+        return None
+
+    def _read_ok(self, timeout=30, skip_events=True):
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = self._read_msg(max(0.1, end - time.time()))
+            if msg is None:
+                return None
+            if "ok" in msg:
+                return msg
+            if not skip_events:
+                return msg
+        return None
+
+    def spawn(self, cwd, log, uid, timeout=60):
+        """(pid, خطا) — فرزندِ تازه با cwd پوشه‌ی همان اکانت."""
+        with self._lock:
+            if not self.start():
+                return None, self.last_error or "دیمن بالا نیامد"
+            try:
+                self._send({"cmd": "run", "cwd": str(cwd), "log": str(log),
+                            "uid": str(uid)})
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
+            msg = self._read_ok(timeout=timeout)
+            if not msg or not msg.get("ok"):
+                return None, (msg or {}).get("error") or "پاسخِ دیمن نیامد"
+            try:
+                return int(msg["pid"]), ""
+            except Exception:
+                return None, "pid نامعتبر"
+
+    def close(self):
+        try:
+            if self.alive():
+                self._send({"cmd": "quit"})
+        except Exception:
+            pass
+        try:
+            if self.alive():
+                self.proc.terminate()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════
@@ -3818,6 +3962,15 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def spawn_mode(env=None):
+    """«process» (پیش‌فرض) یا «fork» (حافظه‌ی مشترک برای ۱۰۰ اکانت)."""
+    e = env if env is not None else os.environ
+    v = (e.get("JAFJ_SPAWN_MODE") or "process").strip().lower()
+    if v in ("fork", "forked", "shared", "share", "اشتراکی"):
+        return "fork"
+    return "process"
+
+
 def proc_rss_mb(pid):
     """حافظه‌ی واقعیِ یک پروسه (MB) از /proc — None اگر نبود."""
     try:
@@ -4670,11 +4823,25 @@ class Supervisor:
             # سشن معتبر نباشد با کدِ ۷۸ خارج می‌شود و ما علامت می‌زنیم.
             _env = dict(os.environ)
             _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
-            p = subprocess.Popen(
-                [sys.executable, SELFBOT],
-                cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, env=_env,
-                start_new_session=True)
+            p = None
+            if spawn_mode() == "fork":
+                # حافظه‌ی تلگرام بینِ همه‌ی اکانت‌ها مشترک می‌شود (COW).
+                _pid, _err = self.fork_daemon().spawn(
+                    folder, os.path.join(folder, "run.log"), uid)
+                if _pid:
+                    p = _AdoptedProc(_pid)
+                else:
+                    try:
+                        print(f"  ⚠️ fork برای {uid} نشد ({_err}) — با پروسه‌ی "
+                              "جدا اجرا می‌کنم", flush=True)
+                    except Exception:
+                        pass
+            if p is None:
+                p = subprocess.Popen(
+                    [sys.executable, SELFBOT],
+                    cwd=folder, stdout=logf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, env=_env,
+                    start_new_session=True)
         except Exception as e:
             try:
                 logf.close()
@@ -4941,6 +5108,14 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def fork_daemon(self):
+        """دیمنِ fork (یک‌بار ساخته می‌شود)."""
+        d = getattr(self, "_forkd", None)
+        if d is None:
+            d = ForkDaemon(SELFBOT)
+            self._forkd = d
+        return d
+
     def children_rss(self):
         """[(uid, pid, MB)] برای سلف‌های روشن + مجموع. برای گزارشِ حافظه."""
         out = []
@@ -5147,6 +5322,11 @@ class Supervisor:
     def shutdown(self):
         for uid in list(self.procs):
             self.stop(uid)
+        try:
+            if getattr(self, "_forkd", None) is not None:
+                self._forkd.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════
