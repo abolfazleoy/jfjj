@@ -111,6 +111,18 @@ def main():
         except Exception:
             pass
 
+        # ── ۴ب) اندازه‌گیریِ واقعیِ مصرفِ هر سلف ──────────────────────
+        me = M.proc_rss_mb(os.getpid())
+        check("proc_rss_mb: حافظه‌ی خودِ پروسه را می‌خواند",
+              me is not None and me > 5, me)
+        check("proc_rss_mb: PIDِ ناموجود → None", M.proc_rss_mb(999999) is None)
+        rss = sup.children_rss()
+        check("children_rss: لیستی از (uid, pid, MB) می‌دهد",
+              isinstance(rss, list) and all(len(x) == 3 for x in rss), rss)
+        src_now = (REPO / "manager_82.py").read_text(encoding="utf-8")
+        check("ضربان: مصرفِ تجمعیِ سلف‌ها را چاپ می‌کند",
+              "مصرفِ سلف‌ها" in src_now)
+
         # ── ۵) پیام و ثبت در لاگ ─────────────────────────────────────
         src = (REPO / "manager_82.py").read_text(encoding="utf-8")
         check("مدیر: دلیلِ کمبودِ حافظه در db.log ثبت می‌شود",

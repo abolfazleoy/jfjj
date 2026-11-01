@@ -3818,6 +3818,18 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def proc_rss_mb(pid):
+    """حافظه‌ی واقعیِ یک پروسه (MB) از /proc — None اگر نبود."""
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
 def ram_gate_mb(env=None):
     """حدِ حافظه‌ی آزادِ لازم برای روشن‌کردنِ سلفِ بعدی (۰ = بی‌نگهبان).
 
@@ -4929,6 +4941,20 @@ class Supervisor:
         return sum(1 for u in list(self.procs) if self.is_running(u))
 
     # ---------- نگهبان ----------
+    def children_rss(self):
+        """[(uid, pid, MB)] برای سلف‌های روشن + مجموع. برای گزارشِ حافظه."""
+        out = []
+        for uid, p in list(getattr(self, "procs", {}).items()):
+            try:
+                if p is None or p.poll() is not None:
+                    continue
+                mb = proc_rss_mb(p.pid)
+                if mb is not None:
+                    out.append((uid, p.pid, mb))
+            except Exception:
+                continue
+        return out
+
     def mark_connected(self, uid=None):
         """زمانِ آخرین «وصل‌کردنِ سشن» را روی دیسک بنویس.
 
@@ -14869,9 +14895,24 @@ class Manager:
                 nowt = time.time()
                 if nowt - _last_log >= 300:
                     _last_log = nowt
-                    print(f"  💾 RAM آزاد: {free if free is not None else '?'}MB "
-                          f"· سلف‌های روشن: {running if running is not None else '?'}",
-                          flush=True)
+                    parts = [f"RAM آزاد: {free if free is not None else '?'}MB",
+                             f"سلف‌های روشن: "
+                             f"{running if running is not None else '?'}"]
+                    try:
+                        kids = self.sup.children_rss()
+                        if kids:
+                            tot = round(sum(k[2] for k in kids), 1)
+                            worst = sorted(kids, key=lambda k: -k[2])[:3]
+                            parts.append(
+                                f"مصرفِ سلف‌ها: {tot}MB (" +
+                                ", ".join(f"{u}:{mb}MB" for u, _p, mb in worst) +
+                                ")")
+                        me = proc_rss_mb(os.getpid())
+                        if me:
+                            parts.append(f"مدیر: {me}MB")
+                    except Exception:
+                        pass
+                    print("  💾 " + " · ".join(parts), flush=True)
                     if free is not None and free < 80:
                         print("  ⚠️ حافظه‌ی آزاد کم است — اگر ادامه پیدا کند "
                               "کرنل پروسه را می‌کشد (سرور آفلاین می‌شود). "
