@@ -47,6 +47,12 @@ def _reply(obj):
 def _child_main(mod, cwd, log_path):
     """بدنه‌ی فرزند — هرگز برنگردد؛ با os._exit تمام شود."""
     out = None
+    # گروهِ پروسه‌ی مستقل: بدونِ این، `killpg`ِ مدیر برای خاموش‌کردنِ یک
+    # اکانت، دیمن و همه‌ی سلف‌های دیگر را هم می‌کشت.
+    try:
+        os.setsid()
+    except Exception:
+        pass
     try:
         os.chdir(cwd)
     except Exception:
@@ -68,6 +74,9 @@ def _child_main(mod, cwd, log_path):
     code = 1
     try:
         code = mod.main()
+        if hasattr(code, "__await__"):        # اگر روزی main() async شد
+            import asyncio
+            code = asyncio.run(code)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except KeyboardInterrupt:
@@ -97,6 +106,7 @@ def main():
     args = ap.parse_args()
 
     mod = _load_selfbot(os.path.abspath(args.selfbot))
+    has_main = callable(getattr(mod, "main", None))
     if str(args.preload_telethon).strip() not in ("0", "false", "no", "نه"):
         try:
             import telethon            # noqa: F401  (عمداً برای اشتراکِ حافظه)
@@ -107,6 +117,17 @@ def main():
             __import__(name)
         except Exception:
             pass
+
+    # اشیای لود‌شده (کدِ تلگرام و 95.py) را از چرخه‌ی GC بیرون بگذار: هم
+    # جست‌وجوی GC ارزان‌تر می‌شود، هم فرزندها کمتر دست به صفحه‌های
+    # copy-on-write می‌زنند — یعنی همان حافظه‌ی مشترک واقعاً مشترک می‌ماند.
+    try:
+        import gc
+        gc.collect()
+        if hasattr(gc, "freeze"):
+            gc.freeze()
+    except Exception:
+        pass
 
     children = {}
 
@@ -157,6 +178,11 @@ def main():
                 cwd = msg.get("cwd") or "."
                 log_path = msg.get("log") or ""
                 uid = str(msg.get("uid") or "")
+                if not has_main:
+                    # سلفی که main() ندارد را با fork نمی‌شود اجرا کرد؛ مدیر
+                    # خودش به پروسه‌ی جدا برمی‌گردد (به‌جای خطای بی‌معنی).
+                    _reply({"ok": False, "error": "selfbot main() ندارد"})
+                    continue
                 try:
                     pid = os.fork()
                 except Exception as e:

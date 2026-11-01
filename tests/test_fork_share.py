@@ -82,11 +82,15 @@ def main():
         import manager_82 as M
 
         # ── ۱) حالتِ spawn ─────────────────────────────────────────────
-        check("spawn_mode: پیش‌فرض process", M.spawn_mode({}) == "process")
-        check("spawn_mode: fork", M.spawn_mode({"JAFJ_SPAWN_MODE": "fork"}) == "fork")
-        check("spawn_mode: اشتراکی", M.spawn_mode({"JAFJ_SPAWN_MODE": "اشتراکی"}) == "fork")
-        check("spawn_mode: مقدارِ ناشناخته → process",
-              M.spawn_mode({"JAFJ_SPAWN_MODE": "xyz"}) == "process")
+        has_fork = bool(hasattr(os, "fork") and os.path.isdir("/proc/self"))
+        want = "fork" if has_fork else "process"
+        check("spawn_mode: پیش‌فرض fork (روی لینوکس)", M.spawn_mode({}) == want)
+        check("spawn_mode: fork", M.spawn_mode({"JAFJ_SPAWN_MODE": "fork"}) == want)
+        check("spawn_mode: اشتراکی", M.spawn_mode({"JAFJ_SPAWN_MODE": "اشتراکی"}) == want)
+        check("spawn_mode: process راهِ فرار است",
+              M.spawn_mode({"JAFJ_SPAWN_MODE": "process"}) == "process")
+        check("spawn_mode: مقدارِ ناشناخته → پیش‌فرض",
+              M.spawn_mode({"JAFJ_SPAWN_MODE": "xyz"}) == want)
 
         # ── ۲) دیمن بالا می‌آید ────────────────────────────────────────
         d = M.ForkDaemon(str(selfbot))
@@ -132,8 +136,20 @@ def main():
         check("داِمن: هر دو فرزند زیرِ یک والد هستند",
               d.alive() and alive(pid_a) and alive(pid_b))
 
-        # ── ۶) خاموش‌کردن با سیگنال (همان کاری که stop() می‌کند) ────
-        os.kill(pid_a, 15)
+        # ── ۶) هر فرزند گروهِ پروسه‌ی خودش را دارد ───────────────────
+        # بدونِ این، `killpg`ِ مدیر برای خاموش‌کردنِ یک اکانت، دیمن و همه‌ی
+        # سلف‌های دیگر را هم می‌کشت.
+        try:
+            pg_a = os.getpgid(pid_a)
+        except Exception:
+            pg_a = None
+        check("فرزند گروهِ پروسه‌ی خودش را دارد (setsid)",
+              pg_a == pid_a, pg_a)
+        check("فرزند هم‌گروهِ مدیر نیست",
+              pg_a is not None and pg_a != os.getpgid(os.getpid()))
+
+        # ── ۷) خاموش‌کردنِ گروهی (همان کاری که stop() می‌کند) ───────
+        os.killpg(pg_a, 15)
         time.sleep(0.8)
         check("فرزند بعد از SIGTERM می‌میرد", not alive(pid_a))
         check("فرزندِ دیگر دست‌نخورده می‌ماند", alive(pid_b))
@@ -147,6 +163,14 @@ def main():
         check("مدیر: زامبی «مرده» شمرده می‌شود",
               '== "Z"' in src and "/stat" in src)
         check("مدیر: shutdown دیمن را می‌بندد", "self._forkd.close()" in src)
+        check("مدیر: بعد از یک شکست دیگر timeout نمی‌خورد",
+              "_fork_broken" in src)
+        check("مدیر: _AdoptedProc سیگنال‌پذیر است",
+              hasattr(M._AdoptedProc, "kill") and hasattr(M._AdoptedProc, "terminate"))
+        fork_src = (REPO / "jafj_forkd.py").read_text(encoding="utf-8")
+        check("داِمن: gc.freeze قبل از fork (صفحه‌های مشترک کمتر کپی می‌شوند)",
+              "gc.freeze()" in fork_src)
+        check("داِمن: فرزند setsid می‌شود", "os.setsid()" in fork_src)
 
         os.kill(pid_b, 15)
         d.close()

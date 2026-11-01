@@ -3586,27 +3586,56 @@ class _AdoptedProc:
     کار می‌کنند و نسخه‌ی دومِ سلف اجرا نمی‌شود.
     """
 
-    def __init__(self, pid):
+    def __init__(self, pid, daemon=None):
         self.pid = int(pid)
+        self.daemon = daemon            # برای خواندنِ کدِ خروجِ واقعی
+        self.returncode = None
+
+    def _exit_code(self, default=1):
+        """کدِ خروج را از دیمنِ fork بگیر (۷۶ تکراری، ۷۷ سوخته، ۷۸ لاگین)."""
+        try:
+            if self.daemon is not None:
+                self.daemon.drain()
+                code = self.daemon.exits.get(self.pid)
+                if isinstance(code, int):
+                    return code
+        except Exception:
+            pass
+        return default
 
     def poll(self):
         try:
             os.kill(self.pid, 0)
         except ProcessLookupError:
-            return 1
+            self.returncode = self._exit_code()
+            return self.returncode
         except PermissionError:
             pass
         except Exception:
-            return 1
+            self.returncode = self._exit_code()
+            return self.returncode
         # پروسه‌ی زامبی (مرده ولی جمع‌نشده) هم «مرده» است؛ وگرنه سلفی که با
         # fork اجرا شده و مرده، برای همیشه «زنده» شمرده می‌شود.
         try:
             with open(f"/proc/{self.pid}/stat", encoding="utf-8") as f:
                 if f.read().rsplit(")", 1)[-1].split()[0] == "Z":
-                    return 1
+                    self.returncode = self._exit_code()
+                    return self.returncode
         except Exception:
             pass
         return None
+
+    def kill(self):
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except Exception:
+            pass
 
 
 class ForkDaemon:
@@ -3626,6 +3655,7 @@ class ForkDaemon:
         self._buf = b""
         self._lock = threading.Lock()
         self.last_error = ""
+        self.exits = {}                 # pid → کدِ خروج (از رویدادهای دیمن)
 
     def forker_path(self):
         d = os.path.dirname(os.path.abspath(self.selfbot))
@@ -3674,9 +3704,17 @@ class ForkDaemon:
             if nl >= 0:
                 line, self._buf = self._buf[:nl], self._buf[nl + 1:]
                 try:
-                    return json.loads(line.decode("utf-8", "ignore"))
+                    msg = json.loads(line.decode("utf-8", "ignore"))
                 except Exception:
                     continue
+                if isinstance(msg, dict) and msg.get("event") == "exit":
+                    # ۷۶ = نسخه‌ی تکراری، ۷۷ = کلیدِ سوخته، ۷۸ = نیاز به لاگین
+                    try:
+                        self.exits[int(msg.get("pid"))] = msg.get("code")
+                    except Exception:
+                        pass
+                    continue
+                return msg
             left = end - time.time()
             if left <= 0 or not self.alive():
                 return None
@@ -3691,6 +3729,13 @@ class ForkDaemon:
             if not chunk:
                 return None
             self._buf += chunk
+
+    def drain(self, timeout=0.02):
+        """رویدادهای معلق را بخوان (کدِ خروجِ فرزندها را ذخیره می‌کند)."""
+        while True:
+            msg = self._read_msg(timeout)
+            if msg is None:
+                return
 
     def _read_until(self, want, timeout=30):
         end = time.time() + timeout
@@ -3962,13 +4007,29 @@ def resume_grace_plan(data_dir, env=None, now_ts=None):
 #  و بوتِ بعدی بی‌خبر است. راه‌حل: هر دقیقه یک فایلِ کوچک با زمان، حافظه‌ی
 #  آزاد و تعدادِ سلف‌ها می‌نویسیم. بوتِ بعد با مقایسه‌ی آن با ثبتِ خروج
 #  می‌فهمد پروسه «تمیز» مرده یا ناگهانی — و همان را در لاگ می‌گوید.
+def fork_supported():
+    """آیا این سیستم fork واقعی دارد؟ (لینوکس بله، ویندوز نه)"""
+    try:
+        return bool(hasattr(os, "fork") and os.path.isdir("/proc/self"))
+    except Exception:
+        return False
+
+
 def spawn_mode(env=None):
-    """«process» (پیش‌فرض) یا «fork» (حافظه‌ی مشترک برای ۱۰۰ اکانت)."""
+    """«fork» (پیش‌فرض) یا «process» — به‌ترتیب با حافظه‌ی مشترک/جدا.
+
+    پیش‌فرض عمداً fork است: بدونِ این، هر اکانت یک نسخه‌ی کاملِ telethon
+    (~۴۰ مگابایت) جدا می‌خورد. کسی که رفتارِ قدیمی را می‌خواهد
+    `JAFJ_SPAWN_MODE=process` بگذارد؛ روی ویندوز/بدونِ fork خودکار
+    process می‌شود.
+    """
     e = env if env is not None else os.environ
-    v = (e.get("JAFJ_SPAWN_MODE") or "process").strip().lower()
-    if v in ("fork", "forked", "shared", "share", "اشتراکی"):
-        return "fork"
-    return "process"
+    v = (e.get("JAFJ_SPAWN_MODE") or "").strip().lower()
+    if v in ("process", "proc", "off", "0", "no", "جدا", "جداگانه"):
+        return "process"
+    if v in ("fork", "forked", "shared", "share", "1", "on", "yes", "اشتراکی"):
+        return "fork" if fork_supported() else "process"
+    return "fork" if fork_supported() else "process"
 
 
 def proc_rss_mb(pid):
@@ -4824,16 +4885,20 @@ class Supervisor:
             _env = dict(os.environ)
             _env.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
             p = None
-            if spawn_mode() == "fork":
+            if spawn_mode() == "fork" and not getattr(self, "_fork_broken", False):
                 # حافظه‌ی تلگرام بینِ همه‌ی اکانت‌ها مشترک می‌شود (COW).
                 _pid, _err = self.fork_daemon().spawn(
                     folder, os.path.join(folder, "run.log"), uid)
                 if _pid:
-                    p = _AdoptedProc(_pid)
+                    p = _AdoptedProc(_pid, self.fork_daemon())
                 else:
+                    # یک بار شکست کافی است: وگرنه هر اکانت ۶۰ ثانیه معطلِ
+                    # timeout می‌شود و هیچ‌کس بالا نمی‌آید.
+                    self._fork_broken = True
                     try:
-                        print(f"  ⚠️ fork برای {uid} نشد ({_err}) — با پروسه‌ی "
-                              "جدا اجرا می‌کنم", flush=True)
+                        print(f"  ⚠️ fork برای {uid} نشد ({_err}) — از این به "
+                              "بعد با پروسه‌ی جدا اجرا می‌کنم تا معطل نشود",
+                              flush=True)
                     except Exception:
                         pass
             if p is None:
@@ -5267,6 +5332,13 @@ class Supervisor:
         دست نمی‌خورد تا بوتِ دوباره (بعد از بازیابی) آن را بی‌دلیل قطع نکند.
         """
         n = skipped = 0
+        try:
+            _mode = spawn_mode()
+        except Exception:
+            _mode = "process"
+        if _mode == "fork":
+            print("  🧠 حالتِ اجرا: اشتراکی (fork) — تلگرام یک‌بار در رم؛ "
+                  "هر اکانتِ اضافه ~۲۵–۳۵MB به‌جای ~۷۰MB", flush=True)
         skip_why = []                 # [(uid, دلیل)] — برای پیامِ روشن به مدیر
         self._resume_fail.clear()
         try:
