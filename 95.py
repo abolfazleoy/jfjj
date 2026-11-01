@@ -877,6 +877,14 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout = 30000")
+        # پیش‌فرضِ sqlite برای هر اتصال ~۲ مگابایت کش می‌گیرد (۲۰۰۰ صفحه).
+        # با ۱۰۰ اکانت یعنی ۲۰۰ مگابایت فقط کشِ دیتابیس. این سلف کوئریِ
+        # سنگین ندارد؛ ۴۰۰ صفحه (۱.۶ مگابایت کمتر برای هر اکانت) کافی است.
+        try:
+            self.conn.execute("PRAGMA cache_size = -400")
+            self.conn.execute("PRAGMA mmap_size = 0")
+        except Exception:
+            pass
         with self.lock:
             self.conn.executescript(SCHEMA)
             # مهاجرت: ستون‌های جدید روی دیتابیس قدیمی
