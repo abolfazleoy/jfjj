@@ -5799,6 +5799,111 @@ def release_run_lock():
         pass
 
 
+# ─────────────────────────────────────────────
+#  کدهای خروج — مدیر از همین عدد علت را می‌فهمد
+# ─────────────────────────────────────────────
+#  ۷۶ = نسخه‌ی دومِ همین اکانت (سشن سالم است، اجرا نکردیم)
+#  ۷۷ = کلیدِ سشن را تلگرام برای همیشه باطل کرده (AuthKeyDuplicated)
+#  ۷۸ = سشن معتبر نیست؛ لاگینِ دوباره لازم است
+#  ۷۹ = شبکه/MTProto از این میزبان باز نمی‌شود (تلاش‌ها تمام شد)
+EXIT_DUP = 76
+EXIT_KEY_BURNED = 77
+EXIT_NEEDS_RELOGIN = 78
+EXIT_NET_DEAD = 79
+
+# چرا این تشخیص مهم است: متنِ واقعیِ تلگرام
+#   «AuthKeyDuplicatedError: The authorization key (session file) was used
+#    under two different IP addresses simultaneously, and can no longer be
+#    used.»
+# با الگوی قدیمی (AUTH_KEY_DUPLICATED با آندرلاین) **نمی‌خواند**، پس خطا
+# «شبکه» دیده می‌شد و آدم می‌رفت سراغِ فیلتر و ری‌استارت؛ در حالی که کلید
+# مرده است و هر ری‌استارت فقط همان حلقه را تکرار می‌کند.
+BURNED_KEY_RE = re.compile(
+    r"AUTH_KEY_DUPLICATED|AUTH_KEY_UNREGISTERED|SESSION_REVOKED|"
+    r"AuthKeyDuplicated|AuthKeyUnregistered|SessionRevoked|"
+    r"two different IP addresses|session file.*used|"
+    r"can no longer be used|USER_DEACTIVATED", re.I)
+
+
+def is_burned_key_error(name="", text=""):
+    """آیا این خطا یعنی «کلیدِ سشن سوخته و دیگر هیچ‌وقت وصل نمی‌شود»؟"""
+    try:
+        return bool(BURNED_KEY_RE.search(str(name or ""))
+                    or BURNED_KEY_RE.search(str(text or "")))
+    except Exception:
+        return False
+
+
+def burned_key_help(err=""):
+    """متنِ روشنِ «چه شد و چه باید کرد» برای لاگ (و در نتیجه برای مدیر)."""
+    print("\n" + "═" * 56, flush=True)
+    print("⛔ کلیدِ این سشن را تلگرام برای همیشه باطل کرده است "
+          "(AuthKeyDuplicated).", flush=True)
+    print("   یعنی همین سشن، هم‌زمان از دو IPِ مختلف به تلگرام وصل شده بود؛ "
+          "معمولاً", flush=True)
+    print("   وقتی دو نسخه از ربات روی یک اکانت اجرا شود یا سرویس از دو "
+          "میزبان/دو", flush=True)
+    print("   IP بالا بیاید (ری‌استارتِ هم‌زمانِ دو کانتینر).", flush=True)
+    print("   این فایلِ سشن دیگر هیچ‌وقت وصل نمی‌شود؛ تلاشِ دوباره فایده "
+          "ندارد.", flush=True)
+    print("   ✅ کارِ درست: مدیر همین اکانت را «نیاز به لاگین» می‌کند و سشنِ "
+          "تازه", flush=True)
+    print("      ساخته می‌شود؛ قبلش مطمئن شو فقط یک نسخه از این اکانت "
+          "بالاست.", flush=True)
+    if err:
+        print(f"   ↳ {err}", flush=True)
+    print("═" * 56 + "\n", flush=True)
+
+
+def egress_ip(timeout=4.0):
+    """IPِ عمومیِ خروجی — بهترین تلاش، هرگز اجرا را متوقف نمی‌کند."""
+    if (os.environ.get("JAFJ_NO_IP_PROBE") or "").strip() not in ("", "0",
+                                                                 "false", "نه"):
+        return None
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=timeout) as r:
+            ip = (r.read(64) or b"").decode("utf-8", "ignore").strip()
+    except Exception:
+        return None
+    if not (6 <= len(ip) <= 45):
+        return None
+    if any(c not in "0123456789.:abcdefABCDEF" for c in ip):
+        return None
+    return ip
+
+
+def log_egress_ip():
+    """IPِ خروجی را در لاگ بنویس و اگر عوض شده هشدار بده.
+
+    چرا: «یک سشن از دو IP» تنها دلیلی است که تلگرام کلید را می‌سوزاند. با
+    ثبتِ IP در هر اجرا، اگر میزبان بین دو اجرا IP را عوض کند (یا IPv4/IPv6
+    را قاطی کند) خودِ لاگ لو می‌دهد — بدونِ آزمون و خطا.
+    """
+    ip = egress_ip()
+    if not ip:
+        return None
+    prev = ""
+    try:
+        if os.path.isfile("jafj_ip.txt"):
+            with open("jafj_ip.txt", encoding="utf-8") as f:
+                prev = (f.read() or "").strip()
+        with open("jafj_ip.txt", "w", encoding="utf-8") as f:
+            f.write(ip + "\n")
+    except Exception:
+        pass
+    print(f"🌐 IPِ خروجی: {ip}"
+          + (f"   (دفعه‌ی قبل: {prev})" if prev and prev != ip else ""),
+          flush=True)
+    if prev and prev != ip:
+        print("⚠️ IPِ خروجی بین این اجرا و اجرای قبل عوض شده. اگر تلگرام یک "
+              "سشن را", flush=True)
+        print("   هم‌زمان از دو IP ببیند، کلیدش را برای همیشه باطل می‌کند "
+              "(AuthKeyDuplicated).", flush=True)
+        print("   یعنی مقصر «کد» نیست، میزبان/شبکه است؛ سرویسِ دوم را ببند.",
+              flush=True)
+    return ip
+
+
 def ensure_creds():
     """تا وقتی api_id و api_hash درست نگرفته، می‌پرسد. خاموش نمی‌شود."""
     c = load_creds()
@@ -5912,9 +6017,17 @@ async def connect_and_run(eng, creds):
         try:
             authorized = bool(await client.is_user_authorized())
         except Exception as e:
+            if is_burned_key_error(type(e).__name__, e):
+                burned_key_help(f"{type(e).__name__}: {e}")
+                return "key_burned"
             print(f"\n⚠️ بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
             authorized = False
     except Exception as e:
+        if is_burned_key_error(type(e).__name__, e):
+            # کلید مرده است: تلاشِ دوباره فقط همان حلقه را تکرار می‌کند و
+            # مدیر هم جایی برای دیدنِ علتِ واقعی ندارد.
+            burned_key_help(f"{type(e).__name__}: {e}")
+            return "key_burned"
         print(f"\n⚠️ اتصال برای بررسیِ سشن: {type(e).__name__}: {e}", flush=True)
         await asyncio.sleep(5)
         return "retry"
@@ -9101,7 +9214,9 @@ async def connect_and_run(eng, creds):
     if _shutdown_exc is not None:
         raise _shutdown_exc
     eng.log("warn", "disconnected", "اتصال قطع شد")
-    return "retry"
+    # «lost» یعنی وصل شده بود و بعد قطع شد (شبکه‌ی لرزان) — با «retry»
+    # (نتوانست اصلاً وصل شود) قاطی نشود تا شمارنده‌ی شکستِ اتصال درست کار کند.
+    return "lost"
 
 
 async def run_bot():
@@ -9123,19 +9238,44 @@ async def run_bot():
     if os.path.exists(SESSION + ".session"):
         print("  سشن از قبل هست؛ اگر وصل شود دیگر شماره نمی‌پرسد.", flush=True)
 
+    log_egress_ip()
+    try:
+        max_fails = int(os.environ.get("JAFJ_MAX_CONNECT_FAILS", "") or 12)
+    except Exception:
+        max_fails = 12
+    max_fails = max(3, max_fails)
     backoff = 10
+    fails = 0
     while True:
         try:
             r = await connect_and_run(eng, creds)
             if r == "stop":
                 return 1
+            if r == "key_burned":
+                # سشن سوخته — هیچ تلاشی نجاتش نمی‌دهد؛ سریع و صریح تمام کن
+                # تا مدیر اکانت را «نیاز به لاگین» کند و مشتری منتظر نماند.
+                print("\n⛔ تا لاگینِ دوباره، این سشن اجرا نمی‌شود (کلید باطل "
+                      "شده).", flush=True)
+                return EXIT_KEY_BURNED
             if r == "needs_relogin":
                 # عمداً retry نمی‌کنیم: هر تلاشِ دوباره = یک کدِ ورودِ تازه
                 # برای مشتری. مدیر باید از پنل دوباره لاگین کند.
                 print("\n⛔ تا لاگینِ دوباره از پنل، این سرویس اجرا نمی‌شود.",
                       flush=True)
-                return 78
-            backoff = 10
+                return EXIT_NEEDS_RELOGIN
+            if r == "lost":
+                fails = 0                      # وصل شده بود؛ شمارنده صفر
+                backoff = 10
+            else:
+                fails += 1
+                if fails >= max_fails:
+                    print(f"\n⛔ {fails} بارِ پشتِ‌سرهم نتوانستم به تلگرام وصل "
+                          f"شوم.", flush=True)
+                    print("   یعنی شبکه/MTProto از این میزبان باز نمی‌شود؛ "
+                          "تلاشِ دوباره در همین پروسه فایده ندارد.", flush=True)
+                    print("   IPِ خروجی همین بالا در لاگ هست — با اجرای قبل "
+                          "مقایسه‌اش کن.", flush=True)
+                    return EXIT_NET_DEAD
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -9148,6 +9288,11 @@ async def run_bot():
 
 
 def main():
+    # «۹۵.py اجرا شد یا نه؟» باید از خودِ لاگ معلوم باشد؛ وگرنه هر کسی از
+    # بیرون حدس می‌زند که فایل اجرا نشده، در حالی که اجرا شده و مثلاً روی
+    # اتصال شکست خورده است.
+    print(f"\n▶️ 95.py اجرا شد | pid={os.getpid()} | python={sys.executable} "
+          f"| cwd={os.getcwd()}", flush=True)
     ok, other = acquire_run_lock()
     if not ok:
         print("\n" + "─" * 52, flush=True)

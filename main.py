@@ -54,6 +54,10 @@ MANAGER_NAME = "manager_82.py"
 SELF_NAME = "95.py"
 ENTRY_NAME = "railway-start.sh"      # entrypointِ مشترکِ ریپو (supervisor)
 
+# با هر تغییرِ این فایل عوض می‌شود و در لاگِ بوت چاپ می‌شود. بدونِ این،
+# «آیا فایلِ جدید در سایت گذاشته شد یا همان قدیمی اجرا می‌شود؟» حدس می‌ماند.
+BOOT_VERSION = "2026-11-01 (boot-listener + session guard)"
+
 CHECK_LINES = []                     # برای نوشتن در data/boot.log
 
 
@@ -138,6 +142,84 @@ def run(cmd, cwd=None, env=None, quiet=False):
         die(f"دستور «{cmd[0]}» روی این میزبان نصب نیست. "
             f"اگر {cmd[0]} از لازمه‌های ایمیج است، ایمیج/بیلدِ میزبان را عوض کن.")
         return None
+
+
+# ───────────────────────────── 0-الف) شنونده‌ی PORT در ثانیه‌ی اولِ بوت ──
+#  چرا این تابع وجود دارد (و چرا نبودنش سشن‌ها را می‌سوزاند):
+#  پنل‌های «اپ پایتونی» مثلِ Wispbyte فقط یک چیز را می‌بینند: «روی PORT کسی
+#  گوش می‌دهد یا نه؟». بدونِ این شنونده، بینِ استارتِ اپ و بالا آمدنِ مدیر
+#  (clone + ساختِ venv + pip install که روی کانتینرِ کند چند دقیقه است) هیچ
+#  شنونده‌ای نبود؛ پنل اپ را «مرده» می‌دید و **ری‌استارت** می‌کرد. هر
+#  ری‌استارت یعنی کانتینرِ تازه با IPِ تازه، در حالی که کانتینرِ قبلی هنوز
+#  در حالِ جان‌دادن است. و همین «یک سشن از دو IP» است که تلگرام را وادار
+#  می‌کند کلید را برای همیشه بسوزانَد:
+#      AuthKeyDuplicatedError: ... used under two different IP addresses ...
+#  این شنونده از همان ثانیه ۲۰۰ می‌دهد و درست پیش از اجرای مدیر بسته می‌شود
+#  تا خودِ مدیر پورت را بگیرد (بخش‌های 4a/4b/4c).
+_boot_srv = None
+
+
+def boot_listener(port=None):
+    """شنونده‌ی موقتِ PORT در بوت. بی‌خطر است: هر خطایی فقط لاگ می‌شود."""
+    global _boot_srv
+    if _boot_srv is not None:
+        return _boot_srv
+    port = port or os.environ.get("PORT")
+    if not port:
+        return None
+    try:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        ver = BOOT_VERSION
+        md = mode() or "manager"
+
+        class _H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = ('{"ok": true, "boot": true, "mode": "%s", '
+                        '"version": "%s"}' % (md, ver)).encode("utf-8")
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception:
+                    pass
+
+            def do_HEAD(self):
+                self.do_GET()
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("0.0.0.0", int(port)), _H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True,
+                         name="jafj-boot-http").start()
+        _boot_srv = srv
+        log(f"شنونده‌ی بوت روی 0.0.0.0:{port} — پنل از همین حالا ۲۰۰ می‌گیرد "
+            "و وسطِ نصب ری‌استارت نمی‌کند")
+        return srv
+    except Exception as e:
+        log(f"⚠️ شنونده‌ی بوت بالا نیامد ({type(e).__name__}: {e}) — ادامه "
+            "می‌دهم؛ اگر پنل وسطِ بوت ری‌استارت کند، همین علتش است.")
+        return None
+
+
+def boot_listener_stop():
+    """بستنِ شنونده تا مدیر خودش پورت را بگیرد (اجرای دوباره = بی‌خطر)."""
+    global _boot_srv
+    srv, _boot_srv = _boot_srv, None
+    if srv is None:
+        return
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+    log("شنونده‌ی بوت بسته شد (مدیر پورت را می‌گیرد).")
 
 
 # ─────────────────────────────────────────────────── 0) چک‌لیستِ بوت ──
@@ -389,6 +471,7 @@ def start_manager(py, env):
         log(f"DRY-RUN: {argv}  cwd={cwd}  ({label})")
         return 0
     log(f"اجرای {label}…")
+    boot_listener_stop()
     os.chdir(cwd)
     if argv[0] == "sh":
         # supervisor خودش مدیر را با pythonِ PATH (یعنی venv) اجرا می‌کند
@@ -500,6 +583,7 @@ def start_self_only(py, env):
     if dry_run(env):
         log(f"DRY-RUN: python {SELF_NAME} (cwd={folder})")
         return 0
+    boot_listener_stop()
     health_server(env["PORT"])
     return supervise_selfbot(py, env, folder)
 
@@ -566,6 +650,27 @@ def self_diagnostic(env, folder):
             f"need_login={row.get('need_login')}")
     for ln in last_log_lines(folder):
         log(f"   | {ln}")
+    # سه نشانه‌ای که «چرا بالا نمی‌آید» را در یک نگاه جواب می‌دهند:
+    bad = folder / "jafj.session.bad"
+    if bad.exists():
+        log("   ⛔ سشنِ قبلی قرنطینه شده (jafj.session.bad): تلگرام کلیدش را "
+            "باطل کرده یا لاگین باطل شده — این فایل به کار نمی‌آید و باید "
+            "یک‌بار از پنل دوباره لاگین شود.")
+    lock = folder / "jafj.run.lock"
+    if lock.exists():
+        try:
+            lp = (lock.read_text(encoding="utf-8") or "").strip() or "?"
+        except Exception:
+            lp = "?"
+        log(f"   🔒 قفلِ اجرا موجود است (pid={lp}) — اگر پروسه‌ای با این PID "
+            f"زنده نیست، فایل را پاک کن تا نسخه‌ی بعدی اجرا شود.")
+    ipf = folder / "jafj_ip.txt"
+    if ipf.exists():
+        try:
+            log(f"   🌐 آخرین IPِ خروجیِ سلف: "
+                f"{(ipf.read_text(encoding='utf-8') or '').strip()}")
+        except Exception:
+            pass
     if not (folder / "jafj.session").exists():
         log("   👉 لاگین هنوز کامل نشده: از پنلِ مدیر «🚀 راه‌اندازی سلف روی اکانتم».")
     elif row.get("need_login"):
@@ -598,6 +703,9 @@ def start_both(py, env):
             + ("; در صورت نیاز اجرای مستقیم" if takeover else ""))
         return 0
 
+    # پورت را به مدیر بده، نه به خودمان: دو شنونده روی یک پورت، مدیر را
+    # بی‌صدا از کار می‌اندازد.
+    boot_listener_stop()
     try:
         mgr = subprocess.Popen(argv, cwd=cwd, env=env)
     except FileNotFoundError:
@@ -669,13 +777,15 @@ def start_both(py, env):
 # ───────────────────────────────────────────────────────────────── main ──
 def main():
     check_only = bool(os.environ.get("JAFJ_CHECK_ONLY")) or "--check" in sys.argv
-    log(f"dir={HERE} python={sys.version.split()[0]}")
+    log(f"dir={HERE} python={sys.version.split()[0]} boot={BOOT_VERSION}")
+    boot_listener()          # اولین کاری که می‌کنیم: پنل «زنده» ببیند
     sync_code()
     py = ensure_python()
     env = check_layout(build_env(py))
     boot_report(py, env)
     if check_only:
         log("حالتِ بررسی (--check): اجرا نمی‌کنم.")
+        boot_listener_stop()
         return 0
     m = mode()
     log(f"code={CODE_DIR} data={env['DATA_DIR']} python={py} "

@@ -108,9 +108,12 @@ def main():
         sys.path.insert(0, str(REPO))
         import manager_82 as M
 
+        # توجه: AUTH_KEY_DUPLICATED عمداً این‌جا نیست — آن یعنی کلیدِ سوخته
+        # (تستِ test_auth_key_burned.py) و درمانش لاگینِ دوباره است، نه
+        # «سشن سالم است».
         for tail, rc in [("⛔ نسخه‌ی دیگری از همین اکانت همین حالا در حال اجراست",
                           None),
-                         ("AUTH_KEY_DUPLICATED", None),
+                         ("⛔ قفلِ jafj.run.lock گرفته شد", None),
                          ("", 76)]:
             kind, hint = M.classify_selfbot_log(tail, rc)
             check(f"classify → dup برای «{(tail or '')[:26]}» rc={rc}",

@@ -53,7 +53,8 @@ def main():
     cases = [
         ("⛔ سشنِ این اکانت معتبر نیست (از تلگرام خارج یا باطل شده).", 78, "session"),
         ("", 78, "session"),
-        ("AUTH_KEY_UNREGISTERED: the key was unregistered", None, "session"),
+        ("AUTH_KEY_UNREGISTERED: the key was unregistered", None, "keydup"),
+        ("needs_relogin: سشن معتبر نیست", None, "session"),
         ("📦 Telethon نصب نیست — نصبش می‌کنم…", None, "deps"),
         ("ModuleNotFoundError: No module named 'telethon'", 1, "deps"),
         ("⚠️ اتصال برای بررسیِ سشن: ConnectionError: Cannot connect", None, "network"),
