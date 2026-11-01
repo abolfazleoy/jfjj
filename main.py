@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══════════════════════════════════════════════════════════════════════════
-#  JAFJ — main.py  (bootstrap برای میزبان‌های «اپ پایتونی»: Wispbyte،
-#                   Hostless python build، هر جایی که فقط یک دستور
-#                   شروع مثل `python main.py` می‌گیرد)
+#  JAFJ — main.py  (راه‌انداز برای میزبان‌های «اپ پایتونی»: Wispbyte،
+#                   Hostless python build، هر جایی که فقط یک دستور شروع
+#                   مثل `python main.py` می‌گیرد)
 #
-#  این فایل فقط «راه‌انداز» است، نه ربات:
+#  کاری که می‌کند:
+#    ۰) «چک‌لیست بوت» را چاپ می‌کند (git، پایتون، telethon، دسترسیِ نوشتن،
+#       فایل‌های ریپو، پورت، نمونه‌ی دوم) → هر چیزی کم باشد همان‌جا معلوم است
 #    ۱) کد را از گیت‌هاب می‌گیرد/به‌روز می‌کند      → ./code
 #    ۲) محیط پایتون و وابستگی‌ها را می‌سازد          → ./venv
 #    ۳) داده‌ها را در یک پوشه‌ی جدا نگه می‌دارد       → ./data
-#    ۴) entrypointِ خودِ ریپو (railway-start.sh) را اجرا می‌کند که
-#       supervisor است و manager_82.py را بالا می‌آورد.
+#    ۴) اجرا با یکی از سه حالت (JAFJ_ONLY):
 #
-#  ⚠️ نکته‌ی مهم (همان چیزی که «سلف اجرا نمی‌شود» را توضیح می‌دهد):
-#     95.py یک رباتِ مستقلِ سراسری نیست. سلفِ هر مشتری است که
-#     خودِ manager_82.py بعد از لاگینِ آن اکانت، با cwd پوشه‌ی همان
-#     اکانت اجرا می‌کند:
-#         data/clients/<uid>/  →  jafj_creds.json + jafj.session
-#                               →  python 95.py
-#     اگر 95.py را از این‌جا (کنار manager، بدون creds و session) اجرا
-#     کنی، فوراً با «ترمینال تعاملی نیست / PHONE را بگذار» می‌میرد —
-#     دقیقاً همان چیزی که دیدی. پس این فایل عمداً 95.py را اجرا نمی‌کند.
-#     (اگر واقعاً می‌خواهی فقط یک سلفِ تنها اجرا شود، JAFJ_ONLY=self
-#      را با JAFJ_SELF_DIR بده — پایین توضیح داده شده.)
+#         JAFJ_ONLY=manager  (پیش‌فرض)
+#             entrypointِ خودِ ریپو (railway-start.sh) را اجرا می‌کند:
+#             supervisor + manager_82.py. سلفِ هر اکانت را خودِ مدیر، بعد از
+#             لاگین، در data/clients/<uid>/ بالا می‌آورد.
+#
+#         JAFJ_ONLY=both      + JAFJ_SELF_UID=<uid>
+#             مدیر بالا می‌آید، و علاوه بر آن سلفِ همان یک اکانت هم مستقیماً
+#             اجرا می‌شود و خروجی‌اش در همین لاگِ سایت می‌آید. اگر مدیر از
+#             قبل خودش آن سلف را روشن کرده باشد، دوباره اجرا نمی‌شود
+#             (دو سلف روی یک سشن = سشن خراب).
+#
+#         JAFJ_ONLY=self       + JAFJ_SELF_UID=<uid>  (یا JAFJ_SELF_DIR)
+#             فقط سلف؛ مدیر اجرا نمی‌شود. برای تستِ اینکه 95.py سالم است.
+#
+#  بررسیِ سریع بدونِ اجرای ربات:   python main.py --check
+#  (یا JAFJ_CHECK_ONLY=1) — چک‌لیست را چاپ می‌کند و خارج می‌شود.
 # ═══════════════════════════════════════════════════════════════════════════
 
 import hashlib
@@ -48,15 +54,46 @@ MANAGER_NAME = "manager_82.py"
 SELF_NAME = "95.py"
 ENTRY_NAME = "railway-start.sh"      # entrypointِ مشترکِ ریپو (supervisor)
 
+CHECK_LINES = []                     # برای نوشتن در data/boot.log
+
 
 # ───────────────────────────────────────────────────────────── helpers ──
 def log(msg):
-    print(f"JAFJ-BOOT: {msg}", flush=True)
+    line = f"JAFJ-BOOT: {msg}"
+    CHECK_LINES.append(line)
+    print(line, flush=True)
 
 
 def die(msg, code=1):
-    print(f"JAFJ-BOOT: ❌ {msg}", flush=True)
+    line = f"JAFJ-BOOT: ❌ {msg}"
+    CHECK_LINES.append(line)
+    print(line, flush=True)
+    flush_boot_log(None)
     sys.exit(code)
+
+
+def check(label, ok, detail=""):
+    """یک سطر از چک‌لیستِ بوت + ثبت برای data/boot.log."""
+    line = f"JAFJ-CHECK: {'✅' if ok else '❌'} {label}" + (
+        f" — {detail}" if detail else "")
+    CHECK_LINES.append(line)
+    print(line, flush=True)
+    return ok
+
+
+def flush_boot_log(data_dir):
+    """چک‌لیست در data/boot.log هم بماند (برای فرستادن به پشتیبانی)."""
+    try:
+        d = Path(data_dir or data_dir_path())
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "boot.log", "w", encoding="utf-8") as f:
+            f.write("\n".join(CHECK_LINES) + "\n")
+    except Exception:
+        pass
+
+
+def data_dir_path():
+    return Path(os.environ.get("DATA_DIR") or DEFAULT_DATA).expanduser().resolve()
 
 
 def repo():
@@ -70,10 +107,6 @@ def branch():
 
 def token():
     return (os.environ.get("JAFJ_GIT_TOKEN") or "").strip()      # ریپوی خصوصی
-
-
-def data_dir():
-    return Path(os.environ.get("DATA_DIR") or DEFAULT_DATA).expanduser().resolve()
 
 
 def repo_url():
@@ -93,20 +126,111 @@ def shown(url):
 
 
 def run(cmd, cwd=None, env=None, quiet=False):
+    """اجرای دستور؛ اگر خودِ برنامه نصب نباشد پیامِ روشن می‌دهد (نه Traceback)."""
     log("$ " + " ".join(str(c) for c in cmd))
     out = subprocess.DEVNULL if quiet else None
-    return subprocess.run(
-        [str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
-        stdout=out, stderr=out,
-    )
+    try:
+        return subprocess.run(
+            [str(c) for c in cmd], cwd=str(cwd) if cwd else None, env=env,
+            stdout=out, stderr=out,
+        )
+    except FileNotFoundError:
+        die(f"دستور «{cmd[0]}» روی این میزبان نصب نیست. "
+            f"اگر {cmd[0]} از لازمه‌های ایمیج است، ایمیج/بیلدِ میزبان را عوض کن.")
+        return None
 
 
-# ─────────────────────────────────────────────────── 1) selfbot mode check ──
-def only_mode():
-    return (os.environ.get("JAFJ_ONLY") or "").strip().lower()
+# ─────────────────────────────────────────────────── 0) چک‌لیستِ بوت ──
+def mode():
+    """manager (پیش‌فرض) | both | self  — هم JAFJ_ONLY و هم JAFJ_BOOT."""
+    m = (os.environ.get("JAFJ_ONLY") or os.environ.get("JAFJ_BOOT") or "").strip().lower()
+    if m in ("1", "true", "yes", "all", "both", "هر دو", "هردو"):
+        return "both"
+    if m in ("self", "selfbot", "سلف"):
+        return "self"
+    return "manager"
 
 
-# ─────────────────────────────────────────────────────── 2) code from git ──
+def self_uid():
+    return (os.environ.get("JAFJ_SELF_UID") or "").strip()
+
+
+def self_folder(data_dir):
+    """پوشه‌ی اکانتی که سلفش را جدا اجرا می‌کنیم."""
+    d = (os.environ.get("JAFJ_SELF_DIR") or "").strip()
+    if d:
+        return Path(d).expanduser().resolve()
+    if self_uid():
+        return Path(data_dir) / "clients" / self_uid()
+    return None
+
+
+def boot_report(py, env):
+    """هر چیزی که «چرا بالا نیامد» را می‌تواند بسازد، همان اول چک می‌شود."""
+    log(f"host={env.get('JAFJ_HOST_LABEL', 'wispbyte')} "
+        f"python={sys.version.split()[0]} dir={HERE} mode={mode()}")
+    check("پایتون ۳.۸+", sys.version_info >= (3, 8),
+          f"{sys.version.split()[0]}")
+    check("git نصب است", bool(shutil.which("git")), shutil.which("git") or "پیدا نشد")
+    check("پوشه‌ی اپ نوشتنی است", os.access(HERE, os.W_OK), str(HERE))
+    d = Path(env["DATA_DIR"])
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".jafj_write_test"
+        probe.write_text("ok")
+        probe.unlink()
+        check("پوشه‌ی داده نوشتنی است", True, str(d))
+    except Exception as e:
+        check("پوشه‌ی داده نوشتنی است", False, f"{d}: {e}")
+    try:
+        du = shutil.disk_usage(str(d if d.exists() else HERE))
+        check("فضای خالی دیسک", du.free > 200 * 1024 * 1024,
+              f"{du.free // (1024 * 1024)}MB آزاد")
+    except Exception:
+        pass
+    check("کد ریپو موجود است",
+          all((CODE_DIR / n).is_file() for n in (MANAGER_NAME, SELF_NAME)),
+          str(CODE_DIR))
+    check("entrypoint ریپو موجود است", (CODE_DIR / ENTRY_NAME).is_file(), ENTRY_NAME)
+    try:
+        ok_dep = subprocess.run([str(py), "-c", "import telethon"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode == 0
+    except Exception:
+        ok_dep = False
+    check("telethon در مفسرِ اجرا نصب است", ok_dep, str(py))
+    if os.environ.get("PORT"):
+        check("PORT از میزبان رسیده", True, os.environ["PORT"])
+    # نمونه‌ی دوم: دو مدیر روی یک پوشه‌ی داده = پیام‌های تکراری و سشن خراب
+    lock = d / "bot.lock"
+    if lock.is_file():
+        try:
+            pid = int(lock.read_text().strip() or 0)
+            alive = bool(pid) and pid != os.getpid()
+            if alive:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    alive = False
+            if alive:
+                check("نمونه‌ی دومی از مدیر در حال اجراست", False,
+                      f"pid={pid} (همان توکن/همان سشن — اول آن را ببند)")
+        except Exception:
+            pass
+    if mode() in ("self", "both"):
+        f = self_folder(env["DATA_DIR"])
+        if f is None:
+            check("حالتِ سلف: پوشه‌ی اکانت", False,
+                  "JAFJ_SELF_UID یا JAFJ_SELF_DIR را بده")
+        else:
+            has = (f / "jafj_creds.json").exists() and (f / "jafj.session").exists()
+            check("حالتِ سلف: creds/session اکانت", has,
+                  str(f) + ("" if has else " — اول از پنلِ مدیر لاگین کن"))
+    flush_boot_log(env["DATA_DIR"])
+    return env
+
+
+# ─────────────────────────────────────────────────────── 1) code from git ──
 def sync_code():
     CODE_DIR.parent.mkdir(parents=True, exist_ok=True)
     url = repo_url()
@@ -116,16 +240,19 @@ def sync_code():
             shutil.rmtree(CODE_DIR, ignore_errors=True)
         log(f"cloning {shown(url)} (branch {branch()}) → {CODE_DIR}")
         args = ["git", "clone", "--depth", "1", "--branch", branch(), url, str(CODE_DIR)]
-        if run(args).returncode != 0:
+        r = run(args)
+        if r is None or r.returncode != 0:
             # شاید برنچ وجود ندارد → برنچ پیش‌فرض را بگیر
             log(f"branch «{branch()}» clone نشد — با برنچ پیش‌فرض امتحان می‌کنم")
-            if run(["git", "clone", "--depth", "1", url, str(CODE_DIR)]).returncode != 0:
-                die("git clone نشد. JAFJ_REPO / JAFJ_BRANCH / JAFJ_GIT_TOKEN را چک کن.")
+            r2 = run(["git", "clone", "--depth", "1", url, str(CODE_DIR)])
+            if r2 is None or r2.returncode != 0:
+                die("git clone نشد. JAFJ_REPO / JAFJ_BRANCH / JAFJ_GIT_TOKEN را چک کن "
+                    "(یا میزبان دسترسی به گیت‌هاب ندارد).")
     else:
         log("code موجود است — به‌روزرسانی…")
-        ok = run(["git", "-C", str(CODE_DIR), "fetch", "--depth", "1",
-                  "origin", branch()]).returncode == 0
-        if ok:
+        r = run(["git", "-C", str(CODE_DIR), "fetch", "--depth", "1",
+                 "origin", branch()])
+        if r is not None and r.returncode == 0:
             run(["git", "-C", str(CODE_DIR), "reset", "--hard", "FETCH_HEAD"])
             # فایل‌های جامانده‌ی نسخه‌های قبلی (مثل 78.py قدیمی) پاک شوند
             run(["git", "-C", str(CODE_DIR), "clean", "-fdq"])
@@ -142,7 +269,7 @@ def sync_code():
             pass
 
 
-# ───────────────────────────────────────────────── 3) venv + dependencies ──
+# ───────────────────────────────────────────────── 2) venv + dependencies ──
 def req_hash():
     f = CODE_DIR / "requirements.txt"
     return hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else ""
@@ -153,9 +280,12 @@ def stamp_file():
 
 
 def deps_ok(py):
-    r = subprocess.run([str(py), "-c", "import telethon"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return r.returncode == 0
+    try:
+        r = subprocess.run([str(py), "-c", "import telethon"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def install_deps(py):
@@ -168,7 +298,7 @@ def install_deps(py):
          "--upgrade", "pip"], quiet=True)
     r = run([str(py), "-m", "pip", "install", "--disable-pip-version-check",
              "-r", str(CODE_DIR / "requirements.txt")])
-    return r.returncode == 0
+    return r is not None and r.returncode == 0
 
 
 def ensure_python():
@@ -182,7 +312,8 @@ def ensure_python():
     py = VENV_DIR / "bin" / "python"
     if not py.exists():
         log("ساخت محیط مجازی…")
-        if run([sys.executable, "-m", "venv", str(VENV_DIR)]).returncode != 0:
+        r = run([sys.executable, "-m", "venv", str(VENV_DIR)])
+        if r is None or r.returncode != 0:
             log("⚠️ venv ساخته نشد — با پایتون سیستم ادامه می‌دهم")
             py = Path(sys.executable)
             if not deps_ok(py):
@@ -206,7 +337,7 @@ def ensure_python():
     return py
 
 
-# ───────────────────────────────────────────────── 4) environment wiring ──
+# ───────────────────────────────────────────────── 3) environment wiring ──
 def build_env(py):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -214,7 +345,7 @@ def build_env(py):
     env["JAFJ_HOSTED"] = env.get("JAFJ_HOSTED", "1")
     env["JAFJ_HOST_LABEL"] = env.get("JAFJ_HOST_LABEL", "wispbyte")
     env["JAFJ_IMAGE_DIR"] = str(CODE_DIR)          # کد: غیرقابل‌تغییر
-    d = data_dir()
+    d = data_dir_path()
     env["JAFJ_APP_DIR"] = str(d)                   # داده: پایدار (در حد امکان)
     env["DATA_DIR"] = str(d)
     env["JAFJ_SELFBOT_REF"] = str(CODE_DIR / SELF_NAME)
@@ -229,41 +360,43 @@ def build_env(py):
 
 def check_layout(env):
     d = Path(env["DATA_DIR"])
-    d.mkdir(parents=True, exist_ok=True)
-    probe = d / ".jafj_write_test"
     try:
-        probe.write_text("ok")
-        probe.unlink()
-    except Exception as e:
-        log(f"⚠️ DATA_DIR نوشتنی نیست ({d}: {e}) — /tmp استفاده می‌شود")
-        env["DATA_DIR"] = env["JAFJ_APP_DIR"] = "/tmp/jafj-data"
-        Path(env["DATA_DIR"]).mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     if Path(env["DATA_DIR"]).resolve() == CODE_DIR.resolve():
         log("⚠️ داده و کد در یک پوشه‌اند — با هر دیپلوی داده پاک می‌شود."
             " DATA_DIR را به یک مسیر پایدار (مثلاً /data) بده.")
     return env
 
 
-# ───────────────────────────── 5a) حالت عادی: manager + سلف‌هایش (پیشنهادی) ──
-def start_manager(py, env):
-    entry = CODE_DIR / ENTRY_NAME
-    if env.get("JAFJ_DRY_RUN", "").strip() in ("1", "true", "yes"):
-        log(f"DRY-RUN: exec sh {entry}   (python={py}, data={env['DATA_DIR']}, "
-            f"code={env['JAFJ_IMAGE_DIR']}, port={env['PORT']})")
-        return 0
+def dry_run(env):
+    return env.get("JAFJ_DRY_RUN", "").strip() in ("1", "true", "yes")
 
+
+# ───────────────────────────── 4a) حالت manager: supervisor + مدیر ────────
+def manager_argv():
+    """(argv, cwd, label) برای بالا آوردنِ مدیر."""
+    entry = CODE_DIR / ENTRY_NAME
     if entry.is_file():
-        log("اجرای entrypoint ریپو (supervisor + manager_82.py)…")
-        os.chdir(env["DATA_DIR"])
-        os.execve("/bin/sh", ["sh", str(entry)], env)   # جایگزین همین پروسه
-    # ریپوی قدیمی بدون entrypoint: مستقیم manager را اجرا کن
-    log(f"⚠️ {ENTRY_NAME} نیست — manager_82.py را مستقیم اجرا می‌کنم"
-        " (بدون supervisor)")
-    os.chdir(str(CODE_DIR))
+        return ["sh", str(entry)], str(data_dir_path()), "railway-start.sh (supervisor)"
+    return [str(CODE_DIR / MANAGER_NAME)], str(CODE_DIR), "manager_82.py (بدون supervisor)"
+
+
+def start_manager(py, env):
+    argv, cwd, label = manager_argv()
+    if dry_run(env):
+        log(f"DRY-RUN: {argv}  cwd={cwd}  ({label})")
+        return 0
+    log(f"اجرای {label}…")
+    os.chdir(cwd)
+    if argv[0] == "sh":
+        # supervisor خودش مدیر را با pythonِ PATH (یعنی venv) اجرا می‌کند
+        os.execve("/bin/sh", argv, env)
     os.execve(str(py), [str(py), str(CODE_DIR / MANAGER_NAME)], env)
 
 
-# ───────────────── 5b) حالت اختیاری: فقط یک سلفِ تنها (بدون manager) ────────
+# ───────────────────────── 4b) حالت self: فقط سلفِ یک اکانت ───────────────
 def health_server(port):
     """میزبان‌های اپ‌پایتونی منتظر شنونده روی PORT‌اند؛ سلف سرور ندارد."""
     try:
@@ -288,66 +421,157 @@ def health_server(port):
         log(f"⚠️ health server بالا نیامد: {e}")
 
 
-def start_selfbot_only(py, env):
-    folder = (os.environ.get("JAFJ_SELF_DIR") or "").strip()
-    uid = (os.environ.get("JAFJ_SELF_UID") or "").strip()
-    if not folder and uid:
-        folder = str(Path(env["DATA_DIR"]) / "clients" / uid)
-    if not folder:
-        die("JAFJ_ONLY=self دادي ولي JAFJ_SELF_DIR يا JAFJ_SELF_UID ندادي.")
-    folder = str(Path(folder).expanduser().resolve())
+def self_ready(folder):
+    return (folder / "jafj_creds.json").is_file() and (folder / "jafj.session").is_file()
 
-    for need in ("jafj_creds.json", "jafj.session"):
-        if not Path(folder, need).exists():
-            die(f"{need} در {folder} نیست — اول در حالت عادی (manager) آن اکانت را "
-                f"از دکمه‌ی «🚀 راه‌اندازی سلف روی اکانتم» لاگین کن.")
-    os.makedirs(folder, exist_ok=True)
+
+def self_running(folder):
+    """آیا همین حالا یک سلف روی این پوشه زنده است؟ (پروسه‌ی خودِ مدیر)"""
+    try:
+        pid = int((folder / ".jafj_self.pid").read_text().strip() or 0)
+    except Exception:
+        return False
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        return SELF_NAME in cmd
+    except Exception:
+        return False
+
+
+def supervise_selfbot(py, env, folder, stop_event=None):
+    """سلف را با ری‌استارتِ پله‌ای اجرا کن؛ خروجی‌اش در همین لاگ می‌آید."""
+    if not self_ready(folder):
+        log(f"⚠️ سلفِ {folder} آماده نیست: "
+            f"jafj_creds.json={'✅' if (folder / 'jafj_creds.json').exists() else '❌'} "
+            f"jafj.session={'✅' if (folder / 'jafj.session').exists() else '❌'}")
+        return 1
     selfbot = Path(env["JAFJ_SELFBOT_REF"])
-    if str(Path(folder, SELF_NAME).resolve()) != str(selfbot.resolve()):
-        shutil.copy2(selfbot, Path(folder, SELF_NAME))     # نسخه‌ی همان ریپو
-
-    health_server(env["PORT"])
-    log(f"اجرای سلفِ تنها — cwd={folder}")
-    if env.get("JAFJ_DRY_RUN", "").strip() in ("1", "true", "yes"):
-        log(f"DRY-RUN: python {Path(folder, SELF_NAME)} (cwd={folder})")
-        return 0
-
+    dst = folder / SELF_NAME
+    try:
+        if (not dst.exists()) or dst.stat().st_size != selfbot.stat().st_size:
+            shutil.copy2(selfbot, dst)
+    except Exception:
+        pass
     e = dict(env)
     e.setdefault("JAFJ_NO_AUTO_LOGIN", "1")
     backoff, child = 5, None
-    try:
-        while True:
-            child = subprocess.Popen([str(py), SELF_NAME], cwd=folder, env=e,
-                                     stdin=subprocess.DEVNULL)
-            log(f"selfbot pid={child.pid}")
-            started = time.time()
-            rc = child.wait()
-            if rc == 0:
-                log("سلف تمیز بسته شد.")
-                return 0
-            if rc == 78:
-                die("سشن این اکانت باطل است — از پنل مدیر دوباره لاگین کن.", 78)
-            up = time.time() - started
-            backoff = 5 if up > 120 else min(backoff * 2, 120)
-            log(f"سلف با کد {rc} بست ({int(up)}s) — {backoff} ثانیه بعد دوباره")
+    while stop_event is None or not stop_event.is_set():
+        child = subprocess.Popen([str(py), SELF_NAME], cwd=str(folder), env=e,
+                                 stdin=subprocess.DEVNULL)
+        log(f"selfbot pid={child.pid} cwd={folder}")
+        started = time.time()
+        rc = child.wait()
+        if stop_event is not None and stop_event.is_set():
+            return 0
+        if rc == 0:
+            log("سلف تمیز بسته شد.")
+            return 0
+        if rc == 78:
+            log("❌ سشنِ این اکانت باطل است (کد ۷۸) — از پنلِ مدیر دوباره لاگین کن.")
+            return 78
+        up = time.time() - started
+        backoff = 5 if up > 120 else min(backoff * 2, 120)
+        log(f"selfbot با کد {rc} بست ({int(up)}s) — {backoff} ثانیه بعد دوباره")
+        if stop_event is not None:
+            stop_event.wait(backoff)
+        else:
             time.sleep(backoff)
-    except KeyboardInterrupt:
-        if child and child.poll() is None:
-            child.terminate()
+    return 0
+
+
+def start_self_only(py, env):
+    folder = self_folder(env["DATA_DIR"])
+    if folder is None:
+        die("JAFJ_ONLY=self دادي ولي JAFJ_SELF_UID يا JAFJ_SELF_DIR ندادي.")
+    folder = Path(folder)
+    log(f"اجرای سلفِ تنها — cwd={folder}")
+    if not self_ready(folder):
+        die(f"پوشه‌ی این اکانت آماده نیست ({folder}): "
+            f"jafj_creds.json={'✅' if (folder / 'jafj_creds.json').exists() else '❌'} "
+            f"jafj.session={'✅' if (folder / 'jafj.session').exists() else '❌'} — "
+            "اول در حالتِ عادی (manager) از «🚀 راه‌اندازی سلف روی اکانتم» لاگین کن.")
+    if dry_run(env):
+        log(f"DRY-RUN: python {SELF_NAME} (cwd={folder})")
         return 0
+    health_server(env["PORT"])
+    return supervise_selfbot(py, env, folder)
+
+
+# ─────────────────── 4c) حالت both: مدیر + سلفِ همین یک اکانت ─────────────
+def start_both(py, env):
+    folder = self_folder(env["DATA_DIR"])
+    if folder is None:
+        die("JAFJ_ONLY=both دادي ولي JAFJ_SELF_UID يا JAFJ_SELF_DIR ندادي.")
+    folder = Path(folder)
+    argv, cwd, label = manager_argv()
+    log(f"حالتِ both: {label} + سلفِ {folder}")
+    if dry_run(env):
+        log(f"DRY-RUN: {argv} (cwd={cwd}) + python {SELF_NAME} (cwd={folder})")
+        return 0
+
+    try:
+        mgr = subprocess.Popen(argv, cwd=cwd, env=env)
+    except FileNotFoundError:
+        die(f"اجرای {argv[0]} ممکن نشد (نصب نبود).")
+        return 1
+    log(f"manager/supervisor pid={mgr.pid}")
+
+    stop = threading.Event()
+    th = None
+    wait_s = float(os.environ.get("JAFJ_SELF_WAIT", "900") or 900)
+    deadline = time.time() + wait_s
+    while True:
+        if mgr.poll() is not None:
+            stop.set()
+            log(f"مدیر با کد {mgr.returncode} بست — خروج")
+            return mgr.returncode or 1
+        if th is None:
+            if self_ready(folder):
+                if self_running(folder):
+                    log("✅ مدیر خودش سلفِ این اکانت را اجرا کرد — اجرای دوم لازم نیست.")
+                    th = "manager"
+                else:
+                    log("سلفِ این اکانت را خودم اجرا می‌کنم (پروسه‌ی مستقیم)…")
+                    th = threading.Thread(target=supervise_selfbot,
+                                          args=(py, env, folder, stop), daemon=True)
+                    th.start()
+            elif time.time() > deadline:
+                log(f"⚠️ تا {int(wait_s)}s پوشه‌ی اکانت آماده نشد ({folder}) — "
+                    "اول از پنلِ مدیر «🚀 راه‌اندازی سلف روی اکانتم» را بزن؛ "
+                    "منتظر می‌مانم و به‌محضِ آماده‌شدن خودم اجرا می‌کنم.")
+                deadline = time.time() + wait_s
+            else:
+                log(f"منتظرِ آماده‌شدنِ اکانت… ({folder})")
+                time.sleep(5)
+                continue
+        time.sleep(2)
 
 
 # ───────────────────────────────────────────────────────────────── main ──
 def main():
-    log(f"host={os.environ.get('JAFJ_HOST_LABEL', 'wispbyte')} "
-        f"python={sys.version.split()[0]} dir={HERE}")
+    check_only = bool(os.environ.get("JAFJ_CHECK_ONLY")) or "--check" in sys.argv
+    log(f"dir={HERE} python={sys.version.split()[0]}")
     sync_code()
     py = ensure_python()
     env = check_layout(build_env(py))
+    boot_report(py, env)
+    if check_only:
+        log("حالتِ بررسی (--check): اجرا نمی‌کنم.")
+        return 0
+    m = mode()
     log(f"code={CODE_DIR} data={env['DATA_DIR']} python={py} "
-        f"mode={only_mode() or 'manager'} port={env['PORT']}")
-    if only_mode() == "self":
-        return start_selfbot_only(py, env)
+        f"mode={m} port={env['PORT']}")
+    if m == "self":
+        return start_self_only(py, env)
+    if m == "both":
+        return start_both(py, env)
     return start_manager(py, env)
 
 
