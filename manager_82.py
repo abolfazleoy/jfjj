@@ -4032,6 +4032,37 @@ def spawn_mode(env=None):
     return "fork" if fork_supported() else "process"
 
 
+# مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:
+# «process» = یک پروسه برای هر اکانت، «fork» = حافظه‌ی مشترک (WISPBYTE_FA §۱۲).
+PER_ACCOUNT_MB = {"fork": 26, "process": 62}
+RAM_RESERVE_MB = 96          # برای مدیر، دیتابیس، پشتیبان و OS
+
+
+def capacity_estimate(free_mb=None, mode=None, reserve_mb=None):
+    """(چند سلف جا می‌شود, مصرفِ هر سلف, حافظه‌ی آزاد) — تخمینِ محافظه‌کارانه.
+
+    چرا: کاربر باید بداند روی پلنِ فعلی چند اکانت جا می‌شود، پیش از آن‌که
+    با OOM همه‌ی سرویس‌ها بخوابند. عددها اندازه‌گیری‌شده‌اند، نه حدس.
+    """
+    m = mode or spawn_mode()
+    per = PER_ACCOUNT_MB.get(m, PER_ACCOUNT_MB["process"])
+    res = RAM_RESERVE_MB if reserve_mb is None else float(reserve_mb)
+    if free_mb is None:
+        try:
+            free_mb = mem_available_mb()
+        except Exception:
+            free_mb = None
+    if free_mb is None:
+        return None, per, None
+    try:
+        usable = float(free_mb) - float(res)
+        if usable <= 0:
+            return 0, per, float(free_mb)
+        return int(usable // per), per, float(free_mb)
+    except Exception:
+        return None, per, None
+
+
 def proc_rss_mb(pid):
     """حافظه‌ی واقعیِ یک پروسه (MB) از /proc — None اگر نبود."""
     try:
@@ -5345,6 +5376,18 @@ class Supervisor:
             rows = self.db.wanted()
         except Exception:
             rows = self.db.runnable()
+        try:
+            _cap, _per, _free = capacity_estimate(mode=_mode)
+            if _cap is not None:
+                print(f"  📊 ظرفیتِ تخمینی: {int(_free)}MB آزاد ÷ ~{_per}MB "
+                      f"≈ {_cap} سلف (حالتِ {_mode}) — "
+                      f"{len(rows)} اکانت باید روشن باشند", flush=True)
+                if len(rows) > _cap:
+                    print(f"  ⚠️ با این پلن {len(rows) - _cap} اکانت جا نمی‌شود: "
+                          f"یا پلن/حافظه را بالا ببر یا سلف‌ها را کم کن",
+                          flush=True)
+        except Exception:
+            pass
         for c in rows:
             uid = c["uid"]
             if self.needs_login(uid) and not force_restart:

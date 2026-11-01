@@ -113,6 +113,23 @@ def main():
 
         # ── ۴ب) اندازه‌گیریِ واقعیِ مصرفِ هر سلف ──────────────────────
         me = M.proc_rss_mb(os.getpid())
+        # ── ظرفیتِ تخمینی (چند سلف روی این پلن) ──────────────────────
+        n, per, free = M.capacity_estimate(free_mb=1024, mode="fork")
+        check("ظرفیت: fork → هر سلف ۲۶MB", per == 26, per)
+        check("ظرفیت: ۱۰۲۴MB آزاد → (۱۰۲۴−۹۶)/۲۶ ≈ ۳۵ سلف",
+              n == int((1024 - M.RAM_RESERVE_MB) // 26), n)
+        n2, per2, _ = M.capacity_estimate(free_mb=1024, mode="process")
+        check("ظرفیت: process → هر سلف ۶۲MB", per2 == 62, per2)
+        check("ظرفیت: حالتِ process کمتر جا می‌دهد", n2 < n, (n, n2))
+        n3, _, _ = M.capacity_estimate(free_mb=50, mode="fork")
+        check("ظرفیت: حافظه‌ی کم → صفر (نه عددِ منفی)", n3 == 0, n3)
+        n4, _, f4 = M.capacity_estimate(free_mb=None, mode="fork")
+        check("ظرفیت: بدونِ خواندنِ حافظه → None بی‌استثنا",
+              n4 is None or isinstance(n4, int))
+        src_m = open(os.path.join(REPO, "manager_82.py"), encoding="utf-8").read()
+        check("ظرفیت: خطِ بوت چاپ می‌شود", "ظرفیتِ تخمینی" in src_m)
+        check("ظرفیت: هشدارِ کمبود چاپ می‌شود", "اکانت جا نمی‌شود" in src_m)
+
         check("proc_rss_mb: حافظه‌ی خودِ پروسه را می‌خواند",
               me is not None and me > 5, me)
         check("proc_rss_mb: PIDِ ناموجود → None", M.proc_rss_mb(999999) is None)

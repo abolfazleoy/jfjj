@@ -44,7 +44,60 @@ def _reply(obj):
         pass
 
 
-def _child_exec(selfbot_path, cwd, log_path, code_obj=None):
+def _preload_body(code_obj, selfbot_path, timeout=6.0):
+    """بدنه‌ی سلف را یک‌بار در دیمن اجرا کن (فقط برای مشترک‌شدنِ حافظه).
+
+    چرا: ثابت‌ها و دیکشنری‌های سطحِ بالای `95.py` (متن‌های راهنما، اسکیما،
+    رجکس‌ها…) حدودِ ۸ مگابایت per فرزند هستند. اگر یک‌بار این‌جا ساخته شوند،
+    فرزندها فقط صفحه‌هایشان را شریک می‌کنند.
+
+    چرا با نگهبان: اگر بدنه بلوکه شود (مثلاً اسکریپتی که همان اول صبر
+    می‌کند) نباید دیمن و در نتیجه کلِ سرویس قفل شود. با SIGALRM بعد از
+    `timeout` ثانیه قطعش می‌کنیم و به حالتِ بی‌خطر برمی‌گردیم.
+
+    خروجی: (namespace یا None، دلیل)
+    """
+    if code_obj is None or not hasattr(__import__("signal"), "SIGALRM"):
+        return None, "بدونِ کد/سیگنال"
+    import signal
+
+    class _Timeout(Exception):
+        pass
+
+    def _alarm(_s, _f):
+        raise _Timeout()
+
+    ns = {"__name__": "jafj_selfbot_preload", "__file__": selfbot_path,
+          "__doc__": None, "__package__": None, "__spec__": None,
+          "__builtins__": __builtins__}
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+    except Exception:
+        return None, "بدونِ SIGALRM"
+    try:
+        signal.setitimer(signal.ITIMER_REAL, max(0.5, float(timeout)))
+        try:
+            exec(code_obj, ns)
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except Exception:
+                pass
+    except _Timeout:
+        return None, "بدنه بلوکه شد"
+    except BaseException as e:
+        return None, f"{type(e).__name__}"
+    finally:
+        try:
+            signal.signal(signal.SIGALRM, old_handler)
+        except Exception:
+            pass
+    if not callable(ns.get("main")):
+        return None, "main ندارد"
+    return ns, "ok"
+
+
+def _child_exec(selfbot_path, cwd, log_path, code_obj=None, pre_ns=None):
     """بدنه‌ی فرزند — هرگز برنگردد؛ با os._exit تمام شود.
 
     دقیقاً همان کاری که `python 95.py` می‌کند: فایل به‌عنوان `__main__` اجرا
@@ -85,16 +138,27 @@ def _child_exec(selfbot_path, cwd, log_path, code_obj=None):
         pass
     code = 1
     try:
-        obj = code_obj
-        if obj is None:
-            with open(selfbot_path, encoding="utf-8", errors="replace") as f:
-                src = f.read()
-            obj = compile(src, selfbot_path, "exec")
-        ns = {"__name__": "__main__", "__file__": selfbot_path,
-              "__doc__": None, "__package__": None, "__spec__": None,
-              "__builtins__": __builtins__}
-        exec(obj, ns)               # کدِ کامپایل‌شده در دیمن → صفحه‌های مشترک
-        code = 0
+        _fn = pre_ns.get("main") if isinstance(pre_ns, dict) else None
+        if callable(_fn):
+            # بدنه‌ی سلف در دیمن یک‌بار اجرا شده و ثابت‌ها/دیکشنری‌هایش در
+            # حافظه هستند؛ این‌جا فقط main() صدا زده می‌شود تا همان صفحه‌ها
+            # بینِ همه‌ی فرزندها **مشترک** بمانند (بدونِ اجرای دوباره‌ی بدنه).
+            _r = _fn()
+            if hasattr(_r, "__await__"):
+                import asyncio
+                _r = asyncio.run(_r)
+            code = 0 if _r is None else int(_r or 0)
+        else:
+            obj = code_obj
+            if obj is None:
+                with open(selfbot_path, encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+                obj = compile(src, selfbot_path, "exec")
+            ns = {"__name__": "__main__", "__file__": selfbot_path,
+                  "__doc__": None, "__package__": None, "__spec__": None,
+                  "__builtins__": __builtins__}
+            exec(obj, ns)           # کدِ کامپایل‌شده در دیمن → صفحه‌های مشترک
+            code = 0
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
     except KeyboardInterrupt:
@@ -186,6 +250,18 @@ def main():
     except Exception:
         pass
 
+    pre_ns, pre_why = _preload_body(code_obj, selfbot_path,
+                                   timeout=float(os.environ.get(
+                                       "JAFJ_FORK_PRELOAD_SECS") or 6))
+    if pre_ns is None:
+        # عمداً سکوت نمی‌کنیم؛ ولی این هم خطا نیست — فقط یعنی ۸ مگابایتِ
+        # ثابت‌ها بینِ فرزندها مشترک نمی‌شود.
+        try:
+            sys.stderr.write(f"jafj_forkd: preload نشد ({pre_why})\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
     children = {}
 
     def reap():
@@ -218,7 +294,7 @@ def main():
     except Exception:
         pass
 
-    _reply({"event": "ready", "pid": os.getpid()})
+    _reply({"event": "ready", "pid": os.getpid(), "preload": pre_ns is not None})
 
     try:
         for line in sys.stdin:
@@ -241,7 +317,7 @@ def main():
                     _reply({"ok": False, "error": f"fork: {type(e).__name__}: {e}"})
                     continue
                 if pid == 0:                      # ── فرزند ──
-                    _child_exec(selfbot_path, cwd, log_path, code_obj)
+                    _child_exec(selfbot_path, cwd, log_path, code_obj, pre_ns)
                     os._exit(1)                   # هرگز نمی‌رسیم
                 children[pid] = uid
                 _reply({"ok": True, "pid": pid, "uid": uid})
