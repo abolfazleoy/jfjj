@@ -3790,7 +3790,10 @@ class ForkDaemon:
             pass
 
 
-SHARD_SIZE = 8          # پیش‌فرض؛ با JAFJ_SHARD_SIZE عوض می‌شود
+# پیش‌فرض ۱۶: هر پروسه‌ی شارد ~۶۷MB پایه دارد (اندازه‌گیری‌شده)، پس
+# شاردهای کوچکِ زیاد گران‌تر از یک شاردِ بزرگ‌اند. ۴ شارد × ۲ اکانت = ۲۶۷MB
+# در حالی که ۱ شارد × ۲۴ اکانت = ۸۲MB.
+SHARD_SIZE = 16         # پیش‌فرض؛ با JAFJ_SHARD_SIZE عوض می‌شود
 
 
 def shard_size(env=None):
@@ -4224,18 +4227,31 @@ def spawn_mode(env=None):
 # مصرفِ اندازه‌گیری‌شده‌ی هر سلف (MB) — با همین 95.py، PSS نه RSS:
 # «process» = یک پروسه برای هر اکانت، «fork» = حافظه‌ی مشترک (WISPBYTE_FA §۱۲).
 # fork: اندازه‌گیریِ پله‌ای ۱ تا ۸ اکانت → هر اکانتِ اضافه ۱۱.۲MB.
-PER_ACCOUNT_MB = {"shard": 4, "fork": 11, "process": 62}
-RAM_RESERVE_MB = 96          # برای مدیر، دیتابیس، پشتیبان و OS
+PER_ACCOUNT_MB = {"shard": 3, "fork": 12, "process": 62}
+# هزینه‌ی پایه‌ی هر **پروسه** (اندازه‌گیری‌شده): هر پروسه‌ای که `telethon` را
+# لود می‌کند ~۶۷MB PSS می‌گیرد و این بینِ پروسه‌ها **مشترک نمی‌شود**.
+# پس تعدادِ پروسه‌ها از تعدادِ اکانت‌ها مهم‌تر است:
+#   ۱ شارد × ۲۴ اکانت = ۸۲MB   ولی   ۴ شارد × ۲ اکانت = ۲۶۷MB
+PROC_BASE_MB = {"shard": 67, "fork": 70, "process": 62}
+MANAGER_MB = 20              # مدیر در حالتِ پایدار ~۱۷MB (اندازه‌گیری‌شده)
+RAM_RESERVE_MB = 96          # برای دیتابیس، پشتیبان و OS
 
 
-def capacity_estimate(free_mb=None, mode=None, reserve_mb=None):
-    """(چند سلف جا می‌شود, مصرفِ هر سلف, حافظه‌ی آزاد) — تخمینِ محافظه‌کارانه.
+def capacity_estimate(free_mb=None, mode=None, reserve_mb=None, size=None):
+    """(چند اکانت جا می‌شود, مصرفِ هر اکانت, حافظه‌ی آزاد).
 
-    چرا: کاربر باید بداند روی پلنِ فعلی چند اکانت جا می‌شود، پیش از آن‌که
-    با OOM همه‌ی سرویس‌ها بخوابند. عددها اندازه‌گیری‌شده‌اند، نه حدس.
+    مدلِ اندازه‌گیری‌شده:
+
+        process : n × ۶۲MB
+        fork    : ۷۰MB (دیمن + اکانتِ اول) + (n−۱) × ۱۲MB
+        shard   : ceil(n/size) پروسه × ۶۷MB + n × ۳MB
+
+    نکته‌ی مهم: چون هر **پروسه** ~۶۷MB پایه دارد، در shard تعدادِ پروسه
+    (یعنی `JAFJ_SHARD_SIZE`) تعیین‌کننده است، نه تعدادِ اکانت.
     """
     m = mode or spawn_mode()
     per = PER_ACCOUNT_MB.get(m, PER_ACCOUNT_MB["process"])
+    base = PROC_BASE_MB.get(m, PROC_BASE_MB["process"])
     res = RAM_RESERVE_MB if reserve_mb is None else float(reserve_mb)
     if free_mb is None:
         try:
@@ -4245,12 +4261,28 @@ def capacity_estimate(free_mb=None, mode=None, reserve_mb=None):
     if free_mb is None:
         return None, per, None
     try:
-        usable = float(free_mb) - float(res)
-        if usable <= 0:
-            return 0, per, float(free_mb)
-        return int(usable // per), per, float(free_mb)
+        usable = float(free_mb) - float(res) - MANAGER_MB
     except Exception:
         return None, per, None
+    if usable <= 0:
+        return 0, per, float(free_mb)
+    if m == "process":
+        return int(usable // per), per, float(free_mb)
+    if m == "fork":
+        if usable <= base:
+            return 0, per, float(free_mb)
+        return int(1 + (usable - base) // per), per, float(free_mb)
+    # shard: پرکردنِ پشتِ‌سرِهمِ شاردها
+    sz = int(size or shard_size())
+    sz = max(1, sz)
+    n, shards = 0, 1
+    while n < 100000:
+        nxt = n + 1
+        need_shards = -(-nxt // sz)             # ceil
+        if nxt * per + need_shards * base > usable:
+            break
+        n, shards = nxt, need_shards
+    return n, per, float(free_mb)
 
 
 def proc_pss_mb(pid):

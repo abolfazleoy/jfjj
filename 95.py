@@ -7742,8 +7742,17 @@ async def connect_and_run(eng, creds):
                 # هیچ لینک دعوتی را برای تشخیص، Import/Join نمی‌کنیم.
                 cid = None
             cache[key] = (now0 + (300 if cid is not None else 30), cid)
-            if len(cache) > LINK_CACHE_LIMIT and LINK_CACHE_LIMIT > 0:
-                trim_link_cache(eng)
+            # سقفِ کش: با globals() خوانده می‌شود تا اگر این تابع به‌تنهایی
+            # (بدونِ کلِ ماژول) اجرا شد، NameError ندهد.
+            try:
+                _lim = int(globals().get("LINK_CACHE_LIMIT", 1500) or 0)
+            except Exception:
+                _lim = 1500
+            if _lim > 0 and len(cache) > _lim:
+                try:
+                    trim_link_cache(eng)
+                except Exception:
+                    pass
             return cid
 
         mine_ids = set()

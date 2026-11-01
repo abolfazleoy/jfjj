@@ -80,9 +80,10 @@ def main():
               'RUN_LOCK = "/tmp/accX/jafj.run.lock"' in out)
 
         # ── ۲) اندازه‌ی شارد ─────────────────────────────────────────
-        check("shard_size: پیش‌فرض ۸", M.shard_size({}) == 8, M.shard_size({}))
+        check("shard_size: پیش‌فرض ۱۶", M.shard_size({}) == 16, M.shard_size({}))
         check("shard_size: مقدارِ صریح", M.shard_size({"JAFJ_SHARD_SIZE": "3"}) == 3)
-        check("shard_size: بی‌معنی → پیش‌فرض", M.shard_size({"JAFJ_SHARD_SIZE": "x"}) == 8)
+        check("shard_size: بی‌معنی → پیش‌فرض",
+              M.shard_size({"JAFJ_SHARD_SIZE": "x"}) == 16)
         check("shard_size: سقفِ ۶۴", M.shard_size({"JAFJ_SHARD_SIZE": "999"}) == 64)
         check("shard_size: کفِ ۱", M.shard_size({"JAFJ_SHARD_SIZE": "0"}) == 1)
 

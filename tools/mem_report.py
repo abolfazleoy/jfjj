@@ -148,6 +148,47 @@ def measure_process(py, env, n):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def measure_shards(py, env, n_shards, per_shard):
+    """چند شاردِ هم‌زمان — برای اثباتِ اینکه هر **پروسه** ~۶۷MB پایه دارد."""
+    root = Path(tempfile.mkdtemp(prefix="jafj_mem_multi_"))
+    procs = []
+    try:
+        for sh in range(n_shards):
+            p = subprocess.Popen([py, str(SHARDD), "--selfbot", str(SELFBOT),
+                                  "--max-accounts", str(per_shard)],
+                                 cwd=str(REPO), env=env,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, bufsize=0)
+            p.stdout.readline()
+            for i in range(per_shard):
+                d = root / f"s{sh}a{i}"
+                d.mkdir()
+                msg = json.dumps({"cmd": "run", "cwd": str(d),
+                                  "log": str(d / "run.log"),
+                                  "uid": f"{sh}{i}"})
+                p.stdin.write((msg + "\n").encode())
+                p.stdin.flush()
+                p.stdout.readline()
+                time.sleep(0.25)
+            procs.append(p)
+        time.sleep(9)
+        rss = pss = 0.0
+        for p in procs:
+            for pid in tree(p.pid):
+                r, sm = mem_of(pid)
+                rss += r
+                pss += sm
+        return rss, pss, n_shards * per_shard, len(procs)
+    finally:
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def measure_daemon(py, env, n, mode):
     """fork یا shard: یک دیمن + n اکانت، با همان مسیرِ کدِ مدیر."""
     script = FORKD if mode == "fork" else SHARDD
@@ -189,11 +230,30 @@ def measure_daemon(py, env, n, mode):
 
 
 # ───────────────────────────────────────────── ظرفیت ──
-def capacity(base_mb, marginal_mb, budget_mb, reserve_mb=96.0):
-    usable = float(budget_mb) - float(reserve_mb) - float(base_mb)
+def capacity(base_mb, marginal_mb, budget_mb, mode="shard",
+             reserve_mb=96.0, manager_mb=20.0, size=16):
+    """چند اکانت در این بودجه جا می‌شود — با همان مدلِ مدیر.
+
+    `base_mb` = هزینه‌ی یک پروسه (اندازه‌گیری‌شده). برای shard، هر
+    `size` اکانت یک پروسه لازم دارد.
+    """
+    usable = float(budget_mb) - float(reserve_mb) - float(manager_mb)
     if usable <= 0 or marginal_mb <= 0:
         return 0
-    return int(usable // marginal_mb)
+    if mode == "process":
+        return int(usable // marginal_mb)
+    if usable <= base_mb:
+        return 0
+    if mode == "fork":
+        return int(1 + (usable - base_mb) // marginal_mb)
+    n = 0
+    while n < 100000:
+        nxt = n + 1
+        shards = -(-nxt // max(1, size))
+        if nxt * marginal_mb + shards * base_mb > usable:
+            break
+        n = nxt
+    return n
 
 
 def main():
@@ -253,12 +313,33 @@ def main():
                 print(f"   ۱ اکانت={one_pss:.1f}MB · هر اکانتِ اضافه="
                       f"{marginal:.1f}MB")
 
+    # ── اثباتِ «هزینه‌ی هر پروسه»: همان تعداد اکانت، شاردبندیِ متفاوت ──
+    if args.mode in ("all", "shard") and not args.json:
+        print("\n── همان تعداد اکانت، تعدادِ پروسه‌ی متفاوت (هزینه‌ی هر پروسه) ──")
+    if args.mode in ("all", "shard"):
+        total = args.accounts
+        packs = []
+        if total >= 4:
+            packs = [(1, total), (2, max(1, total // 2)), (4, max(1, total // 4))]
+        for shards, per in packs:
+            if shards * per != total:
+                continue
+            try:
+                rss, pss, nacc, nproc = measure_shards(py, env, shards, per)
+            except Exception:
+                continue
+            report.setdefault("packing", []).append(
+                {"shards": shards, "per_shard": per, "rss": rss, "pss": pss})
+            if not args.json:
+                print(f"  {shards} شارد × {per} اکانت = {nacc} اکانت → "
+                      f"PSS={pss:6.1f} MB ({nproc} پروسه)")
+
     if not args.json:
         print("\n── ظرفیت (با همین اعداد، ۹۶ مگابایت برای مدیر/سیستم کنار) ──")
     for b in [int(x) for x in str(args.budget).split(",") if x.strip()]:
         row = {}
         for mode, d in report["modes"].items():
-            row[mode] = capacity(d["one_pss"], d["marginal"], b)
+            row[mode] = capacity(d["one_pss"], d["marginal"], b, mode=mode)
         report["capacity"][b] = row
         if not args.json:
             cells = "  ".join(f"{m}={v:>4d}" for m, v in row.items())

@@ -115,19 +115,27 @@ def main():
         me = M.proc_rss_mb(os.getpid())
         # ── ظرفیتِ تخمینی (چند سلف روی این پلن) ──────────────────────
         n, per, free = M.capacity_estimate(free_mb=1024, mode="fork")
-        check("ظرفیت: fork → هر سلف ۱۱MB (اندازه‌گیریِ پله‌ای)", per == 11, per)
-        check("ظرفیت: ۱۰۲۴MB آزاد → (۱۰۲۴−۹۶)/۱۱ سلف",
-              n == int((1024 - M.RAM_RESERVE_MB) // 11), n)
-        check("ظرفیت: ۴ گیگ → بیش از ۳۰۰ اکانت", 
-              M.capacity_estimate(free_mb=4096, mode="fork")[0] > 300)
+        check("ظرفیت: fork → هر اکانت ۱۲MB", per == 12, per)
+        usable = 1024 - M.RAM_RESERVE_MB - M.MANAGER_MB
+        check("ظرفیت: fork = ۱ + (بودجه−پایه)/۱۲",
+              n == int(1 + (usable - M.PROC_BASE_MB["fork"]) // 12), n)
+        check("ظرفیت: shard روی ۵۱۲MB بیشتر از fork جا می‌دهد",
+              M.capacity_estimate(free_mb=512, mode="shard")[0]
+              > M.capacity_estimate(free_mb=512, mode="fork")[0])
+        # پروفایل: هر پروسه ۶۷MB — شاردهای کوچکِ زیاد گران‌ترند
+        small = M.capacity_estimate(free_mb=1024, mode="shard", size=4)[0]
+        big = M.capacity_estimate(free_mb=1024, mode="shard", size=32)[0]
+        check("ظرفیت: شاردِ بزرگ‌تر → اکانتِ بیشتر", big > small, (small, big))
         n2, per2, _ = M.capacity_estimate(free_mb=1024, mode="process")
         check("ظرفیت: process → هر سلف ۶۲MB", per2 == 62, per2)
         check("ظرفیت: حالتِ process کمتر جا می‌دهد", n2 < n, (n, n2))
         n3, _, _ = M.capacity_estimate(free_mb=50, mode="fork")
         check("ظرفیت: حافظه‌ی کم → صفر (نه عددِ منفی)", n3 == 0, n3)
         nS, perS, _ = M.capacity_estimate(free_mb=1024, mode="shard")
-        check("ظرفیت: shard → هر سلف ۴MB", perS == 4, perS)
+        check("ظرفیت: shard → هر اکانت ۳MB", perS == 3, perS)
         check("ظرفیت: shard از fork بیشتر جا می‌دهد", nS > n, (nS, n))
+        check("ظرفیت: پایه‌ی هر پروسه در مدل هست",
+              M.PROC_BASE_MB.get("shard", 0) > 0 and M.MANAGER_MB > 0)
         n4, _, f4 = M.capacity_estimate(free_mb=None, mode="fork")
         check("ظرفیت: بدونِ خواندنِ حافظه → None بی‌استثنا",
               n4 is None or isinstance(n4, int))
