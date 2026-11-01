@@ -100,8 +100,10 @@ def main():
     check("حلقه‌ی memory_loop ساخته می‌شود", "asyncio.create_task(memory_loop())" in src)
     check("حلقه‌ی حافظه در پاک‌سازیِ خروج لغو می‌شود",
           "mem_task" in src and "st_task, mem_task)" in src)
+    # محلِ استفاده: سقف باید همان‌جا هم چک شود (نه فقط در trim_link_cache)
     check("کشِ لینک در محلِ استفاده هم سقف دارد",
-          "if len(cache) > LINK_CACHE_LIMIT" in src)
+          'globals().get("LINK_CACHE_LIMIT"' in src
+          and "len(cache) > _lim" in src)
 
     # ── ۵) انتخابِ حالت بر اساس حافظه ─────────────────────────────
     check("total_ram_mb عدد می‌دهد", (M.total_ram_mb() or 0) > 0, M.total_ram_mb())

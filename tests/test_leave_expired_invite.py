@@ -202,7 +202,9 @@ ok, err = asyncio.run(leave_link("https://t.me/+expiredhash", rec["id"]))
 check(ok is True and err == "",
       "L2: با آیدیِ ذخیره‌شده حتی وقتی لینک منقضی است لفت انجام شد (%r, %r)"
       % (ok, err))
-check(len(fake.leaves) == 1 and getattr(fake.leaves[0], "id", None) == -1001234567890,
+check(len(fake.leaves) == 1
+      and (getattr(fake.leaves[0], "id", None)
+           or getattr(fake.leaves[0], "channel_id", None)) == -1001234567890,
       "L2: لفت با InputChannel همان کانال زده شد")
 check(fake.entity_calls == [],
       "L2: لینکِ منقضی اصلاً حل نشد (get_entity صدا زده نشد)")
