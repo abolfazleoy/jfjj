@@ -122,17 +122,17 @@ DEFAULTS = {
         "_capacity_join_blocked_until": 0,
         "_group_failover_active_index": 0,
         "_group_failover_last_activity": 0,
-        "min_join_gap_sec": 10,    # فاصله پیش‌فرض بین دو جوین
-        "max_join_gap_sec": 20,
+        "min_join_gap_sec": 30,    # فاصله پیش‌فرض بین دو جوین (از یک عدد ثابت به بازه تصادفی)
+        "max_join_gap_sec": 60,
         # بررسی عضویت طرف بی‌صدا و با فاصله تصادفی انجام می‌شود.
         # پیش‌فرض سالم: ۱۵ تا ۳۰ ثانیه تصادفی (نه آن‌قدر کوتاه که فلود بسازد).
         # بعد از جوین، تا سقف ۲۴ ساعت چک می‌کنیم؛ فاصله‌ی چک با سن رکورد
         # پلکانی بلند می‌شود تا بارِ «چک تا ابد» روی اکانت نیفتد.
         # لفت فقط بعد از ۲ منفیِ تأییدشده (هرکدام با چک دوم) انجام می‌شود.
-        "check_min_sec": 7,
-        "check_max_sec": 12,
-        "check_interval_sec": 12,
-        "response_delay_sec": 5,  # تأخیر پاسخ بعد از Join واقعی
+        "check_min_sec": 15,
+        "check_max_sec": 30,
+        "check_interval_sec": 30,
+        "response_delay_sec": 15,  # تأخیر پاسخ بعد از Join واقعی
         "max_joins_per_day": 0,    # Join بدون سقف روزانه
         "recheck_hours": 24,       # چک عضویت تا ۲۴ ساعت بعد از جوین ادامه دارد
         "recheck_minutes": 1,       # بررسی پیش‌فرض عضویت هر یک دقیقه (پشتیبان قدیمی)
@@ -157,15 +157,15 @@ DEFAULTS = {
         "msg_nolink": "",
         "msg_come": "",
         "come_delay_sec": 0,         # تأخیر پیام «بیا» بعد از جوین (سازگاری)
-        "come_min_sec": 8,           # بازه‌ی تصادفی تأخیر «بیا» بعد از جوینِ ربات
-        "come_max_sec": 15,          # هرگز ۰ نیست
-        "response_delay_sec": 5,     # تأخیر پاسخ بعد از Join واقعی (سازگاری)
-        "response_min_sec": 4,       # بازه‌ی تصادفی پاسخ موفق «جوین شدم» روی پیام طرف
-        "response_max_sec": 12,
-        "reply_min_sec": 2,          # بازه‌ی تصادفی تأخیر پاسخ‌های مستقیم رویداد
-        "reply_max_sec": 6,          # (عضو نیست/صبر کن/کانالت پیدا نشد)
-        "reminder_min_sec": 10,      # فاصله کمینه بین دو پیام «نیومدی»
-        "reminder_max_sec": 18,      # فاصله بیشینه بین دو پیام «نیومدی»
+        "come_min_sec": 34,          # بازه‌ی تصادفی تأخیر «بیا» بعد از جوینِ ربات
+        "come_max_sec": 35,          # (پیش‌فرض: ۳۴–۳۵ ثانیه؛ هرگز ۰/درجا)
+        "response_delay_sec": 15,    # تأخیر پاسخ بعد از Join واقعی (سازگاری)
+        "response_min_sec": 11,      # بازه‌ی تصادفی پاسخ موفق «جوین شدم» روی پیام طرف
+        "response_max_sec": 48,      # (پیش‌فرض: ۱۱–۴۸ ثانیه)
+        "reply_min_sec": 5,          # بازه‌ی تصادفی تأخیر پاسخ‌های مستقیم رویداد
+        "reply_max_sec": 18,         # (عضو نیست/صبر کن/کانالت پیدا نشد؛ ۵–۱۸ ثانیه)
+        "reminder_min_sec": 20,      # فاصله کمینه بین دو پیام «نیومدی» (پیش‌فرض ۲۰–۴۰ ثانیه تصادفی)
+        "reminder_max_sec": 40,      # فاصله بیشینه بین دو پیام «نیومدی» — هیچ‌وقت پشت سر هم نمی‌روند
         # ── صفِ تک‌عملکردی تبادل (فیکس «همه‌چیز درجا پشت سر هم») ──
         # هر عملکرد تبادل (چک عضویت / جوین / لفت / پیام «نیومدی» / «جوین شدم»)
         # یک «عملکرد» حساب می‌شود. تا وقتی یک عملکرد تمام نشده، عملکرد بعدی
@@ -176,8 +176,8 @@ DEFAULTS = {
         # «نیومدی» نمی‌رود؛ اول ۱۵–۲۰ ثانیه صبر، بعد چکِ واقعیِ عضویت).
         # این بازه «کفِ» فاصله‌هاست: فاصله‌ی یادآوری/پاسخ اگر بلندتر باشد،
         # همان بلندتر مبناست (هرگز کوتاه‌تر از این نمی‌شود).
-        "op_gap_min_sec": 6,
-        "op_gap_max_sec": 10,
+        "op_gap_min_sec": 15,
+        "op_gap_max_sec": 20,
         # کلید قدیمی برای سازگاری؛ نامشخص هرگز به عدم عضویت تبدیل نمی‌شود
         "unk_fallback_after": 0,
         # بعد از این تعداد پیام «عضو نیست»، اگر طرف هنوز نیامده باشد از
@@ -185,9 +185,9 @@ DEFAULTS = {
         "max_reminders": 2,
         # ── حالت پیش‌قدم: خودت اول جوین می‌شوی ──
         "initiate": True,         # پیش‌فرض روشن
-        "scan_every_sec": 10,     # پیش‌قدم: هر ۱۰ ثانیه پیام‌های جدید را می‌بیند
-        "scan_jitter_min_sec": 2,  # تأخیر تصادفی بین اسکن گروه‌ها — ضد اسپم
-        "scan_jitter_max_sec": 5,  # اگر ۲ گروه داری: اولی سر ۱۰ ثانیه، دومی ۲–۵ ثانیه بعد
+        "scan_every_sec": 30,     # پیش‌قدم: هر ۳۰ ثانیه پیام‌های جدید را می‌بیند
+        "scan_jitter_min_sec": 5,  # تأخیر تصادفی بین اسکن گروه‌ها — ضد اسپم (پیش‌فرض ۵–۱۵ ثانیه)
+        "scan_jitter_max_sec": 15, # اگر ۲ گروه داری: اولی سر ۳۰ ثانیه، دومی ۵–۱۵ ثانیه بعد، بعد دوباره ۳۰ ثانیه صبر
         "scan_every_min": 1,      # سازگاری با تنظیم قدیمیِ دقیقه‌ای
         "scan_limit": 50,         # چند پیام آخر هر گروه
         "scan_max_age_sec": 300,   # فقط لینک حداکثر ۵ دقیقه اخیر
@@ -414,7 +414,7 @@ def group_failover_after_scan(ex_cfg, groups, now_ts, found, scan_error=False):
 # با فاصله‌ی پیش‌فرض ۳۰–۶۰ ثانیه، این تعداد تقریباً کل پنجره‌ی ۵ دقیقه‌ای
 # «سن لینک» را پر می‌کند؛ بیشتر از این، رکوردها پیش از رسیدن نوبت پیر
 # می‌شدند و فقط رکورد مرده و اعلان تکراری می‌ساختند.
-SCAN_JOIN_BACKLOG_LIMIT = 20
+SCAN_JOIN_BACKLOG_LIMIT = 5
 # اعلان خودکار «کانال تازه پیدا شد» حداکثر هر چند ثانیه یک‌بار و به‌صورت
 # تجمیعی برود (اسکن دستی مشمول این محدودیت نیست و همان لحظه جواب می‌دهد).
 SCAN_FOUND_NOTE_GAP_SEC = 300
@@ -465,8 +465,7 @@ def _safe_id(rec):
 
 
 def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
-                                    exclude_ids=None, allow_old_pending=False,
-                                    min_pending_age_sec=900):
+                                    exclude_ids=None):
     """Choose the oldest reciprocated exchange channel to leave for a slot.
 
     An outbound exchange is complete only after the partner joined back.
@@ -474,17 +473,12 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
     records are kept untouched. Completion does not wait for the normal
     membership-watch window; the account-cap error is the cleanup trigger.
 
-    وقتی allow_old_pending=True باشد و هیچ کاندیدِ «تبادل کامل‌شده» پیدا نشود،
-    به‌عنوان آخرین راه، قدیمی‌ترین جوینِ پیش‌قدمی که طرف هنوز برنگشته ولی
-    از joined_at حداقل min_pending_age_sec ثانیه (پیش‌فرض ۱۵ دقیقه) گذشته
-    برمی‌گرداند — این کار از گیرکردن در حلقهٔ «سقف پر بود و کاندید پیدا نشد»
-    جلوگیری می‌کند (قبلاً در این حالت تا ریست دستی یک ساعت بلاک می‌شد).
-
     ``exclude_ids`` برای پاکسازی دسته‌ای است: id رکوردهایی که در همین دور
     قبلاً برداشته شده‌اند رد می‌شوند. رکوردهای برداشته‌شده از استخر حذف
     نمی‌شوند تا تشخیص تکراری (chat_id/لینک یکسان) نسبت به آن‌ها سالم بماند.
     """
     joined = [r for r in (records or []) if r.get("status") == "joined"]
+    candidates = []
     own_channels = tuple(c for c in (own_channels or ()) if c)
     skip_ids = set()
     for v in (exclude_ids or ()):
@@ -497,58 +491,32 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
             skip_ids.add(int(exclude_id))
         except (TypeError, ValueError):
             pass
-
-    def _basic_filter(rec, *, need_peer_join=True):
+    for rec in joined:
         rid = _safe_id(rec)
         if rid in skip_ids:
-            return False
+            continue
         if not rec.get("peer_id"):
-            return False
-        if need_peer_join and str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
-            return False
+            continue
+        if str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
+            continue
         if int(rec.get("next_reminder") or 0) > 0:
-            return False
+            continue
         if any(same_peer_ref(rec.get("link"), own) for own in own_channels):
-            return False
-        return True
-
-    def _dedup_ok(rec, pool):
+            continue
+        duplicate = False
         cid = rec.get("chat_id")
-        rid = _safe_id(rec)
-        for other in pool:
+        for other in joined:
             if other is rec or int(other.get("id") or 0) == rid:
                 continue
             same_chat = (cid and other.get("chat_id")
                          and int(cid) == int(other.get("chat_id")))
             same_link = same_peer_ref(rec.get("link"), other.get("link"))
             if same_chat or same_link:
-                return False
-        return True
-
-    candidates = [r for r in joined if _basic_filter(r, need_peer_join=True) and _dedup_ok(r, joined)]
-
-    # مرحله اضطراری: کاندید کاملاً امن پیدا نشد — برای اینکه ربات در
-    # «کاندید پیدا نشد» یک ساعته گیر نکند، قدیمی‌ترین پیش‌قدمِ کهنه
-    # (که بیش از ۱۵ دقیقه است طرف برنگشته) را هم وارد لیست می‌کنیم.
-    if not candidates and allow_old_pending:
-        now_ts = int(time.time())
-        fallback = []
-        for r in joined:
-            if not _basic_filter(r, need_peer_join=False):
-                continue
-            if str(r.get("direction") or "in").lower() != "out" or r.get("peer_joined_at"):
-                continue
-            try:
-                j = int(r.get("joined_at") or r.get("created_at") or 0)
-            except (TypeError, ValueError):
-                j = 0
-            if not j or (now_ts - j) < int(min_pending_age_sec or 900):
-                continue
-            if not _dedup_ok(r, joined):
-                continue
-            fallback.append(r)
-        candidates = fallback
-
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        candidates.append(rec)
     if not candidates:
         return None
     def _age_key(rec):
@@ -571,15 +539,6 @@ CAPACITY_CLEANUP_BATCH_MAX = 100
 # اگر بعد از یک دور پاکسازیِ موفق، تلگرام هنوز سقف را پر اعلام کند (ثبتِ
 # آزادشدن slot در سرور تلگرام کمی تأخیر دارد)، جوین چقدر مکث کند؟
 CAPACITY_REBLOCK_SEC = 300
-# وقتی هیچ کاندیدِ امنی برای لفت پیدا نشد (مثلاً تبادل‌ها ناتمام/تکراری/خودم
-# هستند) نمی‌دانیم تلگرام هنوز پر است یا کاربر دستی جا آزاد کرده. به‌جای
-# بلاک ۱ ساعته که تا ریست دستی ادامه می‌یابد، مکث کوتاه می‌کنیم و بعد
-# مستقیم با یک جوین کوچک واقعاً تست می‌کنیم.
-CAPACITY_NO_CANDIDATE_BLOCK_SEC = 120
-# هر چند ثانیه یک‌بار، وقتی به‌خاطرِ «کاندید پیدا نشد» بلاک هستیم،
-# بیایم و وضعیت واقعی تلگرام را با یک GetDialogs / تست ظرفیت دوباره چک کنیم
-# — اگر کاربر دستی جا آزاد کرده زودتر از تایمر متوجه شویم.
-CAPACITY_PROBE_INTERVAL_SEC = 60
 
 
 def clamp_capacity_batch(value):
@@ -613,26 +572,13 @@ def select_capacity_leave_batch(records, own_channels=(),
             skip.add(int(exclude_id))
         except (TypeError, ValueError):
             pass
-    # مرحله ۱: فقط کاندیدهای کاملاً امن (تبادل کامل‌شده، طرف هم جوین کرده)
     while len(picked) < limit:
         rec = select_capacity_leave_candidate(
-            pool, own_channels=own_channels, exclude_ids=skip,
-            allow_old_pending=False)
+            pool, own_channels=own_channels, exclude_ids=skip)
         if rec is None:
             break
         picked.append(rec)
         skip.add(_safe_id(rec))
-    # مرحله ۲ (اضطراری): کاندید کامل‌شده پیدا نشد — قدیمی‌ترین پیش‌قدمِ کهنه
-    # را هم لفت بده تا از «یک ساعت بلاک بدون کاندید» دربیاییم.
-    if not picked:
-        while len(picked) < max(3, min(limit, 5)):
-            rec = select_capacity_leave_candidate(
-                pool, own_channels=own_channels, exclude_ids=skip,
-                allow_old_pending=True)
-            if rec is None:
-                break
-            picked.append(rec)
-            skip.add(_safe_id(rec))
     return picked
 
 
@@ -846,37 +792,44 @@ class Settings:
                         pass
                 if not old_ex.get("scan_pick") or old_ex.get("scan_pick") == 2:
                     self.data["exchange"]["scan_pick"] = 1
-                # ── مهاجرت v3: پیش‌فرض‌های تند ──
-                # نسخه‌های قبل با «پیش‌فرض‌های کند» (op_gap ۱۵–۲۰، جوین ۳۰–۶۰،
-                # اسکن ۳۰، چک ۱۵–۳۰ و …) سرعت تبادل را می‌گرفتند. کاربرانی که
-                # مقدارها را دستی عوض نکرده‌اند (هنوز روی پیش‌فرض v2 هستند)
-                # به پیش‌فرض‌های تند منتقل می‌شوند؛ مقادیر سفارشی دست‌نخورده
-                # می‌مانند.
-                if not saved.get("_cfg_migrated_v3"):
+                # ── مهاجرت v3: بازگشت از پیش‌فرض‌های تندِ اشتباه ──
+                # در جلسه‌ای یک‌بار پیش‌فرض‌ها را به مقادیر خیلی تند/خیلی کند
+                # عوض کرده بودیم که نتیجه‌اش «هر چند دقیقه یک پیش‌قدم» و
+                # «بسیاری از تبادل‌ها پیر می‌شوند» بود. کاربرانی که آن نسخه
+                # را اجرا کرده‌اند و مقادیرشان هنوز روی آن اعداد است، یک‌بار
+                # به پیش‌فرض‌های سالم اصلی (v2) برمی‌گردند. اگر خود کاربر
+                # دستی عددی را شخصی کرده بود، تغییر نمی‌دهیم.
+                def _is_bad(key, bad_values):
+                    return old_ex.get(key) in bad_values
+                if not saved.get("_cfg_migrated_v3_fix"):
                     ex = self.data["exchange"]
-                    def _on_default(key, v2_val, new_val):
-                        if old_ex.get(key) in (None, v2_val):
-                            ex[key] = new_val
-                    _on_default("op_gap_min_sec", 15, 6)
-                    _on_default("op_gap_max_sec", 20, 10)
-                    _on_default("min_join_gap_sec", 30, 10)
-                    _on_default("max_join_gap_sec", 60, 20)
-                    _on_default("scan_every_sec", 30, 10)
-                    _on_default("check_min_sec", 15, 7)
-                    _on_default("check_max_sec", 30, 12)
-                    _on_default("check_interval_sec", 30, 12)
-                    _on_default("reminder_min_sec", 20, 10)
-                    _on_default("reminder_max_sec", 40, 18)
-                    _on_default("reply_min_sec", 5, 2)
-                    _on_default("reply_max_sec", 18, 6)
-                    _on_default("response_min_sec", 11, 4)
-                    _on_default("response_max_sec", 48, 12)
-                    _on_default("response_delay_sec", 15, 5)
-                    _on_default("come_min_sec", 34, 8)
-                    _on_default("come_max_sec", 35, 15)
-                    _on_default("scan_jitter_min_sec", 5, 2)
-                    _on_default("scan_jitter_max_sec", 15, 5)
-                    self.data["_cfg_migrated_v3"] = True
+                    if _is_bad("min_join_gap_sec", (10, 20)) and _is_bad("max_join_gap_sec", (20, 35)):
+                        ex["min_join_gap_sec"] = 30
+                        ex["max_join_gap_sec"] = 60
+                    if _is_bad("op_gap_min_sec", (6,)) and _is_bad("op_gap_max_sec", (10,)):
+                        ex["op_gap_min_sec"] = 15
+                        ex["op_gap_max_sec"] = 20
+                    if _is_bad("scan_every_sec", (10,)):
+                        ex["scan_every_sec"] = 30
+                    if _is_bad("scan_jitter_min_sec", (2,)) and _is_bad("scan_jitter_max_sec", (5,)):
+                        ex["scan_jitter_min_sec"] = 5
+                        ex["scan_jitter_max_sec"] = 15
+                    if _is_bad("check_min_sec", (7, 12)) and _is_bad("check_max_sec", (12, 22)):
+                        ex["check_min_sec"] = 15
+                        ex["check_max_sec"] = 30
+                    if _is_bad("reminder_min_sec", (10, 18)) and _is_bad("reminder_max_sec", (18, 30)):
+                        ex["reminder_min_sec"] = 20
+                        ex["reminder_max_sec"] = 40
+                    if _is_bad("reply_min_sec", (2, 4)) and _is_bad("reply_max_sec", (6, 12)):
+                        ex["reply_min_sec"] = 5
+                        ex["reply_max_sec"] = 18
+                    if _is_bad("response_min_sec", (4,)) and _is_bad("response_max_sec", (12,)):
+                        ex["response_min_sec"] = 11
+                        ex["response_max_sec"] = 48
+                    if _is_bad("come_min_sec", (8,)) and _is_bad("come_max_sec", (15,)):
+                        ex["come_min_sec"] = 34
+                        ex["come_max_sec"] = 35
+                    self.data["_cfg_migrated_v3_fix"] = True
             except Exception as e:
                 print(f"⚠️ خواندن تنظیمات ناموفق: {e}")
         # سقف روزانه Join از این نسخه حذف شده؛ حتی تنظیم قدیمی ۲۰ هم نادیده گرفته می‌شود.
@@ -8114,7 +8067,7 @@ async def connect_and_run(eng, creds):
                 # ۰) اسکن گروه‌ها (حالت پیش‌قدم)
                 now_t = time.time()
                 manual = bool(x.pop("_scan_now", False))
-                scan_seconds = max(5, int(x.get("scan_every_sec", 10) or 10))
+                scan_seconds = max(30, int(x.get("scan_every_sec", 30) or 30))
                 if manual or (x["initiate"] and
                               now_t - last_scan[0] >= scan_seconds):
                     last_scan[0] = now_t
@@ -8681,29 +8634,12 @@ async def connect_and_run(eng, creds):
                     continue
 
                 capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
-                now_ts = int(time.time())
-                probe_due = int(x.get("_capacity_probe_due", 0) or 0)
-                if capacity_blocked_until > now_ts:
-                    # بلاک سقف: یا منتظر اتمام جریمه می‌مانیم، یا (برای حالتِ
-                    # «کاندید پیدا نشد» با فاصلهٔ کوتاه) در صورت رسیدن
-                    # probe_due، سریع‌تر تست می‌کنیم که آیا واقعاً هنوز
-                    # سقف پر است — ممکن است کاربر دستی جا آزاد کرده باشد.
-                    want_probe = (probe_due and now_ts >= probe_due)
-                    if not want_probe:
-                        await asyncio.sleep(min(15, max(1, capacity_blocked_until - now_ts)))
-                        continue
-                    # تست: می‌خواهیم بفهمیم آیا تلگرام هنوز ChannelsTooMuch
-                    # می‌دهد یا نه، بدون ریسکِ پذیرش واقعی جوین. ساده‌ترین
-                    # راه: فلگ cleanup_pending را می‌زنیم تا worker دور
-                    # معمول پاکسازی + تلاش واقعی را اجرا کند؛ اما خود
-                    # کانالِ approved را دست‌نخورده نگه می‌داریم.
-                    x["_capacity_probe_due"] = 0
-                    x["_capacity_join_blocked_until"] = 0
-                    x["_capacity_cleanup_pending"] = True
-                    eng.st.save()
-                    eng.log("info", "ex_capacity_probe",
-                            "probe after short block: testing if capacity is free")
+                if capacity_blocked_until > int(time.time()):
+                    await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
                     continue
+                if capacity_blocked_until:
+                    x["_capacity_join_blocked_until"] = 0
+                    eng.st.save()
 
                 # ── شفافیتِ صف: اگر یک عملیات FloodWait خورده باشد، صفِ
                 # تک‌عملکردی تا پایان جریمه بسته است و هیچ پاسخ خودکاری
@@ -8746,19 +8682,18 @@ async def connect_and_run(eng, creds):
                     x["_last_capacity_cleanup_at"] = int(time.time())
                     eng.st.save()
                     if left_count <= 0:
-                        # کاندید امن نبود/همه لفت‌ها شکست خورد.
-                        # نکته: ممکن است کاربر در این میان دستی چند کانال را
-                        # لفت کرده باشد و تلگرام الان واقعاً جا داشته باشد.
-                        # به‌جای بلاک یک‌ساعته (که تا «تبادل لفت خودکار ریست»
-                        # تمام جوین‌ها را می‌بست و مدام پیام «سقف پر بود ولی
-                        # کاندید پیدا نشد» تکرار می‌کرد) مکث کوتاه می‌کنیم و
-                        # بعد با یک تست ظرفیت واقعی (probe) در ابتدای حلقه
-                        # وضعیت را راستی‌آزمایی می‌کنیم.
+                        # کاندید امن نبود/همه لفت‌ها شکست خوردند.
+                        # قبلاً اینجا block_joins_for_capacity() به‌صورت
+                        # پیش‌فرض ۱ ساعت (۳۶۰۰ ثانیه) بلاک می‌کرد و ربات
+                        # تا «تبادل لفت خودکار ریست» اسکن/جوین نمی‌کرد —
+                        # نتیجه: «هر ۶۰ ثانیه یک پیش‌قدم می‌زد» تبدیل به
+                        # «چند دقیقه هیچ‌کاری نمی‌کرد و رکوردها پیر می‌شدند».
+                        # به‌جایش مکث کوتاه می‌کنیم تا تلگرام slotها را ثبت
+                        # کند، بعد دوباره تلاش؛ اگر کاربر در این میان دستی
+                        # لفت کرده باشد خودکار ادامه می‌یابد.
                         block_joins_for_capacity(
                             stopped or "کاندید امن برای لفت پیدا نشد",
-                            seconds=CAPACITY_NO_CANDIDATE_BLOCK_SEC)
-                        x["_capacity_probe_due"] = int(time.time()) + CAPACITY_PROBE_INTERVAL_SEC
-                        eng.st.save()
+                            seconds=90)
                         # گیتِ بلاک بالای حلقه است؛ همین دور دیگر جوین نزن تا
                         # رکورد approved دست‌نخورده بماند و دور بعد پشت گیت بخوابد.
                         continue
