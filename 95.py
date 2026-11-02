@@ -122,17 +122,17 @@ DEFAULTS = {
         "_capacity_join_blocked_until": 0,
         "_group_failover_active_index": 0,
         "_group_failover_last_activity": 0,
-        "min_join_gap_sec": 30,    # فاصله پیش‌فرض بین دو جوین (از یک عدد ثابت به بازه تصادفی)
-        "max_join_gap_sec": 60,
+        "min_join_gap_sec": 10,    # فاصله پیش‌فرض بین دو جوین
+        "max_join_gap_sec": 20,
         # بررسی عضویت طرف بی‌صدا و با فاصله تصادفی انجام می‌شود.
         # پیش‌فرض سالم: ۱۵ تا ۳۰ ثانیه تصادفی (نه آن‌قدر کوتاه که فلود بسازد).
         # بعد از جوین، تا سقف ۲۴ ساعت چک می‌کنیم؛ فاصله‌ی چک با سن رکورد
         # پلکانی بلند می‌شود تا بارِ «چک تا ابد» روی اکانت نیفتد.
         # لفت فقط بعد از ۲ منفیِ تأییدشده (هرکدام با چک دوم) انجام می‌شود.
-        "check_min_sec": 15,
-        "check_max_sec": 30,
-        "check_interval_sec": 30,
-        "response_delay_sec": 15,  # تأخیر پاسخ بعد از Join واقعی
+        "check_min_sec": 7,
+        "check_max_sec": 12,
+        "check_interval_sec": 12,
+        "response_delay_sec": 5,  # تأخیر پاسخ بعد از Join واقعی
         "max_joins_per_day": 0,    # Join بدون سقف روزانه
         "recheck_hours": 24,       # چک عضویت تا ۲۴ ساعت بعد از جوین ادامه دارد
         "recheck_minutes": 1,       # بررسی پیش‌فرض عضویت هر یک دقیقه (پشتیبان قدیمی)
@@ -157,15 +157,15 @@ DEFAULTS = {
         "msg_nolink": "",
         "msg_come": "",
         "come_delay_sec": 0,         # تأخیر پیام «بیا» بعد از جوین (سازگاری)
-        "come_min_sec": 34,          # بازه‌ی تصادفی تأخیر «بیا» بعد از جوینِ ربات
-        "come_max_sec": 35,          # (پیش‌فرض: ۳۴–۳۵ ثانیه؛ هرگز ۰/درجا)
-        "response_delay_sec": 15,    # تأخیر پاسخ بعد از Join واقعی (سازگاری)
-        "response_min_sec": 11,      # بازه‌ی تصادفی پاسخ موفق «جوین شدم» روی پیام طرف
-        "response_max_sec": 48,      # (پیش‌فرض: ۱۱–۴۸ ثانیه)
-        "reply_min_sec": 5,          # بازه‌ی تصادفی تأخیر پاسخ‌های مستقیم رویداد
-        "reply_max_sec": 18,         # (عضو نیست/صبر کن/کانالت پیدا نشد؛ ۵–۱۸ ثانیه)
-        "reminder_min_sec": 20,      # فاصله کمینه بین دو پیام «نیومدی» (پیش‌فرض ۲۰–۴۰ ثانیه تصادفی)
-        "reminder_max_sec": 40,      # فاصله بیشینه بین دو پیام «نیومدی» — هیچ‌وقت پشت سر هم نمی‌روند
+        "come_min_sec": 8,           # بازه‌ی تصادفی تأخیر «بیا» بعد از جوینِ ربات
+        "come_max_sec": 15,          # هرگز ۰ نیست
+        "response_delay_sec": 5,     # تأخیر پاسخ بعد از Join واقعی (سازگاری)
+        "response_min_sec": 4,       # بازه‌ی تصادفی پاسخ موفق «جوین شدم» روی پیام طرف
+        "response_max_sec": 12,
+        "reply_min_sec": 2,          # بازه‌ی تصادفی تأخیر پاسخ‌های مستقیم رویداد
+        "reply_max_sec": 6,          # (عضو نیست/صبر کن/کانالت پیدا نشد)
+        "reminder_min_sec": 10,      # فاصله کمینه بین دو پیام «نیومدی»
+        "reminder_max_sec": 18,      # فاصله بیشینه بین دو پیام «نیومدی»
         # ── صفِ تک‌عملکردی تبادل (فیکس «همه‌چیز درجا پشت سر هم») ──
         # هر عملکرد تبادل (چک عضویت / جوین / لفت / پیام «نیومدی» / «جوین شدم»)
         # یک «عملکرد» حساب می‌شود. تا وقتی یک عملکرد تمام نشده، عملکرد بعدی
@@ -176,8 +176,8 @@ DEFAULTS = {
         # «نیومدی» نمی‌رود؛ اول ۱۵–۲۰ ثانیه صبر، بعد چکِ واقعیِ عضویت).
         # این بازه «کفِ» فاصله‌هاست: فاصله‌ی یادآوری/پاسخ اگر بلندتر باشد،
         # همان بلندتر مبناست (هرگز کوتاه‌تر از این نمی‌شود).
-        "op_gap_min_sec": 15,
-        "op_gap_max_sec": 20,
+        "op_gap_min_sec": 6,
+        "op_gap_max_sec": 10,
         # کلید قدیمی برای سازگاری؛ نامشخص هرگز به عدم عضویت تبدیل نمی‌شود
         "unk_fallback_after": 0,
         # بعد از این تعداد پیام «عضو نیست»، اگر طرف هنوز نیامده باشد از
@@ -185,9 +185,9 @@ DEFAULTS = {
         "max_reminders": 2,
         # ── حالت پیش‌قدم: خودت اول جوین می‌شوی ──
         "initiate": True,         # پیش‌فرض روشن
-        "scan_every_sec": 30,     # پیش‌قدم: هر ۳۰ ثانیه پیام‌های جدید را می‌بیند
-        "scan_jitter_min_sec": 5,  # تأخیر تصادفی بین اسکن گروه‌ها — ضد اسپم (پیش‌فرض ۵–۱۵ ثانیه)
-        "scan_jitter_max_sec": 15, # اگر ۲ گروه داری: اولی سر ۳۰ ثانیه، دومی ۵–۱۵ ثانیه بعد، بعد دوباره ۳۰ ثانیه صبر
+        "scan_every_sec": 10,     # پیش‌قدم: هر ۱۰ ثانیه پیام‌های جدید را می‌بیند
+        "scan_jitter_min_sec": 2,  # تأخیر تصادفی بین اسکن گروه‌ها — ضد اسپم
+        "scan_jitter_max_sec": 5,  # اگر ۲ گروه داری: اولی سر ۱۰ ثانیه، دومی ۲–۵ ثانیه بعد
         "scan_every_min": 1,      # سازگاری با تنظیم قدیمیِ دقیقه‌ای
         "scan_limit": 50,         # چند پیام آخر هر گروه
         "scan_max_age_sec": 300,   # فقط لینک حداکثر ۵ دقیقه اخیر
@@ -414,7 +414,7 @@ def group_failover_after_scan(ex_cfg, groups, now_ts, found, scan_error=False):
 # با فاصله‌ی پیش‌فرض ۳۰–۶۰ ثانیه، این تعداد تقریباً کل پنجره‌ی ۵ دقیقه‌ای
 # «سن لینک» را پر می‌کند؛ بیشتر از این، رکوردها پیش از رسیدن نوبت پیر
 # می‌شدند و فقط رکورد مرده و اعلان تکراری می‌ساختند.
-SCAN_JOIN_BACKLOG_LIMIT = 5
+SCAN_JOIN_BACKLOG_LIMIT = 20
 # اعلان خودکار «کانال تازه پیدا شد» حداکثر هر چند ثانیه یک‌بار و به‌صورت
 # تجمیعی برود (اسکن دستی مشمول این محدودیت نیست و همان لحظه جواب می‌دهد).
 SCAN_FOUND_NOTE_GAP_SEC = 300
@@ -846,6 +846,37 @@ class Settings:
                         pass
                 if not old_ex.get("scan_pick") or old_ex.get("scan_pick") == 2:
                     self.data["exchange"]["scan_pick"] = 1
+                # ── مهاجرت v3: پیش‌فرض‌های تند ──
+                # نسخه‌های قبل با «پیش‌فرض‌های کند» (op_gap ۱۵–۲۰، جوین ۳۰–۶۰،
+                # اسکن ۳۰، چک ۱۵–۳۰ و …) سرعت تبادل را می‌گرفتند. کاربرانی که
+                # مقدارها را دستی عوض نکرده‌اند (هنوز روی پیش‌فرض v2 هستند)
+                # به پیش‌فرض‌های تند منتقل می‌شوند؛ مقادیر سفارشی دست‌نخورده
+                # می‌مانند.
+                if not saved.get("_cfg_migrated_v3"):
+                    ex = self.data["exchange"]
+                    def _on_default(key, v2_val, new_val):
+                        if old_ex.get(key) in (None, v2_val):
+                            ex[key] = new_val
+                    _on_default("op_gap_min_sec", 15, 6)
+                    _on_default("op_gap_max_sec", 20, 10)
+                    _on_default("min_join_gap_sec", 30, 10)
+                    _on_default("max_join_gap_sec", 60, 20)
+                    _on_default("scan_every_sec", 30, 10)
+                    _on_default("check_min_sec", 15, 7)
+                    _on_default("check_max_sec", 30, 12)
+                    _on_default("check_interval_sec", 30, 12)
+                    _on_default("reminder_min_sec", 20, 10)
+                    _on_default("reminder_max_sec", 40, 18)
+                    _on_default("reply_min_sec", 5, 2)
+                    _on_default("reply_max_sec", 18, 6)
+                    _on_default("response_min_sec", 11, 4)
+                    _on_default("response_max_sec", 48, 12)
+                    _on_default("response_delay_sec", 15, 5)
+                    _on_default("come_min_sec", 34, 8)
+                    _on_default("come_max_sec", 35, 15)
+                    _on_default("scan_jitter_min_sec", 5, 2)
+                    _on_default("scan_jitter_max_sec", 15, 5)
+                    self.data["_cfg_migrated_v3"] = True
             except Exception as e:
                 print(f"⚠️ خواندن تنظیمات ناموفق: {e}")
         # سقف روزانه Join از این نسخه حذف شده؛ حتی تنظیم قدیمی ۲۰ هم نادیده گرفته می‌شود.
@@ -8083,7 +8114,7 @@ async def connect_and_run(eng, creds):
                 # ۰) اسکن گروه‌ها (حالت پیش‌قدم)
                 now_t = time.time()
                 manual = bool(x.pop("_scan_now", False))
-                scan_seconds = max(30, int(x.get("scan_every_sec", 30) or 30))
+                scan_seconds = max(5, int(x.get("scan_every_sec", 10) or 10))
                 if manual or (x["initiate"] and
                               now_t - last_scan[0] >= scan_seconds):
                     last_scan[0] = now_t
