@@ -465,7 +465,8 @@ def _safe_id(rec):
 
 
 def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
-                                    exclude_ids=None):
+                                    exclude_ids=None, allow_old_pending=False,
+                                    min_pending_age_sec=900):
     """Choose the oldest reciprocated exchange channel to leave for a slot.
 
     An outbound exchange is complete only after the partner joined back.
@@ -473,12 +474,17 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
     records are kept untouched. Completion does not wait for the normal
     membership-watch window; the account-cap error is the cleanup trigger.
 
+    وقتی allow_old_pending=True باشد و هیچ کاندیدِ «تبادل کامل‌شده» پیدا نشود،
+    به‌عنوان آخرین راه، قدیمی‌ترین جوینِ پیش‌قدمی که طرف هنوز برنگشته ولی
+    از joined_at حداقل min_pending_age_sec ثانیه (پیش‌فرض ۱۵ دقیقه) گذشته
+    برمی‌گرداند — این کار از گیرکردن در حلقهٔ «سقف پر بود و کاندید پیدا نشد»
+    جلوگیری می‌کند (قبلاً در این حالت تا ریست دستی یک ساعت بلاک می‌شد).
+
     ``exclude_ids`` برای پاکسازی دسته‌ای است: id رکوردهایی که در همین دور
     قبلاً برداشته شده‌اند رد می‌شوند. رکوردهای برداشته‌شده از استخر حذف
     نمی‌شوند تا تشخیص تکراری (chat_id/لینک یکسان) نسبت به آن‌ها سالم بماند.
     """
     joined = [r for r in (records or []) if r.get("status") == "joined"]
-    candidates = []
     own_channels = tuple(c for c in (own_channels or ()) if c)
     skip_ids = set()
     for v in (exclude_ids or ()):
@@ -491,32 +497,58 @@ def select_capacity_leave_candidate(records, own_channels=(), exclude_id=None,
             skip_ids.add(int(exclude_id))
         except (TypeError, ValueError):
             pass
-    for rec in joined:
+
+    def _basic_filter(rec, *, need_peer_join=True):
         rid = _safe_id(rec)
         if rid in skip_ids:
-            continue
+            return False
         if not rec.get("peer_id"):
-            continue
-        if str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
-            continue
+            return False
+        if need_peer_join and str(rec.get("direction") or "in").lower() == "out" and not rec.get("peer_joined_at"):
+            return False
         if int(rec.get("next_reminder") or 0) > 0:
-            continue
+            return False
         if any(same_peer_ref(rec.get("link"), own) for own in own_channels):
-            continue
-        duplicate = False
+            return False
+        return True
+
+    def _dedup_ok(rec, pool):
         cid = rec.get("chat_id")
-        for other in joined:
+        rid = _safe_id(rec)
+        for other in pool:
             if other is rec or int(other.get("id") or 0) == rid:
                 continue
             same_chat = (cid and other.get("chat_id")
                          and int(cid) == int(other.get("chat_id")))
             same_link = same_peer_ref(rec.get("link"), other.get("link"))
             if same_chat or same_link:
-                duplicate = True
-                break
-        if duplicate:
-            continue
-        candidates.append(rec)
+                return False
+        return True
+
+    candidates = [r for r in joined if _basic_filter(r, need_peer_join=True) and _dedup_ok(r, joined)]
+
+    # مرحله اضطراری: کاندید کاملاً امن پیدا نشد — برای اینکه ربات در
+    # «کاندید پیدا نشد» یک ساعته گیر نکند، قدیمی‌ترین پیش‌قدمِ کهنه
+    # (که بیش از ۱۵ دقیقه است طرف برنگشته) را هم وارد لیست می‌کنیم.
+    if not candidates and allow_old_pending:
+        now_ts = int(time.time())
+        fallback = []
+        for r in joined:
+            if not _basic_filter(r, need_peer_join=False):
+                continue
+            if str(r.get("direction") or "in").lower() != "out" or r.get("peer_joined_at"):
+                continue
+            try:
+                j = int(r.get("joined_at") or r.get("created_at") or 0)
+            except (TypeError, ValueError):
+                j = 0
+            if not j or (now_ts - j) < int(min_pending_age_sec or 900):
+                continue
+            if not _dedup_ok(r, joined):
+                continue
+            fallback.append(r)
+        candidates = fallback
+
     if not candidates:
         return None
     def _age_key(rec):
@@ -539,6 +571,15 @@ CAPACITY_CLEANUP_BATCH_MAX = 100
 # اگر بعد از یک دور پاکسازیِ موفق، تلگرام هنوز سقف را پر اعلام کند (ثبتِ
 # آزادشدن slot در سرور تلگرام کمی تأخیر دارد)، جوین چقدر مکث کند؟
 CAPACITY_REBLOCK_SEC = 300
+# وقتی هیچ کاندیدِ امنی برای لفت پیدا نشد (مثلاً تبادل‌ها ناتمام/تکراری/خودم
+# هستند) نمی‌دانیم تلگرام هنوز پر است یا کاربر دستی جا آزاد کرده. به‌جای
+# بلاک ۱ ساعته که تا ریست دستی ادامه می‌یابد، مکث کوتاه می‌کنیم و بعد
+# مستقیم با یک جوین کوچک واقعاً تست می‌کنیم.
+CAPACITY_NO_CANDIDATE_BLOCK_SEC = 120
+# هر چند ثانیه یک‌بار، وقتی به‌خاطرِ «کاندید پیدا نشد» بلاک هستیم،
+# بیایم و وضعیت واقعی تلگرام را با یک GetDialogs / تست ظرفیت دوباره چک کنیم
+# — اگر کاربر دستی جا آزاد کرده زودتر از تایمر متوجه شویم.
+CAPACITY_PROBE_INTERVAL_SEC = 60
 
 
 def clamp_capacity_batch(value):
@@ -572,13 +613,26 @@ def select_capacity_leave_batch(records, own_channels=(),
             skip.add(int(exclude_id))
         except (TypeError, ValueError):
             pass
+    # مرحله ۱: فقط کاندیدهای کاملاً امن (تبادل کامل‌شده، طرف هم جوین کرده)
     while len(picked) < limit:
         rec = select_capacity_leave_candidate(
-            pool, own_channels=own_channels, exclude_ids=skip)
+            pool, own_channels=own_channels, exclude_ids=skip,
+            allow_old_pending=False)
         if rec is None:
             break
         picked.append(rec)
         skip.add(_safe_id(rec))
+    # مرحله ۲ (اضطراری): کاندید کامل‌شده پیدا نشد — قدیمی‌ترین پیش‌قدمِ کهنه
+    # را هم لفت بده تا از «یک ساعت بلاک بدون کاندید» دربیاییم.
+    if not picked:
+        while len(picked) < max(3, min(limit, 5)):
+            rec = select_capacity_leave_candidate(
+                pool, own_channels=own_channels, exclude_ids=skip,
+                allow_old_pending=True)
+            if rec is None:
+                break
+            picked.append(rec)
+            skip.add(_safe_id(rec))
     return picked
 
 
@@ -8596,12 +8650,29 @@ async def connect_and_run(eng, creds):
                     continue
 
                 capacity_blocked_until = int(x.get("_capacity_join_blocked_until", 0) or 0)
-                if capacity_blocked_until > int(time.time()):
-                    await asyncio.sleep(min(30, max(1, capacity_blocked_until - int(time.time()))))
-                    continue
-                if capacity_blocked_until:
+                now_ts = int(time.time())
+                probe_due = int(x.get("_capacity_probe_due", 0) or 0)
+                if capacity_blocked_until > now_ts:
+                    # بلاک سقف: یا منتظر اتمام جریمه می‌مانیم، یا (برای حالتِ
+                    # «کاندید پیدا نشد» با فاصلهٔ کوتاه) در صورت رسیدن
+                    # probe_due، سریع‌تر تست می‌کنیم که آیا واقعاً هنوز
+                    # سقف پر است — ممکن است کاربر دستی جا آزاد کرده باشد.
+                    want_probe = (probe_due and now_ts >= probe_due)
+                    if not want_probe:
+                        await asyncio.sleep(min(15, max(1, capacity_blocked_until - now_ts)))
+                        continue
+                    # تست: می‌خواهیم بفهمیم آیا تلگرام هنوز ChannelsTooMuch
+                    # می‌دهد یا نه، بدون ریسکِ پذیرش واقعی جوین. ساده‌ترین
+                    # راه: فلگ cleanup_pending را می‌زنیم تا worker دور
+                    # معمول پاکسازی + تلاش واقعی را اجرا کند؛ اما خود
+                    # کانالِ approved را دست‌نخورده نگه می‌داریم.
+                    x["_capacity_probe_due"] = 0
                     x["_capacity_join_blocked_until"] = 0
+                    x["_capacity_cleanup_pending"] = True
                     eng.st.save()
+                    eng.log("info", "ex_capacity_probe",
+                            "probe after short block: testing if capacity is free")
+                    continue
 
                 # ── شفافیتِ صف: اگر یک عملیات FloodWait خورده باشد، صفِ
                 # تک‌عملکردی تا پایان جریمه بسته است و هیچ پاسخ خودکاری
@@ -8644,10 +8715,19 @@ async def connect_and_run(eng, creds):
                     x["_last_capacity_cleanup_at"] = int(time.time())
                     eng.st.save()
                     if left_count <= 0:
-                        # کاندید امن نبود/همه لفت‌ها شکست خورد؛ بدون این بلاک
-                        # هر جوین دوباره فلگ می‌زد و دور بی‌فایده تکرار می‌شد.
+                        # کاندید امن نبود/همه لفت‌ها شکست خورد.
+                        # نکته: ممکن است کاربر در این میان دستی چند کانال را
+                        # لفت کرده باشد و تلگرام الان واقعاً جا داشته باشد.
+                        # به‌جای بلاک یک‌ساعته (که تا «تبادل لفت خودکار ریست»
+                        # تمام جوین‌ها را می‌بست و مدام پیام «سقف پر بود ولی
+                        # کاندید پیدا نشد» تکرار می‌کرد) مکث کوتاه می‌کنیم و
+                        # بعد با یک تست ظرفیت واقعی (probe) در ابتدای حلقه
+                        # وضعیت را راستی‌آزمایی می‌کنیم.
                         block_joins_for_capacity(
-                            stopped or "کاندید امن برای لفت پیدا نشد")
+                            stopped or "کاندید امن برای لفت پیدا نشد",
+                            seconds=CAPACITY_NO_CANDIDATE_BLOCK_SEC)
+                        x["_capacity_probe_due"] = int(time.time()) + CAPACITY_PROBE_INTERVAL_SEC
+                        eng.st.save()
                         # گیتِ بلاک بالای حلقه است؛ همین دور دیگر جوین نزن تا
                         # رکورد approved دست‌نخورده بماند و دور بعد پشت گیت بخوابد.
                         continue
